@@ -6,9 +6,25 @@ history that produced this repo is gone; everything needed to continue is in thi
 
 ## Where the project stands
 
-**M0 is complete (probe reports checked in from the target). M1 is code-complete: GGUF parser,
-ModelDesc, tokenizer (100 % HF parity), chat template, tool-call parser, Q6_K reference, and
-the WeightSource load path are all green. Remaining M1 odds and ends: criterion benchmarks.**
+**M0 and M1 are complete.** GGUF parser, ModelDesc, tokenizer (100 % HF parity), chat
+template, tool-call parser, Q6_K reference, WeightSource load path, and criterion benchmarks
+are all green on the target box.
+
+M1 benchmark numbers (this box, 2026-06-11, `cargo bench -p sg-tokenizer / -p sg-gguf`):
+
+| Metric | Result | Target |
+|---|---|---|
+| encode, mixed parity corpus | **8.96 M tok/s** | > 1 M tok/s (plan 01) |
+| encode, single ~300 KB doc | 5.96 M tok/s | — |
+| decode | 67.6 M tok/s | — |
+| GGUF parse (real file) | 22.9 ms | — |
+| ModelDesc validation | 115 µs | — |
+| weight load, O_DIRECT (bounce path) | 3.50 s = 4.69 GiB/s | ~2 s ballpark (plan 00); probe ceiling 5.8 GiB/s |
+| weight load, mmap+memcpy (cache-warm) | 0.62 s = 26.5 GiB/s | — |
+
+The O_DIRECT number is the worst case (Vec destination → every chunk bounces); the
+phase-matched M2 layout removes the memcpy. Cache-warm mmap is fastest but only after a prior
+read has paid the cold cost and polluted 17 GB of page cache.
 
 Done on the target box (2026-06-11):
 
@@ -87,12 +103,10 @@ Done since (all on the target box, 2026-06-11):
 
 ## Immediate next steps (in order)
 
-1. **M1 benchmarks** (plan 01): criterion tokenizer throughput (>1 M tok/s target), GGUF parse
-   time, weight-load wall time.
-2. **M2** (plan 02): GPU runtime + kernel library. Inputs now pinned: coopmat configs from
+1. **M2** (plan 02): GPU runtime + kernel library. Inputs now pinned: coopmat configs from
    `docs/probe/vulkan.json`, Q4_0/Q6_K scalar references as kernel ground truth, weight buffer
    layout = file data-section layout (see `weights.rs` phase note).
-3. Optionally set up the self-hosted runner (labels: `self-hosted, linux, framework`) and
+2. Optionally set up the self-hosted runner (labels: `self-hosted, linux, framework`) and
    enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)

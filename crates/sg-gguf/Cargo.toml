@@ -17,3 +17,14 @@ thiserror = "2.0.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.186"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "parse"
+harness = false
+
+[[bench]]
+name = "weight_load"
+harness = false
