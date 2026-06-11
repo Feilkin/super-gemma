@@ -1,0 +1,21 @@
+[package]
+name = "sg-probe"
+description = "M0 hardware probe: Vulkan capabilities, memory bandwidth, NVMe sequential read"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+ash = "0.38"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+vulkano = "0.35.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"

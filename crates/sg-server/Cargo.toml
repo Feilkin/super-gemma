@@ -1,0 +1,23 @@
+[package]
+name = "sg-server"
+description = "axum server: Anthropic-style /v1/messages API, SSE, auth, FIFO queue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+argon2 = "0.5.3"
+axum = "0.8.9"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sg-engine = { version = "0.1.0", path = "../sg-engine" }
+tokio = { version = "1.52.3", features = ["full"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }

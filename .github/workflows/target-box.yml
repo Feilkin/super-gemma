@@ -1,0 +1,26 @@
+# Tier 2 CI (docs/plans/06): GPU + NVMe suites on the Framework Desktop
+# self-hosted runner (labels: self-hosted, linux, framework).
+#
+# Manual-only until the runner exists; then add:
+#   schedule:
+#     - cron: "0 3 * * *"
+# and a pull_request trigger filtered to hot paths.
+name: Target box (Tier 2)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tier2:
+    name: GPU + NVMe suites
+    runs-on: [self-hosted, linux, framework]
+    steps:
+      - uses: actions/checkout@v4
+      - name: hardware probe
+        run: cargo run --release -p sg-probe -- vulkan
+      - name: tests (full, on real hardware)
+        run: cargo nextest run --workspace --profile ci
+      # M2+: sg-validate kernels, sg-bench kernels; M3+: sg-validate layers; ...

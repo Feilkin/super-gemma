@@ -1,0 +1,20 @@
+[package]
+name = "sg-engine"
+description = "Request orchestration: prompt build, cache2 resume-or-prefill, decode loop, streaming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sg-cache = { version = "0.1.0", path = "../sg-cache" }
+sg-gguf = { version = "0.1.0", path = "../sg-gguf" }
+sg-gpu = { version = "0.1.0", path = "../sg-gpu" }
+sg-model = { version = "0.1.0", path = "../sg-model" }
+sg-tokenizer = { version = "0.1.0", path = "../sg-tokenizer" }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1.44"

@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sg-gguf",
+    "crates/sg-tokenizer",
+    "crates/sg-gpu",
+    "crates/sg-model",
+    "crates/sg-cache",
+    "crates/sg-engine",
+    "crates/sg-server",
+    "crates/sg-probe",
+    "crates/sg-validate",
+    "crates/sg-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Fast-iteration profile for benches that still need optimized kernel-adjacent code.
+[profile.bench-dev]
+inherits = "release"
+lto = false
+codegen-units = 16

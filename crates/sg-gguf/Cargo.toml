@@ -1,0 +1,16 @@
+[package]
+name = "sg-gguf"
+description = "GGUF parsing, model description validation, Q4_0 types, weight source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+half = { version = "2.7.1", features = ["bytemuck"] }
+memmap2 = "0.9.10"
+thiserror = "2.0.18"

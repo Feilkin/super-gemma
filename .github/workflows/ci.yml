@@ -1,0 +1,35 @@
+# Tier 1 CI (docs/plans/06): platform-neutral checks on hosted Linux.
+# GPU/NVMe suites run on the target box (target-box.yml).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tier1:
+    name: fmt + clippy + tests + shader compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: rustfmt
+        run: cargo fmt --all --check
+      # Building the workspace also runs sg-gpu's build script, which compiles
+      # and validates every WGSL kernel - shader breakage fails here without a GPU.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: tests
+        run: cargo nextest run --workspace --profile ci
+      - name: doctests
+        run: cargo test --workspace --doc

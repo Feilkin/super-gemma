@@ -1,0 +1,16 @@
+[package]
+name = "sg-model"
+description = "Gemma 4 forward graph (prefill/decode), sampling, CPU reference model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+half = "2.7.1"
+sg-gguf = { version = "0.1.0", path = "../sg-gguf" }
+sg-gpu = { version = "0.1.0", path = "../sg-gpu" }
+thiserror = "2.0.18"
