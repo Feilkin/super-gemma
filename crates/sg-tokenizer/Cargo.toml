@@ -12,3 +12,6 @@ workspace = true
 [dependencies]
 sg-gguf = { version = "0.1.0", path = "../sg-gguf" }
 thiserror = "2.0.18"
+
+[dev-dependencies]
+serde_json = "1.0.150"
