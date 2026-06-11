@@ -13,10 +13,15 @@ mod file;
 pub mod meta;
 mod parse;
 pub mod q4_0;
+pub mod q6_k;
 pub mod tensor;
+pub mod weights;
 
 pub use desc::{AttnGeometry, DescError, LayerKind, ModelDesc};
 pub use file::GgufFile;
 pub use meta::{MetaArray, MetaError, MetaValue, Metadata};
 pub use parse::{DEFAULT_ALIGNMENT, GGUF_MAGIC, GGUF_VERSION, Gguf, GgufError};
 pub use tensor::{GgmlType, TensorInfo};
+#[cfg(target_os = "linux")]
+pub use weights::DirectSource;
+pub use weights::{MmapCopySource, WeightSource};

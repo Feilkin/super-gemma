@@ -6,9 +6,9 @@ history that produced this repo is gone; everything needed to continue is in thi
 
 ## Where the project stands
 
-**M0 is complete (probe reports checked in from the target). M1 is nearly done: GGUF parser,
-ModelDesc, tokenizer (100 % HF parity), chat template, and tool-call parser are all green;
-the weight-upload path remains.**
+**M0 is complete (probe reports checked in from the target). M1 is code-complete: GGUF parser,
+ModelDesc, tokenizer (100 % HF parity), chat template, tool-call parser, Q6_K reference, and
+the WeightSource load path are all green. Remaining M1 odds and ends: criterion benchmarks.**
 
 Done on the target box (2026-06-11):
 
@@ -74,13 +74,24 @@ Done since (all on the target box, 2026-06-11):
   `<|tool_call>call:name{args}<tool_call|>`, documented in `response_schema` of
   `tokenizer_config.json`.
 
+- `sg-gguf::weights`: `WeightSource` trait filling a caller-provided `&mut [u8]` (so the crate
+  stays vulkano-free; M2's GPU allocator passes the mapped buffer). `MmapCopySource` fallback +
+  Linux `DirectSource` (O_DIRECT chunked pread; zero-copy into destinations whose 4 KiB phase
+  matches `data_offset`, bounce-buffer otherwise — M2 should allocate with matching phase).
+  Real-model load verified: 16.4 GiB in ~5 s via the bounce path; phase-matched should approach
+  the probe's 5.8 GiB/s. **Deviation from plan 01:** load path A uses plain pread O_DIRECT, not
+  tokio-uring — sequential QD1 already saturates the drive and the dedicated uring thread only
+  arrives with cache2 (M6); the trait is the swap-in seam if that changes.
+- `sg-gguf::q6_k`: Q6_K block type + scalar dequant reference (layout verified against upstream
+  ggml `dequantize_row_q6_K`), needed because embeddings/tied head are Q6_K.
+
 ## Immediate next steps (in order)
 
-1. **M1 weight upload**: `WeightSource` trait (uring O_DIRECT impl + mmap fallback) into a
-   vulkano HOST_VISIBLE|DEVICE_LOCAL buffer. Also add the Q6_K scalar dequant reference
-   (embeddings/tied head are Q6_K).
-2. **M1 benchmarks** (plan 01): criterion tokenizer throughput (>1 M tok/s target), GGUF parse
+1. **M1 benchmarks** (plan 01): criterion tokenizer throughput (>1 M tok/s target), GGUF parse
    time, weight-load wall time.
+2. **M2** (plan 02): GPU runtime + kernel library. Inputs now pinned: coopmat configs from
+   `docs/probe/vulkan.json`, Q4_0/Q6_K scalar references as kernel ground truth, weight buffer
+   layout = file data-section layout (see `weights.rs` phase note).
 3. Optionally set up the self-hosted runner (labels: `self-hosted, linux, framework`) and
    enable Tier 2 triggers in `target-box.yml`.
 

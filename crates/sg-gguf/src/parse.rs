@@ -104,6 +104,8 @@ pub struct Gguf<'a> {
     pub metadata: Metadata,
     tensors: Vec<TensorInfo>,
     index: HashMap<String, usize>,
+    /// Byte offset of the data section in the file.
+    data_start: usize,
     data: &'a [u8],
 }
 
@@ -201,6 +203,7 @@ impl<'a> Gguf<'a> {
             metadata,
             tensors,
             index,
+            data_start: data_start.min(bytes.len()),
             data,
         })
     }
@@ -208,6 +211,17 @@ impl<'a> Gguf<'a> {
     /// Tensor table in file order.
     pub fn tensors(&self) -> &[TensorInfo] {
         &self.tensors
+    }
+
+    /// The whole tensor-data section (everything tensor offsets are relative
+    /// to).
+    pub fn data_section(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Byte offset of the data section within the file.
+    pub fn data_offset(&self) -> usize {
+        self.data_start
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {

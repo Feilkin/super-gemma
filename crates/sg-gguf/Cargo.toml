@@ -14,3 +14,6 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.10"
 thiserror = "2.0.18"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
