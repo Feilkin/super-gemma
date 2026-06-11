@@ -8,6 +8,8 @@ don't edit these by hand.
 |---|---|---|
 | `gemma-4-31b-it.config.json` | https://huggingface.co/google/gemma-4-31B-it/raw/main/config.json | 2026-06-09 |
 | `gemma-4-31b-it-assistant.config.json` | https://huggingface.co/google/gemma-4-31B-it-assistant/raw/main/config.json (MTP drafter) | 2026-06-10 |
+| `gemma-4-31b-q4_0.gguf-dump.txt` | generated on the target box by `cargo run -p sg-gguf --example dump` from the QAT GGUF below | 2026-06-11 |
+| `model-checksums.txt` | sha256 of the downloaded model files on the target box | 2026-06-11 |
 
 ## Other sources referenced by the plans (not checked in)
 

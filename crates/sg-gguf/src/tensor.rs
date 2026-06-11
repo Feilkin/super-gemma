@@ -4,16 +4,19 @@
 use std::fmt;
 
 /// The ggml tensor dtypes `sg-gguf` supports — exactly the set the Gemma 4 QAT
-/// Q4_0 export can contain (plan 01): `Q4_0` for matmul weights, `F32`/`F16`
-/// for norms, possibly `Q8_0`/`F16` for embeddings. Any other type id in the
-/// tensor table is a parse error naming the tensor; we support what the file
-/// contains, not the whole ggml zoo.
+/// Q4_0 export contains (plan 01): `Q4_0` for matmul weights, `F32` for norms,
+/// `Q6_K` for the token embeddings (found in the real file, resolving plan
+/// 01's open question), plus `F16`/`Q8_0` which KV snapshots use. Any other
+/// type id in the tensor table is a parse error naming the tensor; we support
+/// what the file contains, not the whole ggml zoo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)] // ggml's canonical type names
 pub enum GgmlType {
     F32,
     F16,
     Q4_0,
     Q8_0,
+    Q6_K,
 }
 
 impl GgmlType {
@@ -24,6 +27,7 @@ impl GgmlType {
             1 => Some(Self::F16),
             2 => Some(Self::Q4_0),
             8 => Some(Self::Q8_0),
+            14 => Some(Self::Q6_K),
             _ => None,
         }
     }
@@ -33,6 +37,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q4_0 | Self::Q8_0 => 32,
+            Self::Q6_K => 256,
         }
     }
 
@@ -43,6 +48,8 @@ impl GgmlType {
             Self::F16 => 2,
             Self::Q4_0 => 18,
             Self::Q8_0 => 34,
+            // ql[128] + qh[64] + scales[16] + d(f16)
+            Self::Q6_K => 210,
         }
     }
 
@@ -65,6 +72,7 @@ impl fmt::Display for GgmlType {
             Self::F16 => "F16",
             Self::Q4_0 => "Q4_0",
             Self::Q8_0 => "Q8_0",
+            Self::Q6_K => "Q6_K",
         })
     }
 }
@@ -114,6 +122,14 @@ mod tests {
         assert_eq!(GgmlType::from_raw(1), Some(GgmlType::F16));
         assert_eq!(GgmlType::from_raw(2), Some(GgmlType::Q4_0));
         assert_eq!(GgmlType::from_raw(8), Some(GgmlType::Q8_0));
+        assert_eq!(GgmlType::from_raw(14), Some(GgmlType::Q6_K));
         assert_eq!(GgmlType::from_raw(3), None); // Q4_1: not in this model
+    }
+
+    #[test]
+    fn q6_k_block_geometry() {
+        assert_eq!(GgmlType::Q6_K.byte_len(256), Some(210));
+        assert_eq!(GgmlType::Q6_K.byte_len(512), Some(420));
+        assert_eq!(GgmlType::Q6_K.byte_len(128), None);
     }
 }

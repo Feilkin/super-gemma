@@ -1,0 +1,6 @@
+# sha256 of the model files on the target box (downloaded 2026-06-11, paths
+# relative to the repo's models/ dir — see docs/target-setup.md §4).
+# Verify: sha256sum -c model-checksums.txt (from models/)
+0374ce7b0124db9ba96fc649e835c531223ee224a497ce88a374baaea10932ec  gemma-4-31B_q4_0-it.gguf
+c0d9e1f1653d76f8c44f154ed81c76e5c9db937b6904df4efb1f96d36e615af6  gemma-4-31B-it-assistant-f16.gguf
+8e239c9c592541c9f537fff75677ea30d8af1e14ba63d27cf245423b7d0a688b  gemma-4-31B-it-mmproj.gguf

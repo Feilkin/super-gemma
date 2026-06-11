@@ -54,7 +54,7 @@ pub enum GgufError {
     BadAlignment(u64),
     #[error(
         "tensor `{name}`: unsupported ggml type id {raw} \
-         (this model ships only F32, F16, Q4_0, Q8_0)"
+         (this model ships only F32, F16, Q4_0, Q8_0, Q6_K)"
     )]
     UnsupportedTensorType { name: String, raw: u32 },
     #[error("tensor `{name}`: {n_dims} dimensions, ggml supports at most {MAX_DIMS}")]

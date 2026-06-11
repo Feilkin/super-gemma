@@ -181,7 +181,11 @@ pub struct Metadata {
 
 impl Metadata {
     /// Insert a key; returns `false` (without inserting) on a duplicate.
-    pub(crate) fn insert(&mut self, key: String, value: MetaValue) -> bool {
+    ///
+    /// Public so tests (and fixture generators) can fabricate metadata
+    /// without serializing a file; production metadata comes from
+    /// [`Gguf::parse`](crate::Gguf::parse).
+    pub fn insert(&mut self, key: String, value: MetaValue) -> bool {
         if self.index.contains_key(&key) {
             return false;
         }
@@ -293,6 +297,16 @@ impl Metadata {
             key,
             self.typed(key, "array of i32", |v| match v {
                 MetaValue::Array(MetaArray::I32(s)) => Some(s.as_slice()),
+                _ => None,
+            }),
+        )
+    }
+
+    pub fn require_bool_array(&self, key: &str) -> Result<&[bool], MetaError> {
+        Self::required(
+            key,
+            self.typed(key, "array of bool", |v| match v {
+                MetaValue::Array(MetaArray::Bool(s)) => Some(s.as_slice()),
                 _ => None,
             }),
         )

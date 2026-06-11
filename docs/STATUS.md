@@ -1,12 +1,42 @@
 # STATUS — read this first
 
-Last updated: **2026-06-11**, on handoff from the Windows dev machine to the Framework Desktop
-target. The conversation history that produced this repo is gone; everything needed to continue
-is in this file, `AGENTS.md`, and `docs/plans/`.
+Last updated: **2026-06-11**, working on the Framework Desktop target box. The conversation
+history that produced this repo is gone; everything needed to continue is in this file,
+`AGENTS.md`, and `docs/plans/`.
 
 ## Where the project stands
 
-**M0 (scaffolding) is code-complete and green; its target-box items are still open.**
+**M0 is complete (probe reports checked in from the target). M1 is underway: GGUF parser and
+ModelDesc done and validated against the real file; tokenizer is next.**
+
+Done on the target box (2026-06-11):
+
+- M0 closed: `docs/probe/{vulkan,membw,nvme}.json` generated on this box and committed.
+  Coopmat f16×f16→f32 16×16×16 available, subgroup 64, 80 GB DEVICE_LOCAL heap, NVMe
+  5.8 GiB/s O_DIRECT, CPU memcpy 62 GiB/s multithread.
+- `sg-gguf`: GGUF v3 parser (typed metadata, tensor table, zero-copy tensor views; malformed
+  input errors, never panics — truncation/corruption sweep tests). `ModelDesc` three-way
+  validation (metadata vs tensor shapes vs config expectations) passes against the real QAT
+  GGUF. Dump report checked in at `docs/reference/gemma-4-31b-q4_0.gguf-dump.txt`; model
+  sha256s in `docs/reference/model-checksums.txt`.
+
+**Real-file findings (resolve several plan 00/01 verify-items, feed others):**
+
+- Embeddings (`token_embd.weight`, tied LM head) are **Q6_K** — plan 02's tied-head matmul
+  kernel must read Q6_K, and a Q6_K scalar dequant reference is still needed in `sg-gguf`.
+- Global layers ship **no `attn_v` tensor**: K=V materialized as the single `attn_k`
+  (5376→2048). Global q is 5376→16384 (32 heads × 512), as plan 00 predicted.
+- **New, in no plan:** every layer has `blk.N.layer_output_scale.weight` (F32 scalar), and the
+  file ships a top-level `rope_freqs.weight` (F32 [256], likely the proportional-RoPE
+  frequency table). Both are M3 verify-items; the graph must consume them.
+- `gemma4.rope.dimension_count` = 512 (global) / 256 (swa) — how partial_rotary_factor 0.25
+  interacts with that and `rope_freqs` is still an M3 verify-item.
+- **Tokenizer is NOT plain SPM-unigram as plan 01 assumed**: `tokenizer.ggml.model = "gemma4"`
+  (not `"llama"`), with a 514 906-entry `tokenizer.ggml.merges` array, scores present but
+  -1000 for early tokens, `add_bos_token = false`, `add_space_prefix = false`. Looks like
+  SentencePiece-style **BPE (merge-driven)**. Pin the algorithm from llama.cpp's `gemma4`
+  tokenizer handling + HF tokenizer.json before implementing; parity corpus stays the gate.
+  `add_bos_token=false` likely means the chat template inserts `<bos>` itself — verify.
 
 Done (verified on the dev machine, 2026-06-10):
 
@@ -25,24 +55,29 @@ Done (verified on the dev machine, 2026-06-10):
 - CI: `.github/workflows/ci.yml` (Tier 1, hosted) and `target-box.yml` (Tier 2, manual until the
   self-hosted runner exists).
 
-## Immediate next steps (on the Framework box, in order)
+## Immediate next steps (in order)
 
-1. **Box bring-up**: `docs/target-setup.md` (toolchain, Vulkan/Mesa, model downloads).
-2. **Finish M0**: run `sg-probe` (all three subcommands), check reports into `docs/probe/`
-   (instructions in `docs/probe/README.md`). The `cooperative_matrix_configs` list and NVMe
-   numbers feed plan 02 (GEMM variants) and plan 04 (eviction cost model). Optionally set up the
-   self-hosted runner (labels: `self-hosted, linux, framework`) and enable Tier 2 triggers.
-3. **Start M1** (plan 01): GGUF parser against synthetic fixtures, then parse the real GGUF —
-   which resolves plan 01's open questions (embedding tensor dtype; whether global layers ship a
-   fused/missing v_proj). Then the SPM tokenizer + chat template port.
+1. **M1 tokenizer**: pin down the `gemma4` tokenizer algorithm (BPE merges vs unigram — see
+   findings above) from llama.cpp / HF `tokenizer.json`, implement in `sg-tokenizer` from the
+   GGUF vocab, golden-corpus parity vs HF, streaming detok.
+2. **M1 chat template + tool-call parser**: the template ships *in the GGUF*
+   (`tokenizer.chat_template`, 16 934 bytes — no need to fetch `tokenizer_config.json` for it);
+   hand-port to Rust, golden fixtures via HF `apply_chat_template`, streaming tool-call parser.
+3. **M1 weight upload**: `WeightSource` trait (uring O_DIRECT impl + mmap fallback) into a
+   vulkano HOST_VISIBLE|DEVICE_LOCAL buffer. Also add the Q6_K scalar dequant reference.
+4. Optionally set up the self-hosted runner (labels: `self-hosted, linux, framework`) and
+   enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)
 
-- Plan 00 §verify-against-reference: proportional-RoPE formula, attn softcap on text layers,
-  RMSNorm `w` vs `1+w`, attention scaling, global Q-head layout → resolved by the M3 parity
-  harness against transformers `gemma4` code; isolated behind swappable functions in `sg-model`.
-- Plan 01 §open questions: embedding dtype in the QAT GGUF; Gemma 4 tool-call convention (from
-  the chat template).
+- Plan 00 §verify-against-reference: proportional-RoPE formula (now incl. `rope_freqs.weight`
+  and `rope.dimension_count` 512/256), attn softcap on text layers, RMSNorm `w` vs `1+w`,
+  attention scaling, **`layer_output_scale` semantics** → resolved by the M3 parity harness
+  against transformers `gemma4` code; isolated behind swappable functions in `sg-model`.
+  (Global Q-head layout and missing global v_proj: resolved by the real tensor table, see
+  findings above.)
+- Plan 01 §open questions: ~~embedding dtype~~ (Q6_K, resolved); Gemma 4 tool-call convention
+  (from the chat template — it's in the GGUF); exact `gemma4` tokenizer algorithm.
 - Plan 07 §verify-items: all MTP drafter semantics (conditioning, K, KV-sharing map, centroid
   head, acceptance rule) → from transformers ≥5.7 `gemma4_assistant` before M7.5 starts.
 

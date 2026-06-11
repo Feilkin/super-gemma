@@ -8,12 +8,14 @@
 //! view — owned [`Metadata`] and tensor table, zero-copy tensor data slices
 //! into the mmap.
 
+pub mod desc;
 mod file;
 pub mod meta;
 mod parse;
 pub mod q4_0;
 pub mod tensor;
 
+pub use desc::{AttnGeometry, DescError, LayerKind, ModelDesc};
 pub use file::GgufFile;
 pub use meta::{MetaArray, MetaError, MetaValue, Metadata};
 pub use parse::{DEFAULT_ALIGNMENT, GGUF_MAGIC, GGUF_VERSION, Gguf, GgufError};
