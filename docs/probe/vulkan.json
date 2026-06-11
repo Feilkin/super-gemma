@@ -1,0 +1,50 @@
+{
+  "devices": [
+    {
+      "name": "AMD Radeon 8060S Graphics (RADV STRIX_HALO)",
+      "device_type": "IntegratedGpu",
+      "api_version": "1.4.348",
+      "driver": "radv (Mesa 26.1.1-arch1.2)",
+      "subgroup_size": 64,
+      "subgroup_operations": "BASIC | VOTE | ARITHMETIC | BALLOT | SHUFFLE | SHUFFLE_RELATIVE | CLUSTERED | QUAD",
+      "max_storage_buffer_range": 4294967295,
+      "max_push_constants_size": 256,
+      "max_compute_work_group_invocations": 1024,
+      "features": {
+        "shader_float16": true,
+        "storage_buffer16_bit_access": true,
+        "uniform_and_storage_buffer16_bit_access": true,
+        "timeline_semaphore": true,
+        "cooperative_matrix": true,
+        "shader_int8": true
+      },
+      "khr_cooperative_matrix": true,
+      "cooperative_matrix_configs": [
+        "M16xN16xK16 A=UINT8 B=UINT8 C=UINT32 Result=UINT32 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=UINT8 B=UINT8 C=SINT32 Result=SINT32 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=UINT8 B=UINT8 C=SINT32 Result=SINT32 saturating=true scope=SUBGROUP",
+        "M16xN16xK16 A=UINT8 B=SINT8 C=UINT32 Result=UINT32 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=UINT8 B=SINT8 C=SINT32 Result=SINT32 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=UINT8 B=SINT8 C=SINT32 Result=SINT32 saturating=true scope=SUBGROUP",
+        "M16xN16xK16 A=SINT8 B=UINT8 C=UINT32 Result=UINT32 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=SINT8 B=UINT8 C=SINT32 Result=SINT32 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=SINT8 B=UINT8 C=SINT32 Result=SINT32 saturating=true scope=SUBGROUP",
+        "M16xN16xK16 A=SINT8 B=SINT8 C=UINT32 Result=UINT32 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=SINT8 B=SINT8 C=SINT32 Result=SINT32 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=SINT8 B=SINT8 C=SINT32 Result=SINT32 saturating=true scope=SUBGROUP",
+        "M16xN16xK16 A=FLOAT16 B=FLOAT16 C=FLOAT16 Result=FLOAT16 saturating=false scope=SUBGROUP",
+        "M16xN16xK16 A=FLOAT16 B=FLOAT16 C=FLOAT32 Result=FLOAT32 saturating=false scope=SUBGROUP"
+      ],
+      "memory_heaps": [
+        {
+          "size_bytes": 40265318400,
+          "flags": "empty()"
+        },
+        {
+          "size_bytes": 80530636800,
+          "flags": "DEVICE_LOCAL"
+        }
+      ]
+    }
+  ]
+}

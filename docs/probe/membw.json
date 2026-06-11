@@ -1,0 +1,7 @@
+{
+  "buffer_mib": 1024,
+  "iters": 8,
+  "threads": 32,
+  "single_thread_copy_gib_s": 26.07428158672694,
+  "multi_thread_copy_gib_s": 62.31229734823865
+}

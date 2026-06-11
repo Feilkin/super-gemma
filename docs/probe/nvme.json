@@ -1,0 +1,7 @@
+{
+  "path": "models/gemma-4-31B_q4_0-it.gguf",
+  "bytes_read": 8589934592,
+  "seconds": 1.376753658,
+  "read_gib_s": 5.81077083290379,
+  "o_direct": true
+}
