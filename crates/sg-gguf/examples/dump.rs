@@ -2,14 +2,28 @@
 //! tensor table. The checked-in report for the real model lives in
 //! `docs/reference/` (plan 01).
 //!
-//! Usage: `cargo run -p sg-gguf --example dump -- <file.gguf>`
+//! Usage: `cargo run -p sg-gguf --example dump -- <file.gguf> [key]`
+//!
+//! With `key`, prints that metadata string raw (e.g. `tokenizer.chat_template`)
+//! instead of the report.
 
 use sg_gguf::{GgufFile, MetaArray, MetaValue};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: dump <file.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: dump <file.gguf> [key]");
     let file = GgufFile::open(&path).expect("open/mmap");
     let g = file.parse().expect("parse");
+
+    if let Some(key) = std::env::args().nth(2) {
+        match g.metadata.get(&key) {
+            Some(MetaValue::String(s)) => print!("{s}"),
+            Some(other) => print!("{other:?}"),
+            None => panic!("no metadata key {key:?}"),
+        }
+        return;
+    }
 
     println!("# GGUF dump: {path}");
     println!(

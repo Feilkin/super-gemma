@@ -6,8 +6,9 @@ history that produced this repo is gone; everything needed to continue is in thi
 
 ## Where the project stands
 
-**M0 is complete (probe reports checked in from the target). M1 is underway: GGUF parser and
-ModelDesc done and validated against the real file; tokenizer is next.**
+**M0 is complete (probe reports checked in from the target). M1 is nearly done: GGUF parser,
+ModelDesc, tokenizer (100 % HF parity), chat template, and tool-call parser are all green;
+the weight-upload path remains.**
 
 Done on the target box (2026-06-11):
 
@@ -55,17 +56,32 @@ Done (verified on the dev machine, 2026-06-10):
 - CI: `.github/workflows/ci.yml` (Tier 1, hosted) and `target-box.yml` (Tier 2, manual until the
   self-hosted runner exists).
 
+Done since (all on the target box, 2026-06-11):
+
+- `sg-tokenizer`: Gemma 4 BPE (byte fallback, `" "→"▁"`, 24 leftmost-longest specials), built
+  from GGUF metadata with full validation. **100 % parity with HF tokenizers on a 12 104-case
+  golden corpus** (`tools/gen_tokenizer_fixtures.py`) plus round-trip; streaming `DetokBuffer`;
+  `SpecialTokens::Plain` mode so user text can't inject control tokens.
+- Chat template hand-ported (`template::render_prompt`), byte-identical to jinja2 on the golden
+  corpus (`tools/gen_template_fixtures.py`; template checked in at
+  `docs/reference/gemma-4-chat-template.jinja`). Note: the upstream template *crashes* on a
+  tool message whose function name is unresolvable (no `name`, no matching `tool_call_id`) —
+  the server must always resolve names (plan 05).
+- Streaming `TurnParser`: token-id-driven split of model output into content / thought-channel
+  / tool-call events, plus the Gemma argument-syntax parser (`<|"|>`-quoted strings →
+  `serde_json::Value`). Tool-calling convention (plan 01 open question) is resolved: native
+  special tokens `<|turn>`/`<turn|>`, `<|channel>thought…<channel|>`,
+  `<|tool_call>call:name{args}<tool_call|>`, documented in `response_schema` of
+  `tokenizer_config.json`.
+
 ## Immediate next steps (in order)
 
-1. **M1 tokenizer**: pin down the `gemma4` tokenizer algorithm (BPE merges vs unigram — see
-   findings above) from llama.cpp / HF `tokenizer.json`, implement in `sg-tokenizer` from the
-   GGUF vocab, golden-corpus parity vs HF, streaming detok.
-2. **M1 chat template + tool-call parser**: the template ships *in the GGUF*
-   (`tokenizer.chat_template`, 16 934 bytes — no need to fetch `tokenizer_config.json` for it);
-   hand-port to Rust, golden fixtures via HF `apply_chat_template`, streaming tool-call parser.
-3. **M1 weight upload**: `WeightSource` trait (uring O_DIRECT impl + mmap fallback) into a
-   vulkano HOST_VISIBLE|DEVICE_LOCAL buffer. Also add the Q6_K scalar dequant reference.
-4. Optionally set up the self-hosted runner (labels: `self-hosted, linux, framework`) and
+1. **M1 weight upload**: `WeightSource` trait (uring O_DIRECT impl + mmap fallback) into a
+   vulkano HOST_VISIBLE|DEVICE_LOCAL buffer. Also add the Q6_K scalar dequant reference
+   (embeddings/tied head are Q6_K).
+2. **M1 benchmarks** (plan 01): criterion tokenizer throughput (>1 M tok/s target), GGUF parse
+   time, weight-load wall time.
+3. Optionally set up the self-hosted runner (labels: `self-hosted, linux, framework`) and
    enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)

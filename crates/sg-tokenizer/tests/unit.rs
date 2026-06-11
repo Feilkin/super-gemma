@@ -3,10 +3,21 @@
 //! `parity.rs`).
 
 use sg_gguf::meta::{MetaArray, MetaValue, Metadata};
-use sg_tokenizer::{DetokBuffer, SpecialTokens, Tokenizer, VocabError};
+use sg_tokenizer::{DetokBuffer, SpecialTokens, Tokenizer, TurnEvent, TurnParser, VocabError};
 
 const NORMALS: &[&str] = &[
     "a", "b", "c", "x", "y", "z", "ab", "bc", "abc", "xy", "xyz", "aa", "▁", "▁a", "\n",
+];
+const SPECIALS: &[&str] = &[
+    "<s>",
+    "<ss>",
+    "<turn|>",
+    "<|channel>",
+    "<channel|>",
+    "<|tool_call>",
+    "<tool_call|>",
+    "<|tool_response>",
+    "<|\"|>",
 ];
 const MERGES: &[&str] = &["b c", "a b", "ab c", "x y", "xy z", "a a", "▁ a"];
 
@@ -18,7 +29,7 @@ fn id_of_byte(b: u8) -> u32 {
 fn id_of(piece: &str) -> u32 {
     let i = NORMALS
         .iter()
-        .chain(&["<s>", "<ss>", "<turn|>"])
+        .chain(SPECIALS)
         .position(|p| *p == piece)
         .unwrap_or_else(|| panic!("{piece} not in tiny vocab"));
     260 + i as u32
@@ -38,8 +49,8 @@ fn tiny_meta() -> Metadata {
         pieces.push((*p).to_owned());
         types.push(1);
     }
-    for p in ["<s>", "<ss>", "<turn|>"] {
-        pieces.push(p.to_owned());
+    for p in SPECIALS {
+        pieces.push((*p).to_owned());
         types.push(3);
     }
 
@@ -259,6 +270,129 @@ fn construction_validates_the_payload() {
         Tokenizer::from_metadata(&m),
         Err(VocabError::MergePieceMissing { .. })
     ));
+}
+
+fn feed(t: &Tokenizer, parser: &mut TurnParser, text: &str, events: &mut Vec<TurnEvent>) {
+    for id in t.encode(text, SpecialTokens::Match) {
+        parser.push(t, id, events).unwrap();
+    }
+}
+
+fn collect_text(events: &[TurnEvent], want_thinking: bool) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            TurnEvent::ThinkingDelta(s) if want_thinking => Some(s.as_str()),
+            TurnEvent::ContentDelta(s) if !want_thinking => Some(s.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn turn_parser_splits_thinking_content_and_tool_calls() {
+    let t = tok();
+    let mut parser = TurnParser::new(t.vocab());
+    let mut events = Vec::new();
+
+    feed(
+        &t,
+        &mut parser,
+        "<|channel>thought\nplan it<channel|>",
+        &mut events,
+    );
+    feed(&t, &mut parser, "answer ok", &mut events);
+    feed(
+        &t,
+        &mut parser,
+        "<|tool_call>call:get_weather{city:<|\"|>Oulu, {FI}<|\"|>,days:3,\
+         opts:{dry:true,ratio:2.5},list:[1,None,metric],empty:{}}<tool_call|>",
+        &mut events,
+    );
+    feed(&t, &mut parser, "<turn|>", &mut events);
+    parser.finish(&mut events);
+
+    assert_eq!(collect_text(&events, true), "plan it");
+    assert_eq!(collect_text(&events, false), "answer ok");
+    let call = events
+        .iter()
+        .find(|e| matches!(e, TurnEvent::ToolCall { .. }))
+        .expect("tool call event");
+    let TurnEvent::ToolCall { name, arguments } = call else {
+        unreachable!()
+    };
+    assert_eq!(name, "get_weather");
+    assert_eq!(
+        *arguments,
+        serde_json::json!({
+            "city": "Oulu, {FI}",
+            "days": 3,
+            "opts": {"dry": true, "ratio": 2.5},
+            "list": [1, null, "metric"],
+            "empty": {},
+        })
+    );
+    assert_eq!(events.last(), Some(&TurnEvent::EndOfTurn));
+}
+
+#[test]
+fn turn_parser_reports_tool_response_marker_and_bad_calls() {
+    let t = tok();
+    let mut parser = TurnParser::new(t.vocab());
+    let mut events = Vec::new();
+
+    feed(
+        &t,
+        &mut parser,
+        "<|tool_call>call:ping{}<tool_call|>",
+        &mut events,
+    );
+    feed(&t, &mut parser, "<|tool_response>", &mut events);
+    assert!(events.contains(&TurnEvent::AwaitingToolResponse));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        TurnEvent::ToolCall { name, arguments }
+            if name == "ping" && *arguments == serde_json::json!({})
+    )));
+
+    let mut events = Vec::new();
+    feed(
+        &t,
+        &mut parser,
+        "<|tool_call>nonsense<tool_call|>",
+        &mut events,
+    );
+    assert!(
+        matches!(&events[0], TurnEvent::InvalidToolCall { error, .. } if error.contains("call:")),
+        "{events:?}"
+    );
+
+    // Unterminated call surfaces at finish().
+    let mut events = Vec::new();
+    feed(&t, &mut parser, "<|tool_call>call:ping{", &mut events);
+    parser.finish(&mut events);
+    assert!(
+        matches!(&events[0], TurnEvent::InvalidToolCall { error, .. } if error.contains("unterminated")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn turn_parser_keeps_lookalike_text_as_content() {
+    let t = tok();
+    let mut parser = TurnParser::new(t.vocab());
+    let mut events = Vec::new();
+    // Encoded Plain, the marker string is ordinary bytes — must stay content.
+    for id in t.encode("see <|tool_call> here", SpecialTokens::Plain) {
+        parser.push(&t, id, &mut events).unwrap();
+    }
+    parser.finish(&mut events);
+    assert_eq!(collect_text(&events, false), "see <|tool_call> here");
+    assert!(
+        events
+            .iter()
+            .all(|e| matches!(e, TurnEvent::ContentDelta(_)))
+    );
 }
 
 #[test]

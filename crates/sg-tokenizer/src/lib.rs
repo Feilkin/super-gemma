@@ -10,9 +10,12 @@
 
 mod bpe;
 mod detok;
+pub mod template;
 mod tokenizer;
+mod toolcall;
 mod vocab;
 
 pub use detok::DetokBuffer;
 pub use tokenizer::{DecodeError, SpecialTokens, Tokenizer};
+pub use toolcall::{TurnEvent, TurnParser};
 pub use vocab::{TokenType, Vocab, VocabError};
