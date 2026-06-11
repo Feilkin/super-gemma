@@ -101,13 +101,39 @@ Done since (all on the target box, 2026-06-11):
 - `sg-gguf::q6_k`: Q6_K block type + scalar dequant reference (layout verified against upstream
   ggml `dequantize_row_q6_K`), needed because embeddings/tied head are Q6_K.
 
+## M2 progress (2026-06-11, in flight)
+
+Done, all parity-tested against f64 CPU references and bit-deterministic:
+
+- GPU runtime: `GpuContext` (8060S, all required features + coopmat), unified-memory buffers,
+  build-time kernel variant registry (naga-oil defines; explicit binding layouts because
+  vulkano's reflection misses coopmat-only buffers), one-shot dispatch for tests.
+- Kernels green: rmsnorm ×6 (5376/512/256 × w/1+w), rope ×4 (CPU-filled f64 cos/sin table —
+  GPU trig loses ~1e-2 by pos 100K), geglu, gemv_q4_0 ×4 K-shapes + generic baseline,
+  gemm_q4_0 (coopmat) ×8 shapes + gemm_st_q4_0 (subgroup-tiled fallback) ×8.
+- **gemv_q4_0: 218 GiB/s (91 % of bandwidth ceiling — beats the ≥85 % target).** Decode is set.
+- **gemm_q4_0 (coopmat): 6.4 TFLOPS; gemm_st fallback: 3.3 TFLOPS.** Target ≥30 % of peak
+  (17.7) not yet met → see below. Was 0.4 before fixing three poisons: per-byte serialized
+  global loads in dequant (now 9-word block-pair loads like gemv), naga's injected per-iteration
+  loop bounding (`force_loop_bounding: false`), and single-lane LDS zero-init
+  (`zero_initialize_workgroup_memory: None` — kernels never read unwritten LDS).
+  Tried and rejected: LDS-staged A tiles (30 % slower than global coopLoadT).
+- Toolchain gotchas pinned in code comments: naga 29 spells push constants `var<immediate>`;
+  naga_oil 0.22 corrupts coopmat IR (those shaders compile via plain naga, `raw: true`);
+  WGSL coopmat = `enable wgpu_cooperative_matrix`, `coop_mat16x16<f16, A/B/C>`,
+  `coopLoad/coopLoadT/coopStore/coopMultiplyAdd`.
+
 ## Immediate next steps (in order)
 
-1. **M2** (plan 02): GPU runtime + kernel library. Inputs now pinned: coopmat configs from
-   `docs/probe/vulkan.json`, Q4_0/Q6_K scalar references as kernel ground truth, weight buffer
-   layout = file data-section layout (see `weights.rs` phase note).
-2. Optionally set up the self-hosted runner (labels: `self-hosted, linux, framework`) and
-   enable Tier 2 triggers in `target-box.yml`.
+1. **gemm_q4_0 tuning to ≥30 % of peak (17.7 TFLOPS; at 6.4).** Next levers, profiling-driven
+   (RGP): ISA dump showed real `v_wmma` in wave64 — try wave32 (`required_subgroup_size`),
+   bigger M_TILES/N_TILES register blocking, double-buffered B staging, B-operand LDS layout
+   (bank conflicts on the column-major coopLoad), K-step 128. At 6.4 TFLOPS prefill would be
+   ~100 tok/s vs the ≥300 target.
+2. **M2.5 attention kernels** (prefill sliding/global, decode sliding/global incl. K=V single
+   read + split-K), then kv_append/quant + logits softcap (Q6_K tied head), then pre-recorded
+   command graphs (plan 02 step 8).
+3. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)
 

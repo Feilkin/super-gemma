@@ -24,6 +24,18 @@ struct Variant {
     /// reference it as `#{WG_X}` etc. so this table is the single source of
     /// truth.
     workgroup: [u32; 3],
+    /// Number of storage-buffer bindings (set 0, bindings 0..n); vulkano's
+    /// reflection misses buffers consumed only by cooperative-matrix ops, so
+    /// layouts are built from this instead.
+    bindings: u32,
+    /// Push-constant byte size (0 = none).
+    push_bytes: u32,
+    /// Skip naga-oil and compile with plain naga (textual `#{NAME}`
+    /// substitution only, no `#ifdef`/`#import`). Required for cooperative-
+    /// matrix shaders: naga_oil 0.22's IR cloner copies
+    /// `Expression::CooperativeLoad`'s inner pointer/stride handles without
+    /// remapping them, corrupting the module.
+    raw: bool,
 }
 
 /// Gemma 4 geometry (validated by `sg_gguf::ModelDesc` at load time): the
@@ -35,6 +47,9 @@ const VARIANTS: &[Variant] = &[
         src: "stub",
         defs: &[],
         workgroup: [64, 1, 1],
+        bindings: 1,
+        push_bytes: 4,
+        raw: false,
     },
     // RMSNorm: hidden rows + the two QK-norm head_dims, each in both weight
     // conventions (W_PLUS_ONE picked by M3 parity).
@@ -43,36 +58,54 @@ const VARIANTS: &[Variant] = &[
         src: "rmsnorm",
         defs: &[("ROW_LEN", 5376)],
         workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "rmsnorm_5376_plus1",
         src: "rmsnorm",
         defs: &[("ROW_LEN", 5376), ("W_PLUS_ONE", 1)],
         workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "rmsnorm_512",
         src: "rmsnorm",
         defs: &[("ROW_LEN", 512)],
         workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "rmsnorm_512_plus1",
         src: "rmsnorm",
         defs: &[("ROW_LEN", 512), ("W_PLUS_ONE", 1)],
         workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "rmsnorm_256",
         src: "rmsnorm",
         defs: &[("ROW_LEN", 256)],
         workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "rmsnorm_256_plus1",
         src: "rmsnorm",
         defs: &[("ROW_LEN", 256), ("W_PLUS_ONE", 1)],
         workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     // RoPE per attention site. Sliding: full rotation, θ=10k. Global:
     // partial rotation (0.25 × 512 = 128 dims), θ=1M.
@@ -81,30 +114,45 @@ const VARIANTS: &[Variant] = &[
         src: "rope",
         defs: &[("HEAD_DIM", 256), ("ROT_DIMS", 256), ("N_HEADS", 32)],
         workgroup: [256, 1, 1],
+        bindings: 2,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "rope_sliding_k",
         src: "rope",
         defs: &[("HEAD_DIM", 256), ("ROT_DIMS", 256), ("N_HEADS", 16)],
         workgroup: [256, 1, 1],
+        bindings: 2,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "rope_global_q",
         src: "rope",
         defs: &[("HEAD_DIM", 512), ("ROT_DIMS", 128), ("N_HEADS", 32)],
         workgroup: [256, 1, 1],
+        bindings: 2,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "rope_global_k",
         src: "rope",
         defs: &[("HEAD_DIM", 512), ("ROT_DIMS", 128), ("N_HEADS", 4)],
         workgroup: [256, 1, 1],
+        bindings: 2,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "geglu",
         src: "geglu",
         defs: &[],
         workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     // Q4_0 GEMV, one variant per matmul-site K (the N dimension is the
     // dispatch size). Workgroup = one wave (probe: subgroup 64).
@@ -113,30 +161,247 @@ const VARIANTS: &[Variant] = &[
         src: "gemv_q4_0",
         defs: &[("K_DIM", 5376)],
         workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "gemv_q4_0_k8192",
         src: "gemv_q4_0",
         defs: &[("K_DIM", 8192)],
         workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "gemv_q4_0_k16384",
         src: "gemv_q4_0",
         defs: &[("K_DIM", 16384)],
         workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "gemv_q4_0_k21504",
         src: "gemv_q4_0",
         defs: &[("K_DIM", 21504)],
         workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
     Variant {
         name: "gemv_q4_0_generic",
         src: "gemv_q4_0",
         defs: &[("GENERIC_K", 1)],
         workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 4,
+        raw: false,
+    },
+    // Coopmat Q4_0 GEMM (prefill), one variant per (K, N) site.
+    Variant {
+        name: "gemm_q4_0_k5376_n8192",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 8192),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_k5376_n4096",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 4096),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_k8192_n5376",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 8192),
+            ("N_DIM", 5376),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_k5376_n16384",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 16384),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_k5376_n2048",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 2048),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_k16384_n5376",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 16384),
+            ("N_DIM", 5376),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_k5376_n21504",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_k21504_n5376",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: true,
+    },
+    // Subgroup-tiled Q4_0 GEMM: non-coopmat baseline/fallback.
+    Variant {
+        name: "gemm_st_q4_0_k5376_n8192",
+        src: "gemm_st_q4_0",
+        defs: &[("K_DIM", 5376), ("N_DIM", 8192)],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
+    },
+    Variant {
+        name: "gemm_st_q4_0_k5376_n4096",
+        src: "gemm_st_q4_0",
+        defs: &[("K_DIM", 5376), ("N_DIM", 4096)],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
+    },
+    Variant {
+        name: "gemm_st_q4_0_k8192_n5376",
+        src: "gemm_st_q4_0",
+        defs: &[("K_DIM", 8192), ("N_DIM", 5376)],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
+    },
+    Variant {
+        name: "gemm_st_q4_0_k5376_n16384",
+        src: "gemm_st_q4_0",
+        defs: &[("K_DIM", 5376), ("N_DIM", 16384)],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
+    },
+    Variant {
+        name: "gemm_st_q4_0_k5376_n2048",
+        src: "gemm_st_q4_0",
+        defs: &[("K_DIM", 5376), ("N_DIM", 2048)],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
+    },
+    Variant {
+        name: "gemm_st_q4_0_k16384_n5376",
+        src: "gemm_st_q4_0",
+        defs: &[("K_DIM", 16384), ("N_DIM", 5376)],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
+    },
+    Variant {
+        name: "gemm_st_q4_0_k5376_n21504",
+        src: "gemm_st_q4_0",
+        defs: &[("K_DIM", 5376), ("N_DIM", 21504)],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
+    },
+    Variant {
+        name: "gemm_st_q4_0_k21504_n5376",
+        src: "gemm_st_q4_0",
+        defs: &[("K_DIM", 21504), ("N_DIM", 5376)],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        raw: false,
     },
 ];
 
@@ -156,8 +421,8 @@ fn main() {
         writeln!(
             registry,
             "    KernelBlob {{ name: {:?}, spv: include_bytes!(concat!(env!(\"OUT_DIR\"), \
-             \"/{}.spv\")), workgroup: {:?} }},",
-            v.name, v.name, v.workgroup
+             \"/{}.spv\")), workgroup: {:?}, bindings: {}, push_bytes: {} }},",
+            v.name, v.name, v.workgroup, v.bindings, v.push_bytes
         )
         .unwrap();
     }
@@ -170,26 +435,45 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let display = format!("{} [{}]", path.display(), variant.name);
 
-    let mut shader_defs: HashMap<String, ShaderDefValue> = HashMap::new();
-    shader_defs.insert("WG_X".into(), ShaderDefValue::UInt(variant.workgroup[0]));
-    shader_defs.insert("WG_Y".into(), ShaderDefValue::UInt(variant.workgroup[1]));
-    shader_defs.insert("WG_Z".into(), ShaderDefValue::UInt(variant.workgroup[2]));
-    for (k, v) in variant.defs {
-        shader_defs.insert((*k).to_owned(), ShaderDefValue::UInt(*v));
-    }
+    let module = if variant.raw {
+        // Plain naga path (see `Variant::raw`): textual `#{NAME}` substitution
+        // only.
+        let mut substituted = source;
+        for (k, v) in variant.defs {
+            substituted = substituted.replace(&format!("#{{{k}}}"), &v.to_string());
+        }
+        for (k, v) in [
+            ("WG_X", variant.workgroup[0]),
+            ("WG_Y", variant.workgroup[1]),
+            ("WG_Z", variant.workgroup[2]),
+        ] {
+            substituted = substituted.replace(&format!("#{{{k}}}"), &v.to_string());
+        }
+        naga::front::wgsl::parse_str(&substituted)
+            .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
+    } else {
+        let mut shader_defs: HashMap<String, ShaderDefValue> = HashMap::new();
+        shader_defs.insert("WG_X".into(), ShaderDefValue::UInt(variant.workgroup[0]));
+        shader_defs.insert("WG_Y".into(), ShaderDefValue::UInt(variant.workgroup[1]));
+        shader_defs.insert("WG_Z".into(), ShaderDefValue::UInt(variant.workgroup[2]));
+        for (k, v) in variant.defs {
+            shader_defs.insert((*k).to_owned(), ShaderDefValue::UInt(*v));
+        }
 
-    // The composer validates internally with its own capability set; default
-    // capabilities reject immediates (push constants), f16, subgroups, …
-    let mut composer =
-        naga_oil::compose::Composer::default().with_capabilities(naga::valid::Capabilities::all());
-    let module = composer
-        .make_naga_module(naga_oil::compose::NagaModuleDescriptor {
-            source: &source,
-            file_path: &display,
-            shader_defs,
-            ..Default::default()
-        })
-        .unwrap_or_else(|e| panic!("compose {display}: {e}"));
+        // The composer validates internally with its own capability set;
+        // default capabilities reject immediates (push constants), f16,
+        // subgroups, …
+        let mut composer = naga_oil::compose::Composer::default()
+            .with_capabilities(naga::valid::Capabilities::all());
+        composer
+            .make_naga_module(naga_oil::compose::NagaModuleDescriptor {
+                source: &source,
+                file_path: &display,
+                shader_defs,
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("compose {display}: {e}"))
+    };
 
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
@@ -224,6 +508,14 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         // No f16 stage IO in compute; without this naga declares
         // StorageInputOutput16 whenever f16 is enabled.
         use_storage_input_output_16: false,
+        // Our kernels never read workgroup memory they haven't written; the
+        // polyfill zeroing is a serialized single-lane LDS sweep at every
+        // workgroup launch (clearly visible in the gemm ISA dump).
+        zero_initialize_workgroup_memory: naga::back::spv::ZeroInitializeWorkgroupMemoryMode::None,
+        // The injected loop-bound guards add a scalar-compare + branch chain
+        // per loop iteration in the hot kernels; all our loops have baked
+        // compile-time bounds.
+        force_loop_bounding: false,
         ..Default::default()
     };
     naga::back::spv::write_vec(&module, &info, &options, None)

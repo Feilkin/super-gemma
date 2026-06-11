@@ -2,12 +2,16 @@
 //! creation. Callers deal in [`Kernel`]s; WGSL details (entry point names,
 //! defines) never leak past this module.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use vulkano::descriptor_set::layout::{
+    DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType,
+};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
 use vulkano::pipeline::{ComputePipeline, PipelineLayout, PipelineShaderStageCreateInfo};
-use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
+use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo, ShaderStages};
 
 use crate::{GpuContext, GpuError};
 
@@ -18,6 +22,12 @@ pub struct KernelBlob {
     /// Workgroup size baked into the shader (single source of truth is the
     /// variant table in `build.rs`).
     pub workgroup: [u32; 3],
+    /// Storage-buffer bindings at set 0, bindings `0..bindings`. The layout
+    /// is built from this rather than SPIR-V reflection — vulkano's
+    /// reflection misses buffers consumed only by cooperative-matrix ops.
+    pub bindings: u32,
+    /// Push-constant byte size (0 = none).
+    pub push_bytes: u32,
 }
 
 include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
@@ -72,11 +82,41 @@ impl GpuContext {
                 "{name}: no `main` entry point"
             )))?;
         let stage = PipelineShaderStageCreateInfo::new(entry);
+
+        let set_layout = DescriptorSetLayout::new(
+            self.device().clone(),
+            DescriptorSetLayoutCreateInfo {
+                bindings: (0..blob.bindings)
+                    .map(|i| {
+                        (
+                            i,
+                            DescriptorSetLayoutBinding {
+                                stages: ShaderStages::COMPUTE,
+                                ..DescriptorSetLayoutBinding::descriptor_type(
+                                    DescriptorType::StorageBuffer,
+                                )
+                            },
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                ..Default::default()
+            },
+        )
+        .map_err(GpuError::validated)?;
         let layout = PipelineLayout::new(
             self.device().clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-                .into_pipeline_layout_create_info(self.device().clone())
-                .map_err(|e| GpuError::Pipeline(format!("{name}: {e}")))?,
+            PipelineLayoutCreateInfo {
+                set_layouts: vec![set_layout],
+                push_constant_ranges: (blob.push_bytes > 0)
+                    .then_some(PushConstantRange {
+                        stages: ShaderStages::COMPUTE,
+                        offset: 0,
+                        size: blob.push_bytes,
+                    })
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
         )
         .map_err(GpuError::validated)?;
         let pipeline = ComputePipeline::new(

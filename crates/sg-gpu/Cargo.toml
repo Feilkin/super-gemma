@@ -26,3 +26,7 @@ sg-gguf = { path = "../sg-gguf" }
 [[bench]]
 name = "gemv_bw"
 harness = false
+
+[[bench]]
+name = "gemm_tflops"
+harness = false
