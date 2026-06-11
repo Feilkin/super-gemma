@@ -1,0 +1,144 @@
+//! CPU reference implementations with f64 accumulation (plan 02 §testing:
+//! the oracle every kernel variant is validated against) plus shared test
+//! plumbing (deterministic RNG, f16 round-trips, tolerance checks).
+
+#![allow(dead_code)] // each test binary uses a subset
+
+/// xorshift64* — deterministic across platforms, no dependency.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform in [-2, 2): activation-ish magnitudes.
+    pub fn f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32 * 4.0 - 2.0
+    }
+
+    pub fn f32_vec(&mut self, n: usize) -> Vec<f32> {
+        (0..n).map(|_| self.f32()).collect()
+    }
+}
+
+/// Round through f16: GPU inputs are f16, so the reference must consume
+/// exactly the values the kernel sees.
+pub fn through_f16(xs: &[f32]) -> Vec<f32> {
+    xs.iter()
+        .map(|&x| half::f16::from_f32(x).to_f32())
+        .collect()
+}
+
+pub fn to_f16_bits(xs: &[f32]) -> Vec<u16> {
+    xs.iter()
+        .map(|&x| half::f16::from_f32(x).to_bits())
+        .collect()
+}
+
+pub fn from_f16_bits(xs: &[u16]) -> Vec<f32> {
+    xs.iter()
+        .map(|&b| half::f16::from_bits(b).to_f32())
+        .collect()
+}
+
+/// Max combined error: |got−want| ≤ atol + rtol·|want|, reported with index.
+pub fn assert_close(got: &[f32], want: &[f32], atol: f32, rtol: f32, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let mut worst = (0usize, 0.0f32);
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let err = (g - w).abs() - rtol * w.abs();
+        if err > worst.1 {
+            worst = (i, err);
+        }
+    }
+    let (i, err) = worst;
+    assert!(
+        err <= atol,
+        "{what}: element {i}: got {} want {} (excess error {err:e}, atol {atol:e})",
+        got[i],
+        want[i]
+    );
+}
+
+/// RMSNorm rows of `row_len`, f64 accumulation.
+pub fn rmsnorm(x: &[f32], w: &[f32], row_len: usize, eps: f64, plus_one: bool) -> Vec<f32> {
+    assert_eq!(w.len(), row_len);
+    let mut out = Vec::with_capacity(x.len());
+    for row in x.chunks_exact(row_len) {
+        let ss: f64 = row.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let inv = 1.0 / (ss / row_len as f64 + eps).sqrt();
+        for (i, &v) in row.iter().enumerate() {
+            let weight = if plus_one {
+                1.0 + w[i] as f64
+            } else {
+                w[i] as f64
+            };
+            out.push((v as f64 * inv * weight) as f32);
+        }
+    }
+    out
+}
+
+/// The standard RoPE frequency table: `theta^(-2i/rot_dims)` (M3 swaps in
+/// the GGUF `rope_freqs.weight` values / pinned `proportional` formula).
+pub fn inv_freqs(rot_dims: usize, theta: f64) -> Vec<f64> {
+    (0..rot_dims / 2)
+        .map(|i| theta.powf(-2.0 * i as f64 / rot_dims as f64))
+        .collect()
+}
+
+/// The CPU-filled cos/sin table the rope kernel consumes:
+/// `[token × half_rot]` of interleaved (cos, sin), f64 math, f32 storage.
+/// This function *is* the production table filler's reference semantics.
+pub fn cos_sin_table(inv_freq: &[f64], start_pos: u32, tokens: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(tokens * inv_freq.len() * 2);
+    for token in 0..tokens {
+        let pos = (start_pos as usize + token) as f64;
+        for &f in inv_freq {
+            let (s, c) = (pos * f).sin_cos();
+            out.push(c as f32);
+            out.push(s as f32);
+        }
+    }
+    out
+}
+
+/// Rotate-half RoPE over rows of [token × head × head_dim]; rotates the
+/// first `rot_dims` of each head with the tabulated cos/sin, leaves the tail
+/// untouched.
+pub fn rope(x: &mut [f32], head_dim: usize, rot_dims: usize, n_heads: usize, cos_sin: &[f32]) {
+    let half = rot_dims / 2;
+    for (row_idx, row) in x.chunks_exact_mut(head_dim).enumerate() {
+        let token = row_idx / n_heads;
+        for pair in 0..half {
+            let c = cos_sin[(token * half + pair) * 2] as f64;
+            let s = cos_sin[(token * half + pair) * 2 + 1] as f64;
+            let a = row[pair] as f64;
+            let b = row[pair + half] as f64;
+            row[pair] = (a * c - b * s) as f32;
+            row[pair + half] = (b * c + a * s) as f32;
+        }
+    }
+}
+
+/// gelu_pytorch_tanh(gate) * up.
+pub fn geglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
+    gate.iter()
+        .zip(up)
+        .map(|(&g, &u)| {
+            let g = g as f64;
+            let inner = (2.0 / std::f64::consts::PI).sqrt() * (g + 0.044715 * g * g * g);
+            (0.5 * g * (1.0 + inner.tanh()) * u as f64) as f32
+        })
+        .collect()
+}

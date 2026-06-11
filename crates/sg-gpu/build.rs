@@ -26,12 +26,87 @@ struct Variant {
     workgroup: [u32; 3],
 }
 
-const VARIANTS: &[Variant] = &[Variant {
-    name: "stub",
-    src: "stub",
-    defs: &[],
-    workgroup: [64, 1, 1],
-}];
+/// Gemma 4 geometry (validated by `sg_gguf::ModelDesc` at load time): the
+/// full set of shapes is known here, so every kernel is shape-specialized
+/// (plan 02).
+const VARIANTS: &[Variant] = &[
+    Variant {
+        name: "stub",
+        src: "stub",
+        defs: &[],
+        workgroup: [64, 1, 1],
+    },
+    // RMSNorm: hidden rows + the two QK-norm head_dims, each in both weight
+    // conventions (W_PLUS_ONE picked by M3 parity).
+    Variant {
+        name: "rmsnorm_5376",
+        src: "rmsnorm",
+        defs: &[("ROW_LEN", 5376)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "rmsnorm_5376_plus1",
+        src: "rmsnorm",
+        defs: &[("ROW_LEN", 5376), ("W_PLUS_ONE", 1)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "rmsnorm_512",
+        src: "rmsnorm",
+        defs: &[("ROW_LEN", 512)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "rmsnorm_512_plus1",
+        src: "rmsnorm",
+        defs: &[("ROW_LEN", 512), ("W_PLUS_ONE", 1)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "rmsnorm_256",
+        src: "rmsnorm",
+        defs: &[("ROW_LEN", 256)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "rmsnorm_256_plus1",
+        src: "rmsnorm",
+        defs: &[("ROW_LEN", 256), ("W_PLUS_ONE", 1)],
+        workgroup: [256, 1, 1],
+    },
+    // RoPE per attention site. Sliding: full rotation, θ=10k. Global:
+    // partial rotation (0.25 × 512 = 128 dims), θ=1M.
+    Variant {
+        name: "rope_sliding_q",
+        src: "rope",
+        defs: &[("HEAD_DIM", 256), ("ROT_DIMS", 256), ("N_HEADS", 32)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "rope_sliding_k",
+        src: "rope",
+        defs: &[("HEAD_DIM", 256), ("ROT_DIMS", 256), ("N_HEADS", 16)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "rope_global_q",
+        src: "rope",
+        defs: &[("HEAD_DIM", 512), ("ROT_DIMS", 128), ("N_HEADS", 32)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "rope_global_k",
+        src: "rope",
+        defs: &[("HEAD_DIM", 512), ("ROT_DIMS", 128), ("N_HEADS", 4)],
+        workgroup: [256, 1, 1],
+    },
+    Variant {
+        name: "geglu",
+        src: "geglu",
+        defs: &[],
+        workgroup: [256, 1, 1],
+    },
+];
 
 fn main() {
     println!("cargo::rerun-if-changed=shaders");
@@ -91,6 +166,34 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
     .validate(&module)
     .unwrap_or_else(|e| panic!("validate {display}: {e:?}"));
 
-    naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
+    // Whitelist the SPIR-V capabilities matching the device features
+    // GpuContext enables; without this naga reaches for capabilities like
+    // StorageInputOutput16 (16-bit stage IO) that compute storage access
+    // doesn't need and the device doesn't enable. Needing a capability
+    // outside this set is a build error — extend both this list and
+    // `context::required_features` together.
+    let capabilities = [
+        naga::back::spv::Capability::Shader,
+        naga::back::spv::Capability::Float16,
+        naga::back::spv::Capability::Int8,
+        naga::back::spv::Capability::Int16,
+        naga::back::spv::Capability::StorageBuffer16BitAccess,
+        naga::back::spv::Capability::UniformAndStorageBuffer16BitAccess,
+        naga::back::spv::Capability::GroupNonUniform,
+        naga::back::spv::Capability::GroupNonUniformArithmetic,
+        naga::back::spv::Capability::GroupNonUniformBallot,
+        naga::back::spv::Capability::GroupNonUniformShuffle,
+        naga::back::spv::Capability::GroupNonUniformShuffleRelative,
+        naga::back::spv::Capability::CooperativeMatrixKHR,
+        naga::back::spv::Capability::VulkanMemoryModel,
+    ];
+    let options = naga::back::spv::Options {
+        capabilities: Some(capabilities.into_iter().collect()),
+        // No f16 stage IO in compute; without this naga declares
+        // StorageInputOutput16 whenever f16 is enabled.
+        use_storage_input_output_16: false,
+        ..Default::default()
+    };
+    naga::back::spv::write_vec(&module, &info, &options, None)
         .unwrap_or_else(|e| panic!("spv-out {display}: {e}"))
 }
