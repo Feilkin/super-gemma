@@ -1422,9 +1422,11 @@ name = "sg-gpu"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "criterion",
  "half",
  "naga",
  "naga_oil",
+ "sg-gguf",
  "thiserror",
  "vulkano",
 ]

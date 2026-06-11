@@ -106,6 +106,38 @@ const VARIANTS: &[Variant] = &[
         defs: &[],
         workgroup: [256, 1, 1],
     },
+    // Q4_0 GEMV, one variant per matmul-site K (the N dimension is the
+    // dispatch size). Workgroup = one wave (probe: subgroup 64).
+    Variant {
+        name: "gemv_q4_0_k5376",
+        src: "gemv_q4_0",
+        defs: &[("K_DIM", 5376)],
+        workgroup: [64, 1, 1],
+    },
+    Variant {
+        name: "gemv_q4_0_k8192",
+        src: "gemv_q4_0",
+        defs: &[("K_DIM", 8192)],
+        workgroup: [64, 1, 1],
+    },
+    Variant {
+        name: "gemv_q4_0_k16384",
+        src: "gemv_q4_0",
+        defs: &[("K_DIM", 16384)],
+        workgroup: [64, 1, 1],
+    },
+    Variant {
+        name: "gemv_q4_0_k21504",
+        src: "gemv_q4_0",
+        defs: &[("K_DIM", 21504)],
+        workgroup: [64, 1, 1],
+    },
+    Variant {
+        name: "gemv_q4_0_generic",
+        src: "gemv_q4_0",
+        defs: &[("GENERIC_K", 1)],
+        workgroup: [64, 1, 1],
+    },
 ];
 
 fn main() {
