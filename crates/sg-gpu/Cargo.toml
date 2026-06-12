@@ -34,3 +34,7 @@ harness = false
 [[bench]]
 name = "attn_us"
 harness = false
+
+[[bench]]
+name = "head_kv"
+harness = false

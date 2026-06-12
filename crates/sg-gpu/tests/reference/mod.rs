@@ -178,6 +178,42 @@ pub fn attention_head(
     out
 }
 
+/// Q8_0 quantization in the kernels' structure-of-arrays page format,
+/// mirroring the GPU op-for-op in f32: per 32 weights, d = amax·(1/127)
+/// (f32, stored f16; a multiply so it is bit-identical to the GPU — FDiv
+/// is not), q = round_ties_even(x · 1/d). The 1/d reciprocal IS a
+/// division: the GPU may differ by an ulp, flipping a quant by ±1 at exact
+/// rounding boundaries (the parity test allows it). Returns (f16 scale
+/// bits, i8 quants as bytes).
+pub fn quant_q8_0(x: &[f32]) -> (Vec<u16>, Vec<u8>) {
+    assert!(x.len().is_multiple_of(32));
+    let mut scales = Vec::with_capacity(x.len() / 32);
+    let mut quants = Vec::with_capacity(x.len());
+    for block in x.chunks_exact(32) {
+        let amax = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let d = amax * (1.0 / 127.0);
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        scales.push(half::f16::from_f32(d).to_bits());
+        for &v in block {
+            quants.push((v * id).round_ties_even() as i8 as u8);
+        }
+    }
+    (scales, quants)
+}
+
+/// Q8_0 dequantization mirroring the GPU kernel: x = f16(f16_d · q).
+pub fn dequant_q8_0(scales: &[u16], quants: &[u8]) -> Vec<f32> {
+    assert_eq!(quants.len(), scales.len() * 32);
+    let mut out = Vec::with_capacity(quants.len());
+    for (blk, &s) in scales.iter().enumerate() {
+        let d = half::f16::from_bits(s).to_f32();
+        for &q in &quants[blk * 32..][..32] {
+            out.push(half::f16::from_f32(d * (q as i8) as f32).to_f32());
+        }
+    }
+    out
+}
+
 /// gelu_pytorch_tanh(gate) * up.
 pub fn geglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     gate.iter()

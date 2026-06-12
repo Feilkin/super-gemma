@@ -123,6 +123,22 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
   windows); **global 34 ms/chunk at 8K ctx and O(ctx²)** — fine to start, the known optimization
   target is a coopmat flash-attention rewrite, deferred until e2e profiling (decision with Ada
   2026-06-12: no more kernel micro-tuning before the full pipeline runs).
+- **KV plumbing + LM head (M2.6) green:** `kv_append_sliding` (ring, wraps via push-constant
+  pos) / `kv_append_global` (linear); `kv_quant_q8`/`kv_dequant_q8` — Q8_0 semantics in a
+  structure-of-arrays page format WE define (f16 scales array + word-aligned i8 quants array;
+  plan 04 pages use this), ~155 GiB/s each way, scales bit-exact vs CPU, quants ±1 at FDiv
+  rounding boundaries (GPU FDiv is 2.5 ULP; the GPU is the authoritative page producer and is
+  bit-deterministic — tested). `gemv_q6_k_logits`: the tied Q6_K LM head fused with the
+  tanh-30 softcap, f32 logits out — **5.45 ms/token at 198 GiB/s** (83 % of ceiling; decode
+  budget item). Q6_K rows are uploaded padded 4410 → 4416 bytes (`ROW_WORDS` 1104) so every
+  row starts word-aligned; the engine must repack on upload. Embedding LOOKUP (input side,
+  gather + dequant + sqrt(hidden) scale verify-item) is NOT an M2 kernel — M3 decides
+  CPU-vs-kernel.
+- Two more f32 gotchas pinned (kernel comments + here): **GPU FDiv is 2.5 ULP** (rcp-based) —
+  anything that must match the CPU bit-exactly must avoid runtime division (the Q8 scale is
+  amax·(1/127), a multiply); **pack2x16float truncates toward zero on RADV** (unspecified
+  rounding in SPIR-V) — use an `f16()` value conversion when RTNE matters. Also naga 29 and
+  naga_oil 0.22 both miscompile `bitcast<u32>(vec2<f16>)` (per-component lowering) — avoid.
 - Attention layouts (kernels and engine must agree): activations `[token × head × head_dim]`;
   ring/linear KV `[slot|token × n_kv_heads × head_dim]`; decode iterates ring slots in PHYSICAL
   order (order-invariant softmax; no ring-head arithmetic in-kernel); prefill takes a linear KV
@@ -159,8 +175,9 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
    profile with RGP/`RADV_DEBUG` wave occupancy counters to find the actual stall reason
    before touching the kernel again. At ~12 TFLOPS prefill is ~190 tok/s vs the ≥300 target;
    may also revisit after M2.7 command graphs (dispatch overhead currently in every number).
-2. **M2.6 kv_append/kv_quant (f16↔Q8_0) + logits softcap** (Q6_K tied head, tanh cap 30), then
-   **M2.7 pre-recorded command graphs** + uniform update + timestamp timing (plan 02 step 8).
+2. **M2.7 pre-recorded command graphs** + uniform update + timestamp timing (plan 02 step 8) —
+   the last M2 step; after it, the full-pipeline e2e profile (agreed with Ada 2026-06-12)
+   decides all further kernel optimization priorities.
 3. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)

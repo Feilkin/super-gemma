@@ -221,6 +221,60 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: false,
     },
+    // KV plumbing (plan 02 step 7): append into ring/linear stores, and
+    // f16↔Q8_0 block-pair codecs for cache2 page traffic.
+    Variant {
+        name: "kv_append_sliding",
+        src: "kv_append",
+        defs: &[("ROW_LEN", 4096), ("RING", 1024)],
+        workgroup: [256, 1, 1],
+        bindings: 2,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: false,
+    },
+    Variant {
+        name: "kv_append_global",
+        src: "kv_append",
+        defs: &[("ROW_LEN", 2048)],
+        workgroup: [256, 1, 1],
+        bindings: 2,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: false,
+    },
+    Variant {
+        name: "kv_quant_q8",
+        src: "kv_quant_q8",
+        defs: &[],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: false,
+    },
+    Variant {
+        name: "kv_dequant_q8",
+        src: "kv_dequant_q8",
+        defs: &[],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: false,
+    },
+    // Q6_K LM head with fused softcap (plan 02 step 7): rows padded from
+    // 4410 to 4416 bytes so each starts word-aligned.
+    Variant {
+        name: "gemv_q6_k_logits",
+        src: "gemv_q6_k_logits",
+        defs: &[("BLOCKS_PER_ROW", 21), ("ROW_WORDS", 1104)],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: false,
+    },
     // Attention (plan 02 step 6). Sliding: GQA 32:16, head_dim 256, window
     // 1024, separate K/V. Global: GQA 32:4, head_dim 512, K = V aliased.
     // Workgroups cover one KV head (× query token / split), computing the
