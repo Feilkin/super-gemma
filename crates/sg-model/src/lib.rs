@@ -11,10 +11,12 @@ pub mod graph;
 pub mod reference;
 pub mod rope;
 pub mod sampler;
+pub mod session;
 pub mod weights;
 
 pub use generate::{EOS_TOKENS, GenerateParams, StopReason};
 pub use graph::GpuModel;
 pub use reference::{Conventions, CpuKvCache, CpuModel, RefError};
 pub use sampler::{Sampler, SamplerParams};
+pub use session::Session;
 pub use weights::{GpuWeights, UploadError};

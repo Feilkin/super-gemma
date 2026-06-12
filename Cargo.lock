@@ -1378,6 +1378,9 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sg-gguf",
+ "sg-gpu",
+ "sg-model",
 ]
 
 [[package]]

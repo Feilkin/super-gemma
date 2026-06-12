@@ -36,6 +36,18 @@ use crate::weights::{GpuWeights, UploadError};
 const SPLITS_SLIDING: u32 = 16;
 const SPLITS_GLOBAL: u32 = 32;
 
+/// Layers per prefill SUBMISSION (one global layer each). A prefill chunk
+/// is split into segment command buffers because amdgpu's job watchdog
+/// (`lockup_timeout`, default 2000 ms on this kernel) kills any single
+/// submission running longer — a whole 60-layer chunk crosses 2 s near
+/// q0 ≈ 10K and was being ring-reset (diagnosed 2026-06-12; every "GPU
+/// hang" that day was this cliff). Segments also keep the desktop
+/// responsive. At 128K context the global-attention cost (~1 s/layer)
+/// approaches the limit again — the flash-attention rewrite is the
+/// durable fix; raising `amdgpu.lockup_timeout` on the box is the
+/// operational backstop.
+const PREFILL_SEGMENT_LAYERS: usize = 6;
+
 const HIDDEN: usize = 5376;
 const FFN: usize = 21504;
 
@@ -73,9 +85,10 @@ pub struct GpuModel<'a> {
     max_chunk: usize,
     /// Capacity of the linear global-KV stores, in tokens.
     global_cap: usize,
-    /// Recorded prefill graphs keyed by (padded_len, real_len, logits mode)
-    /// — the dispatch grids and append slices are shape-specific.
-    prefill_graphs: std::collections::HashMap<(usize, usize, LogitsMode), CommandGraph>,
+    /// Recorded prefill SEGMENT graphs keyed by (padded_len, real_len,
+    /// logits mode); segments are submitted in order (see
+    /// [`PREFILL_SEGMENT_LAYERS`]).
+    prefill_graphs: std::collections::HashMap<(usize, usize, LogitsMode), Vec<CommandGraph>>,
     /// `[max_chunk × vocab]` f32, allocated on first all-logits prefill
     /// (the perplexity path); ~270 MB at the default chunk size.
     logits_all: Option<Subbuffer<[f32]>>,
@@ -639,25 +652,36 @@ impl<'a> GpuModel<'a> {
         .map(|_| ())
     }
 
-    /// Record one prefill chunk: `m_pad` padded rows (multiple of 64),
-    /// `n_real` real tokens. Padding rows compute garbage nothing reads:
-    /// the causal mask hides their keys from real queries, KV appends bind
-    /// `n_real`-sliced sources, and logits read the last REAL row.
+    /// Record one prefill chunk as SEGMENT graphs of
+    /// [`PREFILL_SEGMENT_LAYERS`] layers, submitted in order. `m_pad`
+    /// padded rows (multiple of 64), `n_real` real tokens. Padding rows
+    /// compute garbage nothing reads: the causal mask hides their keys
+    /// from real queries, KV appends bind `n_real`-sliced sources, and
+    /// logits read the last REAL row.
     fn record_prefill(
         &self,
         m_pad: usize,
         n_real: usize,
         logits: LogitsMode,
-    ) -> Result<CommandGraph, GpuError> {
-        self.ctx.record_graph(|rec| {
-            for i in 0..self.desc.n_layers {
-                self.record_prefill_layer(rec, i, m_pad, n_real)?;
-            }
-            match logits {
-                LogitsMode::None => Ok(()),
-                LogitsMode::Last => self.record_prefill_logits(rec, n_real),
-            }
-        })
+    ) -> Result<Vec<CommandGraph>, GpuError> {
+        let n_layers = self.desc.n_layers;
+        let mut segments = Vec::new();
+        let mut start = 0;
+        while start < n_layers {
+            let end = (start + PREFILL_SEGMENT_LAYERS).min(n_layers);
+            let last = end == n_layers;
+            segments.push(self.ctx.record_graph(|rec| {
+                for i in start..end {
+                    self.record_prefill_layer(rec, i, m_pad, n_real)?;
+                }
+                match logits {
+                    LogitsMode::Last if last => self.record_prefill_logits(rec, n_real),
+                    _ => Ok(()),
+                }
+            })?);
+            start = end;
+        }
+        Ok(segments)
     }
 
     /// Chunked prefill returning per-position logits, `[n × vocab]` f32 —
@@ -687,7 +711,9 @@ impl<'a> GpuModel<'a> {
                 self.prefill_graphs.insert(key, g);
             }
             self.stage_prefill_chunk(chunk)?;
-            self.ctx.submit_blocking(&self.prefill_graphs[&key])?;
+            for segment in &self.prefill_graphs[&key] {
+                self.ctx.submit_blocking(segment)?;
+            }
             self.pos += n_real as u32;
 
             // Final norm over all rows, then the LM head in row batches.
@@ -750,6 +776,49 @@ impl<'a> GpuModel<'a> {
             out.extend_from_slice(&r[..n_real * vocab]);
         }
         Ok(out)
+    }
+
+    /// One full-size interior prefill chunk (no logits) as segment graphs,
+    /// uninstrumented — the profiler wall-times the segment sequence.
+    pub fn record_prefill_chunk_plain(&self) -> Result<Vec<CommandGraph>, GpuError> {
+        self.record_prefill(self.max_chunk, self.max_chunk, LogitsMode::None)
+    }
+
+    /// Decode graph over `layers` only, with per-dispatch timestamps —
+    /// kernel-level detail for a small representative range (e.g. one
+    /// sliding + one global layer, extrapolated by layer counts). Keep the
+    /// range SMALL: each timestamp drains the pipeline, which is harmless
+    /// on the serial decode path but destroys prefill's cross-layer
+    /// overlap — a fully-marked prefill chunk inflated past the 10 s
+    /// amdgpu watchdog (measured 2026-06-12). Totals come from wall-timing
+    /// the UNinstrumented graphs.
+    pub fn record_layers_kernel_profiled(
+        &self,
+        layers: Range<usize>,
+        timer: &sg_gpu::GpuTimer,
+    ) -> Result<(CommandGraph, Vec<&'static str>), GpuError> {
+        self.ctx.record_graph_profiled(timer, |rec| {
+            for i in layers.clone() {
+                self.record_layer(rec, i)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Prefill analog of [`Self::record_layers_kernel_profiled`]; the
+    /// same small-range caveat applies with more force (see there).
+    pub fn record_prefill_kernel_profiled(
+        &self,
+        layers: Range<usize>,
+        timer: &sg_gpu::GpuTimer,
+    ) -> Result<(CommandGraph, Vec<&'static str>), GpuError> {
+        let m = self.max_chunk;
+        self.ctx.record_graph_profiled(timer, |rec| {
+            for i in layers.clone() {
+                self.record_prefill_layer(rec, i, m, m)?;
+            }
+            Ok(())
+        })
     }
 
     /// Per-layer-range prefill graph for the parity harness (mirrors
@@ -1187,7 +1256,9 @@ impl<'a> GpuModel<'a> {
                 self.prefill_graphs.insert(key, g);
             }
             self.stage_prefill_chunk(chunk)?;
-            self.ctx.submit_blocking(&self.prefill_graphs[&key])?;
+            for segment in &self.prefill_graphs[&key] {
+                self.ctx.submit_blocking(segment)?;
+            }
             self.pos += n_real as u32;
         }
         self.read_logits()

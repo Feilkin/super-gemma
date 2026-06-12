@@ -8,7 +8,7 @@ fail-fast = false
 gpu-model = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'package(sg-model) and (test(gpu_graph) or test(prefill) or test(perplexity))'
+filter = 'package(sg-model) and (test(gpu_graph) or test(prefill) or test(perplexity) or test(session))'
 test-group = 'gpu-model'
 
 [profile.ci]

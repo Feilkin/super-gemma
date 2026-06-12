@@ -289,16 +289,76 @@ Suite hygiene: the model-heavy GPU tests each upload 17.5 GB and overflow the 80
 when nextest runs them concurrently — they're serialized via a `gpu-model` test group in
 `.config/nextest.toml`. Full workspace suite: 109 tests, ~5 min.
 
+## E2e profile (2026-06-12) — DONE; and THE WATCHDOG FINDING
+
+`cargo run --release -p sg-bench -- profile` → `bench/results/<sha>-e2e-profile.json`.
+Wall-timed uninstrumented graphs + per-dispatch timestamps over one representative layer
+of each kind (extrapolate ×50/×10).
+
+**Critical operational finding: this kernel's `amdgpu.lockup_timeout` default is 2000 ms**
+— any single GPU submission over ~2 s is killed (gfx ring reset, context lost). Every "GPU
+hang" chased on 2026-06-12 was this one cliff: the whole-chunk prefill graph crosses 2 s
+near q0 ≈ 10K; timestamp-drained graphs and the unbatched ppl LM head crossed it earlier.
+Diagnosed via `RADV_DEBUG=hang` dumps (hung pipeline with zero active waves = killed, not
+looping) + the rep0-pass/rep1-fail pattern sitting exactly on a 2.0 s boundary.
+Consequences, both landed:
+- **Prefill submits in 6-layer segments** (`PREFILL_SEGMENT_LAYERS`, one global layer
+  each): worst segment ≈ 0.3 s at 32K, ~1 s headroom at 128K. Parity unaffected (same
+  ops, fences between segments).
+- The perplexity LM head was already batched 32 rows/submission (same root cause,
+  misattributed to a 10 s watchdog at first).
+- **Recommendation for the box (Ada):** set `amdgpu.lockup_timeout=10000` (kernel
+  cmdline) as a backstop — a 2 s budget is tight for an inference workstation, and the
+  flash-attention rewrite only lowers, never removes, long-context submission times.
+
+Measured (median of 5, this box):
+
+| Phase | Result | Target (plan 06) |
+|---|---|---|
+| decode @ 1K / 8K / 32K | **11.7 / 11.4 / 10.3 tok/s** | ≥ 10 / 10 / 9.5 ✓ |
+| prefill 256-chunk @ q0 0 / 8K / 32K | **179 / 128 / 83 tok/s** | ≥ 300 ✗ |
+| CPU per decode step | stage 23 µs + sampler ≤ 423 µs + overhead ~310 µs | ≪ 75 ms budget ✓ |
+
+Optimization ranking (per-layer medians from the rep-layer breakdown):
+
+1. **`attn_prefill_global`: 0.42 → 35.6 → 141 ms/layer at q0 0 / 8K / 32K** — 46 % of the
+   chunk at 32K and growing linearly per chunk (quadratic per prompt). The coopmat
+   flash-attention rewrite is both the prefill-throughput fix at context and the
+   watchdog-pressure fix. Clear #1.
+2. **Coopmat GEMM** (~12 TFLOPS): the FFN pair (`n21504` + `n5376`) is ~17–21 ms of every
+   ~28 ms layer — ~70 % of short-context prefill; 179 vs ≥300 tok/s is mostly this.
+   Structural levers exhausted (M2 dead-ends); the **int8 coopmat path
+   (SINT8×SINT8→SINT32, probed available) is the MMQ-style candidate** — likely faster
+   AND more accurate than f16×f16 (llama.cpp's quantization bias measured in the ppl
+   work was on its activation side; ours would quantize activations Q8 too — needs a
+   quality gate).
+3. Decode is healthy: gemv-dominated (~1.16 ms/layer of weight streaming = the bandwidth
+   floor), `attn_decode_global` 1.23 ms/layer at 32K (the K≠V ×2 traffic is visible but
+   only ~12 % of a decode step). LM head 5.45 ms ≈ 6 %. Tuning here buys little until
+   MTP (M7.5) multiplies decode value.
+4. CPU side is a non-issue (stage_chunk 3.6 ms per 256 tokens, single-threaded dequant —
+   rayon it if it ever shows).
+
+## M5 (2026-06-12) — in-memory incremental sessions, gate green
+
+`sg_model::Session` (plan 03 engine flow with cache2 stubbed): one resident conversation;
+a request's prompt reuses the longest common prefix of the resident history and prefills
+only the suffix. Reuse is **append-only**: rolling back to a mid-history position is
+impossible in-memory — every position `p` past the rollback point overwrote ring slot
+`p % 1024`, which belonged to position `p − 1024`, inside the rollback point's window
+(this is exactly why plan 04's cache2 keeps tail snapshots; until M6, divergence and
+full-prompt retries reset and recompute). Gate (`tests/session.rs`): replay of the same
+request sequence is **bit-exact**; resumed-vs-cold greedy generations agree exactly;
+the divergence path matches a cold run bitwise.
+
 ## Immediate next steps (in order)
 
-1. **Full-pipeline e2e profile** (agreed with Ada 2026-06-12), now that M4 runs: it ranks
-   all further kernel work — coopmat GEMM ~12 of 17.7 TFLOPS, prefill-global attention
-   O(ctx²), LM head at 83 % of ceiling, global decode KV traffic ×2 (K≠V), and the
-   int8-coopmat (SINT8×SINT8→SINT32, probed available) MMQ-style GEMM as a possible
-   accuracy+speed lever.
-2. **M5: in-memory caching across requests** (sliding ring + resident global KV reuse,
-   incremental decode; cache-on ≡ cache-off bit-identical gate).
-3. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
+1. **Coopmat flash-attention rewrite of `attn_prefill_global`** (profile rank #1), then
+   re-profile; consider the int8-MMQ GEMM (rank #2) behind a quality gate.
+2. **M6: cache2** (NVMe radix trie, paging, tail snapshots, eviction) — the in-memory
+   session substrate (M5) is proven; plan 04.
+3. Ask Ada to set `amdgpu.lockup_timeout=10000` on the box (see the watchdog finding).
+4. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)
 

@@ -76,6 +76,18 @@ pub struct CommandGraph {
 pub struct GraphRecorder<'a> {
     ctx: &'a GpuContext,
     builder: AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    /// When profiling: the timer plus one label per recorded interval.
+    /// `auto` stamps after every dispatch (`record_graph_profiled` — keep
+    /// such graphs SMALL: per-dispatch timestamps at graph scale melted
+    /// both vulkano's recording and the GPU ring, see sg-bench/profile.rs);
+    /// otherwise only explicit [`Self::mark`] calls stamp.
+    prof: Option<Prof<'a>>,
+}
+
+struct Prof<'a> {
+    timer: &'a GpuTimer,
+    labels: Vec<&'static str>,
+    auto: bool,
 }
 
 impl GraphRecorder<'_> {
@@ -109,6 +121,33 @@ impl GraphRecorder<'_> {
         // SAFETY: dispatch bounds are the caller's contract with the kernel;
         // all our kernels bounds-check against arrayLength or baked sizes.
         unsafe { self.builder.dispatch(groups) }.map_err(|e| GpuError::Pipeline(e.to_string()))?;
+
+        if self.prof.as_ref().is_some_and(|p| p.auto) {
+            let name = kernel.name;
+            self.mark(name)?;
+        }
+        Ok(self)
+    }
+
+    /// Record a profiling timestamp closing an interval labelled `label`.
+    /// Only valid inside a profiled recording.
+    pub fn mark(&mut self, label: &'static str) -> Result<&mut Self, GpuError> {
+        let Some(prof) = self.prof.take() else {
+            return Err(GpuError::Validation(
+                "mark() outside a profiled recording".into(),
+            ));
+        };
+        let index = prof.labels.len() as u32 + 1;
+        if index >= prof.timer.count {
+            return Err(GpuError::Validation(format!(
+                "profiling timer too small: {} queries for >{index} timestamps",
+                prof.timer.count
+            )));
+        }
+        self.timestamp(prof.timer, index)?;
+        let mut prof = prof;
+        prof.labels.push(label);
+        self.prof = Some(prof);
         Ok(self)
     }
 
@@ -150,9 +189,16 @@ impl GpuTimer {
     /// Read all timestamps in nanoseconds (waits for availability). Only
     /// meaningful after the graph containing the writes has been submitted.
     pub fn read_ns(&self) -> Result<Vec<f64>, GpuError> {
-        let mut ticks = vec![0u64; self.count as usize];
+        self.read_ns_prefix(self.count)
+    }
+
+    /// Read the first `n` timestamps — for profiled graphs that wrote
+    /// fewer queries than the pool holds (waiting on unwritten queries
+    /// would block forever).
+    pub fn read_ns_prefix(&self, n: u32) -> Result<Vec<f64>, GpuError> {
+        let mut ticks = vec![0u64; n as usize];
         self.pool
-            .get_results(0..self.count, &mut ticks, QueryResultFlags::WAIT)
+            .get_results(0..n, &mut ticks, QueryResultFlags::WAIT)
             .map_err(GpuError::validated)?;
         Ok(ticks
             .into_iter()
@@ -200,10 +246,85 @@ impl GpuContext {
             CommandBufferUsage::MultipleSubmit,
         )
         .map_err(GpuError::validated)?;
-        let mut recorder = GraphRecorder { ctx: self, builder };
+        let mut recorder = GraphRecorder {
+            ctx: self,
+            builder,
+            prof: None,
+        };
         record(&mut recorder)?;
         let cb = recorder.builder.build().map_err(GpuError::validated)?;
         Ok(CommandGraph { cb })
+    }
+
+    /// Like [`Self::record_graph`], but every dispatch is followed by a
+    /// timestamp into `timer` (query 0 marks the start). Returns one label
+    /// per interval: dispatch `i`'s duration is `ts[i+1] − ts[i]`.
+    ///
+    /// **Keep these graphs small** (≲ 100 dispatches): a full decode graph
+    /// (~1400 dispatches) with per-dispatch timestamps took minutes of
+    /// auto-sync recording CPU and then tripped the amdgpu ring watchdog.
+    /// For graph-scale profiling use [`Self::record_graph_with_marks`].
+    ///
+    /// Attribution caveat: BottomOfPipe timestamps partition the total
+    /// time exactly, but where adjacent dispatches overlap (no barrier
+    /// between them), an interval's time may include a neighbour's tail —
+    /// fine for ranking, not for microbenchmarking a single kernel.
+    pub fn record_graph_profiled<F>(
+        &self,
+        timer: &GpuTimer,
+        record: F,
+    ) -> Result<(CommandGraph, Vec<&'static str>), GpuError>
+    where
+        F: FnOnce(&mut GraphRecorder<'_>) -> Result<(), GpuError>,
+    {
+        self.record_profiled_inner(timer, true, record)
+    }
+
+    /// Profiled recording with MANUAL interval boundaries: only
+    /// [`GraphRecorder::mark`] calls stamp (query 0 = start). The cheap
+    /// way to profile big graphs — e.g. one mark per layer.
+    pub fn record_graph_with_marks<F>(
+        &self,
+        timer: &GpuTimer,
+        record: F,
+    ) -> Result<(CommandGraph, Vec<&'static str>), GpuError>
+    where
+        F: FnOnce(&mut GraphRecorder<'_>) -> Result<(), GpuError>,
+    {
+        self.record_profiled_inner(timer, false, record)
+    }
+
+    fn record_profiled_inner<F>(
+        &self,
+        timer: &GpuTimer,
+        auto: bool,
+        record: F,
+    ) -> Result<(CommandGraph, Vec<&'static str>), GpuError>
+    where
+        F: FnOnce(&mut GraphRecorder<'_>) -> Result<(), GpuError>,
+    {
+        let builder = AutoCommandBufferBuilder::primary(
+            self.command_buffer_allocator().clone(),
+            self.queue().queue_family_index(),
+            CommandBufferUsage::MultipleSubmit,
+        )
+        .map_err(GpuError::validated)?;
+        let mut recorder = GraphRecorder {
+            ctx: self,
+            builder,
+            prof: None,
+        };
+        recorder.reset_timer(timer)?;
+        recorder.timestamp(timer, 0)?;
+        recorder.prof = Some(Prof {
+            timer,
+            labels: Vec::new(),
+            auto,
+        });
+        record(&mut recorder)?;
+        let labels = recorder.prof.take().expect("prof attached above").labels;
+        let cb = recorder.builder.build().map_err(GpuError::validated)?;
+        Ok((CommandGraph { cb }, labels))
     }
 
     /// Submit a pre-recorded graph and wait for completion.
