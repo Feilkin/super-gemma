@@ -30,3 +30,7 @@ harness = false
 [[bench]]
 name = "gemm_tflops"
 harness = false
+
+[[bench]]
+name = "attn_us"
+harness = false

@@ -131,6 +131,53 @@ pub fn rope(x: &mut [f32], head_dim: usize, rot_dims: usize, n_heads: usize, cos
     }
 }
 
+/// Full-softmax attention for one (query token, query head) over the
+/// inclusive key range [t0, t1], f64 throughout. GQA: query head `qh` reads
+/// KV head `qh / (n_q_heads / n_kv_heads)`. Pass `v = k` for the K=V global
+/// layers. Layouts match the kernels: q `[m × n_q_heads × head_dim]`,
+/// k/v `[l × n_kv_heads × head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_head(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    i: usize,
+    qh: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    scale: f64,
+    t0: usize,
+    t1: usize,
+) -> Vec<f32> {
+    let kvh = qh / (n_q_heads / n_kv_heads);
+    let qrow = &q[(i * n_q_heads + qh) * head_dim..][..head_dim];
+    let scores: Vec<f64> = (t0..=t1)
+        .map(|t| {
+            let krow = &k[(t * n_kv_heads + kvh) * head_dim..][..head_dim];
+            let dot: f64 = qrow
+                .iter()
+                .zip(krow)
+                .map(|(&a, &b)| a as f64 * b as f64)
+                .sum();
+            dot * scale
+        })
+        .collect();
+    let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
+    let denom: f64 = exps.iter().sum();
+    let mut out = vec![0.0f32; head_dim];
+    for (d, o) in out.iter_mut().enumerate() {
+        let acc: f64 = exps
+            .iter()
+            .zip(t0..=t1)
+            .map(|(&e, t)| e * v[(t * n_kv_heads + kvh) * head_dim + d] as f64)
+            .sum();
+        *o = (acc / denom) as f32;
+    }
+    out
+}
+
 /// gelu_pytorch_tanh(gate) * up.
 pub fn geglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     gate.iter()

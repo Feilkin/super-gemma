@@ -112,6 +112,23 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
   GPU trig loses ~1e-2 by pos 100K), geglu, gemv_q4_0 ×4 K-shapes + generic baseline,
   gemm_q4_0 (coopmat) ×8 shapes + gemm_st_q4_0 (subgroup-tiled fallback) ×8.
 - **gemv_q4_0: 218 GiB/s (91 % of bandwidth ceiling — beats the ≥85 % target).** Decode is set.
+- **Attention (M2.5) green: all four kernels + shared split-K reducer**, parity vs f64 reference
+  (window-boundary mid-chunk, partial/full ring, uneven and empty splits) and bit-deterministic.
+  Both decode kernels are split-K + reduce (`attn_reduce_d256`/`_d512`): their natural workgroup
+  counts (16/4 KV heads) leave the 40-CU GPU latency-bound — sliding decode measured 322 µs →
+  37 µs with 16 splits. Global decode with splits ∝ ctx holds ~1.2 ms/layer at any context
+  (32 splits at 32K; 36.7 ms unsplit). K=V on global layers is native: one read serves score and
+  weighted sum. GQA: workgroup per KV head computing its Q_PER_KV query heads. Softmax scale is
+  a push constant (M3 verify-item pins the value). Prefill: sliding 3.6 ms/chunk (M=256, full
+  windows); **global 34 ms/chunk at 8K ctx and O(ctx²)** — fine to start, the known optimization
+  target is a coopmat flash-attention rewrite, deferred until e2e profiling (decision with Ada
+  2026-06-12: no more kernel micro-tuning before the full pipeline runs).
+- Attention layouts (kernels and engine must agree): activations `[token × head × head_dim]`;
+  ring/linear KV `[slot|token × n_kv_heads × head_dim]`; decode iterates ring slots in PHYSICAL
+  order (order-invariant softmax; no ring-head arithmetic in-kernel); prefill takes a linear KV
+  view with `q0` history keys, query i at key index q0+i. Split-K partials
+  `[q_head × split × (head_dim + 2)]` f32 (acc, m, l); n_splits must be a deterministic
+  function of kv_len for bit-exact reruns.
 - **gemm_q4_0 (coopmat): 11.5–12.5 TFLOPS (≈20 % of peak; run-to-run clock drift); gemm_st
   fallback: 3.3 TFLOPS.** Target ≥30 % of peak (17.7) not yet met → see below. Was 0.4 before
   fixing three poisons: per-byte serialized global loads in dequant (now 9-word block-pair
@@ -130,7 +147,9 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
   naga_oil 0.22 corrupts coopmat IR (those shaders compile via plain naga, `raw: true`);
   WGSL coopmat = `enable wgpu_cooperative_matrix`, `coop_mat16x16<f16, A/B/C>`,
   `coopLoad/coopLoadT/coopStore/coopMultiplyAdd`; **naga emits user functions as real SPIR-V
-  calls — a helper wrapping the hot 9-word load+dequant cost 1.6×; keep hot loops inline.**
+  calls — a helper wrapping the hot 9-word load+dequant cost 1.6×; keep hot loops inline**;
+  naga 29 implements `subgroupAdd` but not the `enable subgroups` directive — omit the
+  directive and compile those shaders via plain naga (`raw: true`, naga_oil rejects them too).
 
 ## Immediate next steps (in order)
 
@@ -140,9 +159,8 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
    profile with RGP/`RADV_DEBUG` wave occupancy counters to find the actual stall reason
    before touching the kernel again. At ~12 TFLOPS prefill is ~190 tok/s vs the ≥300 target;
    may also revisit after M2.7 command graphs (dispatch overhead currently in every number).
-2. **M2.5 attention kernels** (prefill sliding/global, decode sliding/global incl. K=V single
-   read + split-K), then kv_append/quant + logits softcap (Q6_K tied head), then pre-recorded
-   command graphs (plan 02 step 8).
+2. **M2.6 kv_append/kv_quant (f16↔Q8_0) + logits softcap** (Q6_K tied head, tanh cap 30), then
+   **M2.7 pre-recorded command graphs** + uniform update + timestamp timing (plan 02 step 8).
 3. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)

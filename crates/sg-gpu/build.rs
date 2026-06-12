@@ -221,6 +221,79 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: false,
     },
+    // Attention (plan 02 step 6). Sliding: GQA 32:16, head_dim 256, window
+    // 1024, separate K/V. Global: GQA 32:4, head_dim 512, K = V aliased.
+    // Workgroups cover one KV head (× query token / split), computing the
+    // Q_PER_KV query heads that share it.
+    // (The subgroupAdd kernels compile via plain naga, like coopmat:
+    // naga_oil rejects `enable subgroups`.)
+    // Both decode kernels are split-K + reduce: their natural workgroup
+    // counts (16/4 KV heads) leave a 40-CU GPU latency-bound.
+    Variant {
+        name: "attn_decode_sliding",
+        src: "attn_decode_sliding",
+        defs: &[("HEAD_DIM", 256), ("N_KV_HEADS", 16), ("Q_PER_KV", 2)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 12,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "attn_decode_global",
+        src: "attn_decode_global",
+        defs: &[("HEAD_DIM", 512), ("N_KV_HEADS", 4), ("Q_PER_KV", 8)],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 12,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "attn_reduce_d256",
+        src: "attn_reduce",
+        defs: &[("HEAD_DIM", 256)],
+        workgroup: [64, 1, 1],
+        bindings: 2,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: false,
+    },
+    Variant {
+        name: "attn_reduce_d512",
+        src: "attn_reduce",
+        defs: &[("HEAD_DIM", 512)],
+        workgroup: [64, 1, 1],
+        bindings: 2,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: false,
+    },
+    Variant {
+        name: "attn_prefill_sliding",
+        src: "attn_prefill_sliding",
+        defs: &[
+            ("HEAD_DIM", 256),
+            ("N_KV_HEADS", 16),
+            ("Q_PER_KV", 2),
+            ("WINDOW", 1024),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 8,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "attn_prefill_global",
+        src: "attn_prefill_global",
+        defs: &[("HEAD_DIM", 512), ("N_KV_HEADS", 4), ("Q_PER_KV", 8)],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 8,
+        subgroup_size: 0,
+        raw: true,
+    },
     // Coopmat Q4_0 GEMM (prefill), one variant per (K, N) site.
     Variant {
         name: "gemm_q4_0_k5376_n8192",
