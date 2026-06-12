@@ -91,13 +91,18 @@ def main():
     )
     version_str = (version.stderr + version.stdout).strip().splitlines()[0]
 
+    # CPU backend on purpose: f32 accumulation makes a far tighter oracle
+    # for the f32/f64 CPU reference than the HIP f16 kernels. Measured on
+    # the 2054-token prompt (2026-06-12): llama.cpp's own fa=on vs fa=off
+    # GPU backends differ by up to Δ 0.41 logprob / KL 0.03 — noise the
+    # parity thresholds would otherwise have to absorb.
     proc = subprocess.Popen(
         [
             "llama-server",
             "--model", str(MODEL),
             "--port", str(PORT),
             "--ctx-size", "4096",
-            "-ngl", "99",
+            "-ngl", "0",
             "--no-warmup",
         ],
         stdout=subprocess.DEVNULL,

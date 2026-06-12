@@ -145,8 +145,10 @@ impl<'a> CpuModel<'a> {
     }
 
     /// Run `tokens` (absolute positions `cache.len()..`) through the full
-    /// stack, appending to `cache`. Returns logits for every input token,
-    /// `[n_tokens × vocab]`, softcap applied.
+    /// stack, appending to `cache`. Returns logits for the LAST input token
+    /// (`[vocab]`, softcap applied) — the production semantics (plan 03:
+    /// no logits GEMM over prefill positions), and the 262k-vocab head over
+    /// every position would dominate long-prompt oracle runs.
     ///
     /// Tap points per layer: `attn_norm`, `q_rope`, `k_rope`, `v_norm`,
     /// `attn_out`, `post_attn_norm`, `h_attn` (post-residual), `ffn_norm`,
@@ -302,8 +304,9 @@ impl<'a> CpuModel<'a> {
         self.rmsnorm_rows(&mut x, hidden, "output_norm.weight");
         tap("final_norm", NO_LAYER, &x);
 
-        // Tied Q6_K LM head + tanh-30 softcap.
-        let mut logits = matmul(&embd, &x, n);
+        // Tied Q6_K LM head + tanh-30 softcap, last token only.
+        let last = &x[(n - 1) * hidden..][..hidden];
+        let mut logits = matmul(&embd, last, 1);
         let cap = d.final_logit_softcap;
         for v in logits.iter_mut() {
             *v = cap * (*v / cap).tanh();
@@ -375,9 +378,31 @@ fn head_rows(
         .map(move |(i, c)| (i / n_heads, c))
 }
 
+/// f64 dot product with 8 independent accumulator lanes, merged in fixed
+/// order. Deterministic for a given length like the strict sequential sum
+/// (and slightly *more* accurate — shorter chains), but vectorizable: the
+/// strict `.sum()` was the long-prompt oracle bottleneck (~95 % of a
+/// 2K-token forward), and a serial f64 reduction cannot be SIMD'd.
+fn dot_f64(a: &[f32], b: &[f32]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = [0.0f64; 8];
+    let (a8, a_tail) = a.split_at(a.len() / 8 * 8);
+    let (b8, b_tail) = b.split_at(a8.len());
+    for (ac, bc) in a8.chunks_exact(8).zip(b8.chunks_exact(8)) {
+        for j in 0..8 {
+            acc[j] += ac[j] as f64 * bc[j] as f64;
+        }
+    }
+    let mut sum: f64 = acc.iter().sum();
+    for (&x, &y) in a_tail.iter().zip(b_tail) {
+        sum += x as f64 * y as f64;
+    }
+    sum
+}
+
 /// `y = W·x` for all tokens: `x` is `[n_tokens × n_in]` token-major,
 /// result `[n_tokens × n_out]` token-major. Rows are dequantized on the
-/// fly; dots accumulate in f64. Deterministic (no reduction reordering).
+/// fly; dots accumulate in f64 lanes ([`dot_f64`]) — deterministic.
 fn matmul(w: &MatWeight<'_>, x: &[f32], n_tokens: usize) -> Vec<f32> {
     assert_eq!(x.len(), n_tokens * w.n_in);
     // Row-major intermediate so rayon can hand each weight row a disjoint
@@ -389,13 +414,7 @@ fn matmul(w: &MatWeight<'_>, x: &[f32], n_tokens: usize) -> Vec<f32> {
             row_buf.resize(w.n_in, 0.0);
             dequant_row(w, r, row_buf);
             for (t, d) in dst.iter_mut().enumerate() {
-                let xs = &x[t * w.n_in..][..w.n_in];
-                let acc: f64 = row_buf
-                    .iter()
-                    .zip(xs)
-                    .map(|(&a, &b)| a as f64 * b as f64)
-                    .sum();
-                *d = acc as f32;
+                *d = dot_f64(row_buf, &x[t * w.n_in..][..w.n_in]) as f32;
             }
         },
     );
@@ -471,8 +490,7 @@ fn attention(
         for kp in lo..=q_pos {
             debug_assert!(kp < kv_len);
             let kr = &ck[(kp * n_kv + kvh) * hd..][..hd];
-            let dot: f64 = qr.iter().zip(kr).map(|(&a, &b)| a as f64 * b as f64).sum();
-            scores.push(dot * scale as f64);
+            scores.push(dot_f64(qr, kr) * scale as f64);
         }
         let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let mut sum = 0.0f64;

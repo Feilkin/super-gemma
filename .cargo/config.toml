@@ -1,0 +1,11 @@
+# One model, one box (README): production code runs only on the Framework
+# Desktop, so building for the host CPU is always right. The practical win
+# is AVX-512 in the CPU reference oracle's f64 dot lanes (sg-model) —
+# baseline x86-64 codegen left it at 2-wide SSE2.
+#
+# Tier 1 CI builds with the hosted runner's own `native` — fine: nothing
+# performance- or bit-sensitive runs there (the oracle's float bits are not
+# pinned across machines; determinism contracts are within-run / within-box,
+# plan 06).
+[build]
+rustflags = ["-C", "target-cpu=native"]

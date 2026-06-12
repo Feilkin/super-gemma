@@ -48,11 +48,11 @@ fn forward_invariants_and_decode_prefill_bitexact() {
             v5 = data.to_vec();
         }
     });
-    assert_eq!(logits_a.len(), PROMPT.len() * vocab);
+    assert_eq!(logits_a.len(), vocab); // last token only
     assert_eq!(cache_a.len(), PROMPT.len());
 
     // Sanity: finite, softcap-bounded, non-degenerate logits.
-    let last = &logits_a[(PROMPT.len() - 1) * vocab..];
+    let last = &logits_a[..];
     assert!(last.iter().all(|v| v.is_finite()));
     assert!(last.iter().all(|v| v.abs() <= cap));
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
