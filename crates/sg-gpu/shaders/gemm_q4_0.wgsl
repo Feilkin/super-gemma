@@ -6,9 +6,25 @@
 // (N_TILES·16)(rows) × 64(K) strip of W — one aligned Q4_0 block pair per
 // thread, bulk-loaded as 9 words like the gemv kernel — into workgroup
 // memory, then runs M_TILES × N_TILES × 4 coopMultiplyAdds (KHR cooperative
-// matrix, probed f16×f16→f32 16×16×16 config). A tiles are loaded once per
-// K-substep and reused across the N strip; the column-major B load from the
-// staging buffer transposes Wᵀ for free.
+// matrix, probed f16×f16→f32 16×16×16 config). B tiles are loaded once per
+// K-substep and held in registers across the M tiles; A tiles are loaded
+// once per (substep, mt) and reused across the N strip; the column-major B
+// load from the staging buffer transposes Wᵀ for free.
+//
+// The loop structure is deliberately the naive load → dequant → barrier →
+// MMA → barrier: ACO plus multi-workgroup occupancy already overlap the
+// staging with MMAs from other waves, and every "smarter" variant measured
+// SLOWER (see the dead-ends list in this directory's history / STATUS.md):
+//   - LDS-staged A tiles            −30 % (coopLoadT from L2 is fine)
+//   - K-step 128 (16 KB b_tile)     −3 %
+//   - register prefetch of next w0..w8  −20 % (register pressure)
+//   - double-buffered b_tile        −40 %
+//   - tile-contiguous B layout      −3 %
+//   - wave32 via required_subgroup_size −25 % (acc VGPRs double per lane,
+//     hits the 256-VGPR ceiling; RDNA3.5 wmma shows no wave64 penalty)
+//   - shared WGSL helper for the 9-word load+dequant  −40 % (naga emits
+//     real calls; the boundary breaks ACO's load clustering — keep it
+//     inline)
 //
 // Constraints: M must be a multiple of M_TILES·16 (the engine pads prefill
 // chunks); N_TILES·16 == WG_X so the dequant assigns one W row per thread;
@@ -51,8 +67,7 @@ fn main(
     // This thread dequantizes one aligned Q4_0 block PAIR (64 weights, 36
     // bytes = 9 contiguous words, the gemv access pattern) of W row n0+lid
     // each K-step. One bulk load instead of per-byte global reads.
-    let row_n = n0 + lid;
-    let row_word_base = row_n * (BLOCKS_PER_ROW * 18u / 4u);
+    let row_word_base = (n0 + lid) * (BLOCKS_PER_ROW * 18u / 4u);
 
     for (var k0 = 0u; k0 < K; k0 += 64u) {
         let wb = row_word_base + (k0 / 64u) * 9u;
@@ -78,20 +93,22 @@ fn main(
         dequant_block(unpack2x16float(w4).y, w5, w6, w7, w8, lid * 64u + 32u);
         workgroupBarrier();
 
-        // Four 16-wide K substeps over the staged strip; A reused across
-        // the whole N strip.
+        // Four 16-wide K substeps over the staged strip.
         for (var s = 0u; s < 4u; s += 1u) {
+            var b: array<coop_mat16x16<f16, B>, N_TILES>;
+            for (var nt = 0u; nt < N_TILES; nt += 1u) {
+                b[nt] = coopLoad<coop_mat16x16<f16, B>>(
+                    &b_tile[nt * 16u * 64u + s * 16u],
+                    64u,
+                );
+            }
             for (var mt = 0u; mt < M_TILES; mt += 1u) {
                 let a = coopLoadT<coop_mat16x16<f16, A>>(
                     &x[(m0 + mt * 16u) * K + k0 + s * 16u],
                     K,
                 );
                 for (var nt = 0u; nt < N_TILES; nt += 1u) {
-                    let b = coopLoad<coop_mat16x16<f16, B>>(
-                        &b_tile[nt * 16u * 64u + s * 16u],
-                        64u,
-                    );
-                    acc[mt * N_TILES + nt] = coopMultiplyAdd(a, b, acc[mt * N_TILES + nt]);
+                    acc[mt * N_TILES + nt] = coopMultiplyAdd(a, b[nt], acc[mt * N_TILES + nt]);
                 }
             }
         }

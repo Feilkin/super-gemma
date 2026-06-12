@@ -112,24 +112,34 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
   GPU trig loses ~1e-2 by pos 100K), geglu, gemv_q4_0 ×4 K-shapes + generic baseline,
   gemm_q4_0 (coopmat) ×8 shapes + gemm_st_q4_0 (subgroup-tiled fallback) ×8.
 - **gemv_q4_0: 218 GiB/s (91 % of bandwidth ceiling — beats the ≥85 % target).** Decode is set.
-- **gemm_q4_0 (coopmat): 6.4 TFLOPS; gemm_st fallback: 3.3 TFLOPS.** Target ≥30 % of peak
-  (17.7) not yet met → see below. Was 0.4 before fixing three poisons: per-byte serialized
-  global loads in dequant (now 9-word block-pair loads like gemv), naga's injected per-iteration
-  loop bounding (`force_loop_bounding: false`), and single-lane LDS zero-init
-  (`zero_initialize_workgroup_memory: None` — kernels never read unwritten LDS).
-  Tried and rejected: LDS-staged A tiles (30 % slower than global coopLoadT).
+- **gemm_q4_0 (coopmat): 11.5–12.5 TFLOPS (≈20 % of peak; run-to-run clock drift); gemm_st
+  fallback: 3.3 TFLOPS.** Target ≥30 % of peak (17.7) not yet met → see below. Was 0.4 before
+  fixing three poisons: per-byte serialized global loads in dequant (now 9-word block-pair
+  loads like gemv), naga's injected per-iteration loop bounding (`force_loop_bounding: false`),
+  and single-lane LDS zero-init (`zero_initialize_workgroup_memory: None` — kernels never read
+  unwritten LDS). Then ~1.9× from M_TILES 2→4 (64×64 C block per workgroup: halves W traffic,
+  doubles FLOPs per dequant) + B tiles hoisted into registers across the M loop.
+- **Tuning dead-ends, all measured (do not retry without RGP evidence; list also in the shader
+  header):** LDS-staged A (−30 %), M_TILES=8 (−10 %, VGPR pressure), K-step 128 (−3 %),
+  register prefetch of next weight words (−20 %), double-buffered b_tile (−40 %),
+  tile-contiguous B LDS layout (−3 %), wave32 via `required_subgroup_size` (−25 %: per-lane
+  acc VGPRs double → 256-VGPR ceiling; RDNA3.5 wmma shows no wave64 penalty). The plumbing for
+  pinning a subgroup size (KernelBlob/Variant `subgroup_size`) is in place but unused; using
+  it again requires enabling `subgroup_size_control` in `GpuContext`.
 - Toolchain gotchas pinned in code comments: naga 29 spells push constants `var<immediate>`;
   naga_oil 0.22 corrupts coopmat IR (those shaders compile via plain naga, `raw: true`);
   WGSL coopmat = `enable wgpu_cooperative_matrix`, `coop_mat16x16<f16, A/B/C>`,
-  `coopLoad/coopLoadT/coopStore/coopMultiplyAdd`.
+  `coopLoad/coopLoadT/coopStore/coopMultiplyAdd`; **naga emits user functions as real SPIR-V
+  calls — a helper wrapping the hot 9-word load+dequant cost 1.6×; keep hot loops inline.**
 
 ## Immediate next steps (in order)
 
-1. **gemm_q4_0 tuning to ≥30 % of peak (17.7 TFLOPS; at 6.4).** Next levers, profiling-driven
-   (RGP): ISA dump showed real `v_wmma` in wave64 — try wave32 (`required_subgroup_size`),
-   bigger M_TILES/N_TILES register blocking, double-buffered B staging, B-operand LDS layout
-   (bank conflicts on the column-major coopLoad), K-step 128. At 6.4 TFLOPS prefill would be
-   ~100 tok/s vs the ≥300 target.
+1. **gemm_q4_0 tuning to ≥30 % of peak (17.7 TFLOPS; at ~12).** The cheap structural levers
+   are exhausted (see dead-ends above — every variant of the naive
+   load→dequant→barrier→MMA→barrier loop measured slower). Next step is evidence-first:
+   profile with RGP/`RADV_DEBUG` wave occupancy counters to find the actual stall reason
+   before touching the kernel again. At ~12 TFLOPS prefill is ~190 tok/s vs the ≥300 target;
+   may also revisit after M2.7 command graphs (dispatch overhead currently in every number).
 2. **M2.5 attention kernels** (prefill sliding/global, decode sliding/global incl. K=V single
    read + split-K), then kv_append/quant + logits softcap (Q6_K tied head), then pre-recorded
    command graphs (plan 02 step 8).

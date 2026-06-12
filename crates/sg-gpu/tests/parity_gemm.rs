@@ -62,7 +62,7 @@ fn dequant_row(weights: &[u8], k: usize, row: usize) -> Vec<f32> {
 
 /// Output block per workgroup (M_TILES=2 × N_TILES=4 of 16×16 tiles; must
 /// match the gemm variant defines in build.rs).
-const M_BLOCK: usize = 32;
+const M_BLOCK: usize = 64;
 const N_BLOCK: usize = 64;
 
 const SHAPES: &[(usize, usize)] = &[

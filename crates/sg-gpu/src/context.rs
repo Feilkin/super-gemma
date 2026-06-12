@@ -75,6 +75,9 @@ impl GpuContext {
         // Cooperative matrix needs the extension, its feature bit, and the
         // Vulkan memory model (SPIR-V requirement). All present on target;
         // optional so dev machines without them still run non-coopmat tests.
+        // (No kernel currently pins a subgroup size; a variant that sets
+        // `subgroup_size` in build.rs needs `subgroup_size_control` enabled
+        // here.)
         let supports_coopmat = physical.supported_extensions().khr_cooperative_matrix
             && physical.supported_features().cooperative_matrix
             && physical.supported_features().vulkan_memory_model;

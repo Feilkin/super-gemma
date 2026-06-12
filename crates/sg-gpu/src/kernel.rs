@@ -28,6 +28,9 @@ pub struct KernelBlob {
     pub bindings: u32,
     /// Push-constant byte size (0 = none).
     pub push_bytes: u32,
+    /// Required subgroup size, 0 = driver default. The coopmat GEMM kernels
+    /// pin 32: RDNA3 WMMA runs at half rate in wave64.
+    pub subgroup_size: u32,
 }
 
 include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
@@ -81,7 +84,10 @@ impl GpuContext {
             .ok_or(GpuError::UnknownKernel(format!(
                 "{name}: no `main` entry point"
             )))?;
-        let stage = PipelineShaderStageCreateInfo::new(entry);
+        let stage = PipelineShaderStageCreateInfo {
+            required_subgroup_size: (blob.subgroup_size > 0).then_some(blob.subgroup_size),
+            ..PipelineShaderStageCreateInfo::new(entry)
+        };
 
         let set_layout = DescriptorSetLayout::new(
             self.device().clone(),

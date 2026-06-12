@@ -16,8 +16,8 @@ const M: usize = 512; // prefill chunk
 const K: usize = 5376;
 const N: usize = 21504; // ffn gate/up — the prefill flop bucket
 const DISPATCHES: usize = 4;
-// Must match the gemm variant defines (M_TILES=2, N_TILES=4).
-const M_BLOCK: usize = 32;
+// Must match the gemm variant defines (M_TILES=4, N_TILES=4).
+const M_BLOCK: usize = 64;
 const N_BLOCK: usize = 64;
 
 fn bench(c: &mut Criterion) {

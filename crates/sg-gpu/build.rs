@@ -30,6 +30,9 @@ struct Variant {
     bindings: u32,
     /// Push-constant byte size (0 = none).
     push_bytes: u32,
+    /// Required subgroup size, 0 = driver default. The coopmat GEMM kernels
+    /// pin 32: RDNA3 WMMA runs at half rate in wave64.
+    subgroup_size: u32,
     /// Skip naga-oil and compile with plain naga (textual `#{NAME}`
     /// substitution only, no `#ifdef`/`#import`). Required for cooperative-
     /// matrix shaders: naga_oil 0.22's IR cloner copies
@@ -49,6 +52,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [64, 1, 1],
         bindings: 1,
         push_bytes: 4,
+        subgroup_size: 0,
         raw: false,
     },
     // RMSNorm: hidden rows + the two QK-norm head_dims, each in both weight
@@ -60,6 +64,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -69,6 +74,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -78,6 +84,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -87,6 +94,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -96,6 +104,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -105,6 +114,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     // RoPE per attention site. Sliding: full rotation, θ=10k. Global:
@@ -116,6 +126,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 2,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -125,6 +136,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 2,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -134,6 +146,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 2,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -143,6 +156,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 2,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -152,6 +166,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     // Q4_0 GEMV, one variant per matmul-site K (the N dimension is the
@@ -163,6 +178,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -172,6 +188,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -181,6 +198,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -190,6 +208,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -199,6 +218,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 4,
+        subgroup_size: 0,
         raw: false,
     },
     // Coopmat Q4_0 GEMM (prefill), one variant per (K, N) site.
@@ -208,14 +228,15 @@ const VARIANTS: &[Variant] = &[
         defs: &[
             ("K_DIM", 5376),
             ("N_DIM", 8192),
-            ("M_TILES", 2),
+            ("M_TILES", 4),
             ("N_TILES", 4),
             ("B_TILE_LEN", 4096),
-            ("ACC_LEN", 8),
+            ("ACC_LEN", 16),
         ],
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: true,
     },
     Variant {
@@ -224,14 +245,15 @@ const VARIANTS: &[Variant] = &[
         defs: &[
             ("K_DIM", 5376),
             ("N_DIM", 4096),
-            ("M_TILES", 2),
+            ("M_TILES", 4),
             ("N_TILES", 4),
             ("B_TILE_LEN", 4096),
-            ("ACC_LEN", 8),
+            ("ACC_LEN", 16),
         ],
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: true,
     },
     Variant {
@@ -240,14 +262,15 @@ const VARIANTS: &[Variant] = &[
         defs: &[
             ("K_DIM", 8192),
             ("N_DIM", 5376),
-            ("M_TILES", 2),
+            ("M_TILES", 4),
             ("N_TILES", 4),
             ("B_TILE_LEN", 4096),
-            ("ACC_LEN", 8),
+            ("ACC_LEN", 16),
         ],
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: true,
     },
     Variant {
@@ -256,14 +279,15 @@ const VARIANTS: &[Variant] = &[
         defs: &[
             ("K_DIM", 5376),
             ("N_DIM", 16384),
-            ("M_TILES", 2),
+            ("M_TILES", 4),
             ("N_TILES", 4),
             ("B_TILE_LEN", 4096),
-            ("ACC_LEN", 8),
+            ("ACC_LEN", 16),
         ],
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: true,
     },
     Variant {
@@ -272,14 +296,15 @@ const VARIANTS: &[Variant] = &[
         defs: &[
             ("K_DIM", 5376),
             ("N_DIM", 2048),
-            ("M_TILES", 2),
+            ("M_TILES", 4),
             ("N_TILES", 4),
             ("B_TILE_LEN", 4096),
-            ("ACC_LEN", 8),
+            ("ACC_LEN", 16),
         ],
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: true,
     },
     Variant {
@@ -288,14 +313,15 @@ const VARIANTS: &[Variant] = &[
         defs: &[
             ("K_DIM", 16384),
             ("N_DIM", 5376),
-            ("M_TILES", 2),
+            ("M_TILES", 4),
             ("N_TILES", 4),
             ("B_TILE_LEN", 4096),
-            ("ACC_LEN", 8),
+            ("ACC_LEN", 16),
         ],
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: true,
     },
     Variant {
@@ -304,14 +330,15 @@ const VARIANTS: &[Variant] = &[
         defs: &[
             ("K_DIM", 5376),
             ("N_DIM", 21504),
-            ("M_TILES", 2),
+            ("M_TILES", 4),
             ("N_TILES", 4),
             ("B_TILE_LEN", 4096),
-            ("ACC_LEN", 8),
+            ("ACC_LEN", 16),
         ],
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: true,
     },
     Variant {
@@ -320,14 +347,15 @@ const VARIANTS: &[Variant] = &[
         defs: &[
             ("K_DIM", 21504),
             ("N_DIM", 5376),
-            ("M_TILES", 2),
+            ("M_TILES", 4),
             ("N_TILES", 4),
             ("B_TILE_LEN", 4096),
-            ("ACC_LEN", 8),
+            ("ACC_LEN", 16),
         ],
         workgroup: [64, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: true,
     },
     // Subgroup-tiled Q4_0 GEMM: non-coopmat baseline/fallback.
@@ -338,6 +366,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -347,6 +376,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -356,6 +386,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -365,6 +396,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -374,6 +406,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -383,6 +416,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -392,6 +426,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
     Variant {
@@ -401,6 +436,7 @@ const VARIANTS: &[Variant] = &[
         workgroup: [256, 1, 1],
         bindings: 3,
         push_bytes: 0,
+        subgroup_size: 0,
         raw: false,
     },
 ];
@@ -421,8 +457,8 @@ fn main() {
         writeln!(
             registry,
             "    KernelBlob {{ name: {:?}, spv: include_bytes!(concat!(env!(\"OUT_DIR\"), \
-             \"/{}.spv\")), workgroup: {:?}, bindings: {}, push_bytes: {} }},",
-            v.name, v.name, v.workgroup, v.bindings, v.push_bytes
+             \"/{}.spv\")), workgroup: {:?}, bindings: {}, push_bytes: {}, subgroup_size: {} }},",
+            v.name, v.name, v.workgroup, v.bindings, v.push_bytes, v.subgroup_size
         )
         .unwrap();
     }
