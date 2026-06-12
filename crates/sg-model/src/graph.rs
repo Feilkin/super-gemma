@@ -57,6 +57,14 @@ pub struct GpuModel<'a> {
     cs_sliding: Subbuffer<[f32]>,
     /// 64 live pairs global (the frozen 192 are identities, never stored).
     cs_global: Subbuffer<[f32]>,
+    p: PrefillBufs,
+    /// Prefill chunk capacity (multiple of the gemm M_BLOCK 64).
+    max_chunk: usize,
+    /// Capacity of the linear global-KV stores, in tokens.
+    global_cap: usize,
+    /// Recorded prefill graphs keyed by (padded_len, real_len, with_logits)
+    /// — the dispatch grids and append slices are shape-specific.
+    prefill_graphs: std::collections::HashMap<(usize, usize, bool), CommandGraph>,
     /// Absolute position of the NEXT token to decode.
     pub pos: u32,
 }
@@ -87,6 +95,21 @@ struct Kernels {
     reduce256: Kernel,
     reduce512: Kernel,
     logits: Kernel,
+    // Prefill (chunked, coopmat gemm path).
+    gemm_q_sl: Kernel,
+    gemm_q_gl: Kernel,
+    gemm_kv_sl: Kernel,
+    gemm_kv_gl: Kernel,
+    gemm_o_sl: Kernel,
+    gemm_o_gl: Kernel,
+    gemm_up: Kernel,
+    gemm_down: Kernel,
+    prefill_sl: Kernel,
+    prefill_gl: Kernel,
+    /// Sync shim: the gemm kernels read `x` only via coopmat loads, which
+    /// vulkano's auto-sync cannot see — touch the buffer first so the
+    /// producer's write→read barrier is emitted (touch.wgsl).
+    touch: Kernel,
 }
 
 /// Activation buffers (single token). Sized per layer kind where the
@@ -121,15 +144,57 @@ struct Bufs {
     logits: Subbuffer<[f32]>,
 }
 
+/// Prefill activation buffers, sized for `max_chunk` tokens. Separate from
+/// the decode set: several kernels derive their bounds from `arrayLength`,
+/// so decode on chunk-sized buffers would over-dispatch ~chunk×.
+///
+/// Smaller (padded-tail) chunks reuse these buffers' prefixes; dispatch
+/// grids are recorded per chunk shape, and the `arrayLength`-bounded
+/// elementwise kernels merely process the stale tail rows (garbage in,
+/// garbage out — nothing reads them, and KV appends bind sliced sources).
+struct PrefillBufs {
+    x: Subbuffer<[u16]>,
+    xn: Subbuffer<[u16]>,
+    q_raw_sl: Subbuffer<[u16]>,
+    q_sl: Subbuffer<[u16]>,
+    q_raw_gl: Subbuffer<[u16]>,
+    q_gl: Subbuffer<[u16]>,
+    kp_sl: Subbuffer<[u16]>,
+    k_sl: Subbuffer<[u16]>,
+    vp_sl: Subbuffer<[u16]>,
+    v_sl: Subbuffer<[u16]>,
+    kp_gl: Subbuffer<[u16]>,
+    k_gl: Subbuffer<[u16]>,
+    v_gl: Subbuffer<[u16]>,
+    attn_sl: Subbuffer<[u16]>,
+    attn_gl: Subbuffer<[u16]>,
+    o: Subbuffer<[u16]>,
+    on: Subbuffer<[u16]>,
+    x2: Subbuffer<[u16]>,
+    fin: Subbuffer<[u16]>,
+    g: Subbuffer<[u16]>,
+    u: Subbuffer<[u16]>,
+    gu: Subbuffer<[u16]>,
+    f: Subbuffer<[u16]>,
+    fn2: Subbuffer<[u16]>,
+    /// Per-chunk rope tables: `[max_chunk × live_pairs × 2]` f32.
+    cs_sl: Subbuffer<[f32]>,
+    cs_gl: Subbuffer<[f32]>,
+}
+
 impl<'a> GpuModel<'a> {
     /// Upload weights and allocate all graph state. `global_cap` bounds the
     /// linear global-KV stores (tokens); tests keep it small, the engine
-    /// will size it from the configured context limit.
+    /// will size it from the configured context limit. `max_chunk` is the
+    /// prefill chunk capacity (rounded up to the gemm M_BLOCK 64; plan 03
+    /// default 256).
     pub fn new(
         ctx: &'a GpuContext,
         gguf: &'a Gguf<'a>,
         global_cap: usize,
+        max_chunk: usize,
     ) -> Result<Self, UploadError> {
+        let max_chunk = max_chunk.next_multiple_of(64);
         let desc = ModelDesc::from_gguf(gguf).map_err(|e| RefError::BadTensor {
             name: "<model>".into(),
             what: e.to_string(),
@@ -179,6 +244,36 @@ impl<'a> GpuModel<'a> {
             logits: ctx.new_buffer::<f32>(desc.vocab_size as u64, usage)?,
         };
 
+        let m = max_chunk;
+        let p = PrefillBufs {
+            x: f16buf(m * HIDDEN)?,
+            xn: f16buf(m * HIDDEN)?,
+            q_raw_sl: f16buf(m * q_dim_sl)?,
+            q_sl: f16buf(m * q_dim_sl)?,
+            q_raw_gl: f16buf(m * q_dim_gl)?,
+            q_gl: f16buf(m * q_dim_gl)?,
+            kp_sl: f16buf(m * kv_dim_sl)?,
+            k_sl: f16buf(m * kv_dim_sl)?,
+            vp_sl: f16buf(m * kv_dim_sl)?,
+            v_sl: f16buf(m * kv_dim_sl)?,
+            kp_gl: f16buf(m * kv_dim_gl)?,
+            k_gl: f16buf(m * kv_dim_gl)?,
+            v_gl: f16buf(m * kv_dim_gl)?,
+            attn_sl: f16buf(m * q_dim_sl)?,
+            attn_gl: f16buf(m * q_dim_gl)?,
+            o: f16buf(m * HIDDEN)?,
+            on: f16buf(m * HIDDEN)?,
+            x2: f16buf(m * HIDDEN)?,
+            fin: f16buf(m * HIDDEN)?,
+            g: f16buf(m * FFN)?,
+            u: f16buf(m * FFN)?,
+            gu: f16buf(m * FFN)?,
+            f: f16buf(m * HIDDEN)?,
+            fn2: f16buf(m * HIDDEN)?,
+            cs_sl: ctx.new_buffer::<f32>((m * desc.sliding.head_dim / 2 * 2) as u64, usage)?,
+            cs_gl: ctx.new_buffer::<f32>((m * desc.global.head_dim / 8 * 2) as u64, usage)?,
+        };
+
         let kv = desc
             .layer_kinds
             .iter()
@@ -216,6 +311,17 @@ impl<'a> GpuModel<'a> {
             reduce256: load("attn_reduce_d256")?,
             reduce512: load("attn_reduce_d512")?,
             logits: load("gemv_q6_k_logits")?,
+            gemm_q_sl: load("gemm_q4_0_k5376_n8192")?,
+            gemm_q_gl: load("gemm_q4_0_k5376_n16384")?,
+            gemm_kv_sl: load("gemm_q4_0_k5376_n4096")?,
+            gemm_kv_gl: load("gemm_q4_0_k5376_n2048")?,
+            gemm_o_sl: load("gemm_q4_0_k8192_n5376")?,
+            gemm_o_gl: load("gemm_q4_0_k16384_n5376")?,
+            gemm_up: load("gemm_q4_0_k5376_n21504")?,
+            gemm_down: load("gemm_q4_0_k21504_n5376")?,
+            prefill_sl: load("attn_prefill_sliding_ring")?,
+            prefill_gl: load("attn_prefill_global")?,
+            touch: load("touch")?,
         };
 
         let cs_sliding = ctx.new_buffer::<f32>((desc.sliding.head_dim / 2 * 2) as u64, usage)?;
@@ -227,6 +333,10 @@ impl<'a> GpuModel<'a> {
             weights,
             k,
             b,
+            p,
+            max_chunk,
+            global_cap,
+            prefill_graphs: std::collections::HashMap::new(),
             kv,
             step: ctx.new_step_buffer()?,
             cs_sliding,
@@ -501,6 +611,463 @@ impl<'a> GpuModel<'a> {
             [self.desc.vocab_size as u32, 1, 1],
         )
         .map(|_| ())
+    }
+
+    /// Record one prefill chunk: `m_pad` padded rows (multiple of 64),
+    /// `n_real` real tokens. Padding rows compute garbage nothing reads:
+    /// the causal mask hides their keys from real queries, KV appends bind
+    /// `n_real`-sliced sources, and logits read the last REAL row.
+    fn record_prefill(
+        &self,
+        m_pad: usize,
+        n_real: usize,
+        with_logits: bool,
+    ) -> Result<CommandGraph, GpuError> {
+        self.ctx.record_graph(|rec| {
+            for i in 0..self.desc.n_layers {
+                self.record_prefill_layer(rec, i, m_pad, n_real)?;
+            }
+            if with_logits {
+                self.record_prefill_logits(rec, n_real)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Per-layer-range prefill graph for the parity harness (mirrors
+    /// [`Self::record`] on the decode side): submit one layer at a time
+    /// after [`Self::stage_prefill_chunk`] and inspect
+    /// [`Self::read_prefill_hidden`] between submits.
+    pub fn record_prefill_layers(
+        &self,
+        layers: Range<usize>,
+        m_pad: usize,
+        n_real: usize,
+    ) -> Result<CommandGraph, GpuError> {
+        self.ctx.record_graph(|rec| {
+            for i in layers.clone() {
+                self.record_prefill_layer(rec, i, m_pad, n_real)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Read a prefill activation buffer by oracle tap name, as f32 — the
+    /// parity harness's window into the per-stage intermediates. Names
+    /// match [`crate::CpuModel::forward`]'s tap points.
+    pub fn read_prefill_tap(&self, name: &str, sliding: bool) -> Result<Vec<f32>, GpuError> {
+        let p = &self.p;
+        let b: &Subbuffer<[u16]> = match (name, sliding) {
+            ("attn_norm", _) => &p.xn,
+            ("q_rope", true) => &p.q_sl,
+            ("q_rope", false) => &p.q_gl,
+            ("k_rope", true) => &p.k_sl,
+            ("k_rope", false) => &p.k_gl,
+            ("v_norm", true) => &p.v_sl,
+            ("v_norm", false) => &p.v_gl,
+            ("attn", true) => &p.attn_sl,
+            ("attn", false) => &p.attn_gl,
+            ("attn_out", _) => &p.o,
+            ("post_attn_norm", _) => &p.on,
+            ("h_attn", _) => &p.x2,
+            ("ffn_norm", _) => &p.fin,
+            ("ffn_out", _) => &p.f,
+            ("post_ffn_norm", _) => &p.fn2,
+            ("layer_out", _) => &p.x,
+            _ => return Err(GpuError::Validation(format!("unknown tap `{name}`"))),
+        };
+        let r = b.read().map_err(|e| GpuError::Validation(e.to_string()))?;
+        Ok(r.iter().map(|&v| f16::from_bits(v).to_f32()).collect())
+    }
+
+    /// The prefill residual stream, first `n` tokens, as f32.
+    pub fn read_prefill_hidden(&self, n: usize) -> Result<Vec<f32>, GpuError> {
+        let r = self
+            .p
+            .x
+            .read()
+            .map_err(|e| GpuError::Validation(e.to_string()))?;
+        Ok(r[..n * HIDDEN]
+            .iter()
+            .map(|&b| f16::from_bits(b).to_f32())
+            .collect())
+    }
+
+    fn record_prefill_layer(
+        &self,
+        rec: &mut GraphRecorder<'_>,
+        i: usize,
+        m_pad: usize,
+        n_real: usize,
+    ) -> Result<(), GpuError> {
+        let lw = &self.weights.layers[i];
+        let p = &self.p;
+        let kv = &self.kv[i];
+        let sliding = lw.kind == LayerKind::Sliding;
+        let (hd, n_kv) = match lw.kind {
+            LayerKind::Sliding => (self.desc.sliding.head_dim, self.desc.sliding.n_kv_heads),
+            LayerKind::Global => (self.desc.global.head_dim, self.desc.global.n_kv_heads),
+        };
+        let q_dim = 32 * hd;
+        let kv_dim = n_kv * hd;
+        let mg = (m_pad / 64) as u32; // gemm M-block count
+        let (q_raw, q, kp, k, v) = if sliding {
+            (&p.q_raw_sl, &p.q_sl, &p.kp_sl, &p.k_sl, &p.v_sl)
+        } else {
+            (&p.q_raw_gl, &p.q_gl, &p.kp_gl, &p.k_gl, &p.v_gl)
+        };
+        let (rms_hd, rope_q, rope_k, cs) = if sliding {
+            (
+                &self.k.rms256,
+                &self.k.rope_sl_q,
+                &self.k.rope_sl_k,
+                &p.cs_sl,
+            )
+        } else {
+            (
+                &self.k.rms512,
+                &self.k.rope_gl_q,
+                &self.k.rope_gl_k,
+                &p.cs_gl,
+            )
+        };
+        let (gemm_q, gemm_kv, gemm_o) = if sliding {
+            (&self.k.gemm_q_sl, &self.k.gemm_kv_sl, &self.k.gemm_o_sl)
+        } else {
+            (&self.k.gemm_q_gl, &self.k.gemm_kv_gl, &self.k.gemm_o_gl)
+        };
+        let no_push = None::<u32>;
+
+        // The gemms read their activation input only via coopmat loads,
+        // invisible to vulkano's auto-sync: a `touch` of the buffer makes
+        // the producer's write→read barrier materialize (touch.wgsl).
+        let touch = |rec: &mut GraphRecorder<'_>, b: &Subbuffer<[u16]>| -> Result<(), GpuError> {
+            rec.dispatch(
+                &self.k.touch,
+                vec![buf(0, b.clone())],
+                None::<u32>,
+                [1, 1, 1],
+            )
+            .map(|_| ())
+        };
+
+        // ── Attention block ──────────────────────────────────────────────
+        rms(rec, &self.k.rms5376, &p.x, &lw.attn_norm, &p.xn, m_pad)?;
+        touch(rec, &p.xn)?;
+        rec.dispatch(
+            gemm_q,
+            vec![
+                buf(0, lw.attn_q.clone()),
+                buf(1, p.xn.clone()),
+                buf(2, q_raw.clone()),
+            ],
+            no_push,
+            [(q_dim / 64) as u32, mg, 1],
+        )?;
+        rec.dispatch(
+            gemm_kv,
+            vec![
+                buf(0, lw.attn_k.clone()),
+                buf(1, p.xn.clone()),
+                buf(2, kp.clone()),
+            ],
+            no_push,
+            [(kv_dim / 64) as u32, mg, 1],
+        )?;
+        let vp = match &lw.attn_v {
+            Some(wv) => {
+                rec.dispatch(
+                    gemm_kv,
+                    vec![
+                        buf(0, wv.clone()),
+                        buf(1, p.xn.clone()),
+                        buf(2, p.vp_sl.clone()),
+                    ],
+                    no_push,
+                    [(kv_dim / 64) as u32, mg, 1],
+                )?;
+                &p.vp_sl
+            }
+            None => kp,
+        };
+        rms(rec, rms_hd, q_raw, &lw.attn_q_norm, q, m_pad * 32)?;
+        rms(rec, rms_hd, kp, &lw.attn_k_norm, k, m_pad * n_kv)?;
+        rms(rec, rms_hd, vp, &self.weights.norm_ones, v, m_pad * n_kv)?;
+        let live_pairs = if sliding { hd / 2 } else { hd / 8 };
+        rec.dispatch(
+            rope_q,
+            vec![buf(0, q.clone()), buf(1, cs.clone())],
+            no_push,
+            rope_q.groups_for((m_pad * 32 * live_pairs) as u64),
+        )?;
+        rec.dispatch(
+            rope_k,
+            vec![buf(0, k.clone()), buf(1, cs.clone())],
+            no_push,
+            rope_k.groups_for((m_pad * n_kv * live_pairs) as u64),
+        )?;
+
+        // KV-append sources sliced to the REAL rows (padding must not land
+        // in the stores). Global appends BEFORE attending (linear store,
+        // causal mask makes the chunk's own keys visible at the right
+        // queries); sliding attends from ring + chunk FIRST, then appends
+        // (plan 03 §prefill — appending first would overwrite early
+        // queries' windows).
+        let append = if sliding {
+            &self.k.append_sl
+        } else {
+            &self.k.append_gl
+        };
+        let real = (n_real * kv_dim) as u64;
+        let do_appends = |rec: &mut GraphRecorder<'_>| -> Result<(), GpuError> {
+            for (src, dst) in [(k, &kv.k), (v, &kv.v)] {
+                rec.dispatch(
+                    append,
+                    vec![
+                        buf(0, src.clone().slice(0..real)),
+                        buf(1, dst.clone()),
+                        buf(2, self.step.clone()),
+                    ],
+                    None::<u32>,
+                    append.groups_for(real),
+                )?;
+            }
+            Ok(())
+        };
+
+        let attn_out = if sliding { &p.attn_sl } else { &p.attn_gl };
+        if sliding {
+            rec.dispatch(
+                &self.k.prefill_sl,
+                vec![
+                    buf(0, q.clone()),
+                    buf(1, kv.k.clone()),
+                    buf(2, kv.v.clone()),
+                    buf(3, k.clone()),
+                    buf(4, v.clone()),
+                    buf(5, attn_out.clone()),
+                    buf(6, self.step.clone()),
+                ],
+                Some(1.0f32),
+                [n_kv as u32, m_pad as u32, 1],
+            )?;
+            do_appends(rec)?;
+        } else {
+            do_appends(rec)?;
+            rec.dispatch(
+                &self.k.prefill_gl,
+                vec![
+                    buf(0, q.clone()),
+                    buf(1, kv.k.clone()),
+                    buf(2, kv.v.clone()),
+                    buf(3, attn_out.clone()),
+                    buf(4, self.step.clone()),
+                ],
+                Some(1.0f32),
+                [n_kv as u32, m_pad as u32, 1],
+            )?;
+        }
+
+        touch(rec, attn_out)?;
+        rec.dispatch(
+            gemm_o,
+            vec![
+                buf(0, lw.attn_output.clone()),
+                buf(1, attn_out.clone()),
+                buf(2, p.o.clone()),
+            ],
+            no_push,
+            [(HIDDEN / 64) as u32, mg, 1],
+        )?;
+        rms(
+            rec,
+            &self.k.rms5376,
+            &p.o,
+            &lw.post_attention_norm,
+            &p.on,
+            m_pad,
+        )?;
+        rec.dispatch(
+            &self.k.add,
+            vec![
+                buf(0, p.x.clone()),
+                buf(1, p.on.clone()),
+                buf(2, p.x2.clone()),
+            ],
+            Some(1.0f32),
+            self.k.add.groups_for(p.x2.len()),
+        )?;
+
+        // ── FFN block ────────────────────────────────────────────────────
+        rms(rec, &self.k.rms5376, &p.x2, &lw.ffn_norm, &p.fin, m_pad)?;
+        touch(rec, &p.fin)?;
+        for (w, dst) in [(&lw.ffn_gate, &p.g), (&lw.ffn_up, &p.u)] {
+            rec.dispatch(
+                &self.k.gemm_up,
+                vec![
+                    buf(0, w.clone()),
+                    buf(1, p.fin.clone()),
+                    buf(2, (*dst).clone()),
+                ],
+                no_push,
+                [(FFN / 64) as u32, mg, 1],
+            )?;
+        }
+        rec.dispatch(
+            &self.k.geglu,
+            vec![
+                buf(0, p.g.clone()),
+                buf(1, p.u.clone()),
+                buf(2, p.gu.clone()),
+            ],
+            no_push,
+            self.k.geglu.groups_for(p.gu.len()),
+        )?;
+        touch(rec, &p.gu)?;
+        rec.dispatch(
+            &self.k.gemm_down,
+            vec![
+                buf(0, lw.ffn_down.clone()),
+                buf(1, p.gu.clone()),
+                buf(2, p.f.clone()),
+            ],
+            no_push,
+            [(HIDDEN / 64) as u32, mg, 1],
+        )?;
+        rms(rec, &self.k.rms5376, &p.f, &lw.post_ffw_norm, &p.fn2, m_pad)?;
+        rec.dispatch(
+            &self.k.add,
+            vec![
+                buf(0, p.x2.clone()),
+                buf(1, p.fn2.clone()),
+                buf(2, p.x.clone()),
+            ],
+            Some(lw.layer_output_scale),
+            self.k.add.groups_for(p.x.len()),
+        )?;
+        Ok(())
+    }
+
+    /// Final norm + LM head over the chunk's LAST REAL row only (plan 03:
+    /// no logits GEMM over prefill positions). Reuses the decode-side
+    /// `xn`/`logits` buffers.
+    fn record_prefill_logits(
+        &self,
+        rec: &mut GraphRecorder<'_>,
+        n_real: usize,
+    ) -> Result<(), GpuError> {
+        let last = self
+            .p
+            .x
+            .clone()
+            .slice(((n_real - 1) * HIDDEN) as u64..(n_real * HIDDEN) as u64);
+        rec.dispatch(
+            &self.k.rms5376,
+            vec![
+                buf(0, last),
+                buf(1, self.weights.output_norm.clone()),
+                buf(2, self.b.xn.clone()),
+            ],
+            None::<u32>,
+            [1, 1, 1],
+        )?;
+        rec.dispatch(
+            &self.k.logits,
+            vec![
+                buf(0, self.weights.token_embd.clone()),
+                buf(1, self.b.xn.clone()),
+                buf(2, self.b.logits.clone()),
+            ],
+            None::<u32>,
+            [self.desc.vocab_size as u32, 1, 1],
+        )
+        .map(|_| ())
+    }
+
+    /// CPU-side per-chunk staging: embedding rows, step state, rope tables
+    /// for positions `pos .. pos + tokens.len()`.
+    pub fn stage_prefill_chunk(&self, tokens: &[u32]) -> Result<(), GpuError> {
+        {
+            let mut w = self
+                .p
+                .x
+                .write()
+                .map_err(|e| GpuError::Validation(e.to_string()))?;
+            for (t, &tok) in tokens.iter().enumerate() {
+                let row = self.embed_row(tok);
+                for (dst, &val) in w[t * HIDDEN..][..HIDDEN].iter_mut().zip(&row) {
+                    *dst = f16::from_f32(val).to_bits();
+                }
+            }
+        }
+        StepState {
+            pos: self.pos,
+            kv_len_sliding: 0, // unused by the prefill kernels
+            kv_len_global: 0,  // unused by the prefill kernels
+            q0: self.pos,
+        }
+        .write_to(&self.step)?;
+
+        let positions: Vec<u32> = (0..tokens.len() as u32).map(|i| self.pos + i).collect();
+        let write_cs = |buf: &Subbuffer<[f32]>, table: &[f32]| -> Result<(), GpuError> {
+            let mut w = buf
+                .write()
+                .map_err(|e| GpuError::Validation(e.to_string()))?;
+            w[..table.len()].copy_from_slice(table);
+            Ok(())
+        };
+        let sl = cos_sin_table(
+            &positions,
+            self.desc.sliding.head_dim,
+            self.desc.sliding.rope_theta,
+            None,
+        );
+        write_cs(&self.p.cs_sl, &sl)?;
+        // Global: keep only the live pairs of each position's table entry.
+        let gl_full = cos_sin_table(
+            &positions,
+            self.desc.global.head_dim,
+            self.desc.global.rope_theta,
+            Some(&self.weights.rope_factors),
+        );
+        let (full, live) = (
+            self.desc.global.head_dim / 2 * 2,
+            self.desc.global.head_dim / 8 * 2,
+        );
+        let gl: Vec<f32> = gl_full
+            .chunks_exact(full)
+            .flat_map(|t| t[..live].iter().copied())
+            .collect();
+        write_cs(&self.p.cs_gl, &gl)?;
+        Ok(())
+    }
+
+    /// Chunked prefill of `tokens` starting at the current `pos` (plan 03
+    /// §prefill). Returns the last token's logits. Graphs are recorded per
+    /// chunk shape and cached.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, GpuError> {
+        assert!(!tokens.is_empty());
+        assert!(
+            self.pos as usize + tokens.len() <= self.global_cap,
+            "prefill past the global-KV capacity ({} + {} > {})",
+            self.pos,
+            tokens.len(),
+            self.global_cap
+        );
+        let n_chunks = tokens.len().div_ceil(self.max_chunk);
+        for (ci, chunk) in tokens.chunks(self.max_chunk).enumerate() {
+            let n_real = chunk.len();
+            let m_pad = n_real.next_multiple_of(64);
+            let key = (m_pad, n_real, ci == n_chunks - 1);
+            if !self.prefill_graphs.contains_key(&key) {
+                let g = self.record_prefill(m_pad, n_real, key.2)?;
+                self.prefill_graphs.insert(key, g);
+            }
+            self.stage_prefill_chunk(chunk)?;
+            self.ctx.submit_blocking(&self.prefill_graphs[&key])?;
+            self.pos += n_real as u32;
+        }
+        self.read_logits()
     }
 
     /// CPU-side per-token staging (plan 03 decode loop step 1): embedding

@@ -58,7 +58,7 @@ fn gpu_graph_matches_cpu_reference_per_layer_and_logits() {
     let gguf = file.parse().expect("parse model");
 
     let cpu = CpuModel::new(&gguf).expect("CPU reference");
-    let mut gpu = GpuModel::new(&ctx, &gguf, 64).expect("GPU model upload");
+    let mut gpu = GpuModel::new(&ctx, &gguf, 64, 64).expect("GPU model upload");
     let n_layers = cpu.desc.n_layers;
     let vocab = cpu.desc.vocab_size;
 

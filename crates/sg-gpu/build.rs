@@ -169,6 +169,19 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: false,
     },
+    // Synchronization shim for recorded graphs (see touch.wgsl): a no-op
+    // with a reflection-VISIBLE read_write on its binding, dispatched on a
+    // buffer that a following coopmat kernel reads invisibly.
+    Variant {
+        name: "touch",
+        src: "touch",
+        defs: &[],
+        workgroup: [1, 1, 1],
+        bindings: 1,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: false,
+    },
     // Residual join: y = (a + b) * s; s carries layer_output_scale on the
     // FFN join, 1.0 on the attention join (M3 graph).
     Variant {
@@ -348,6 +361,26 @@ const VARIANTS: &[Variant] = &[
         ],
         workgroup: [64, 1, 1],
         bindings: 5,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Two-range sliding prefill (plan 03 §prefill): history from the
+    // pre-append ring + the chunk's own K/V, one position-ordered
+    // streaming softmax. The production prefill path; the linear-view
+    // `attn_prefill_sliding` above remains the A/B reference.
+    Variant {
+        name: "attn_prefill_sliding_ring",
+        src: "attn_prefill_sliding_ring",
+        defs: &[
+            ("HEAD_DIM", 256),
+            ("N_KV_HEADS", 16),
+            ("Q_PER_KV", 2),
+            ("WINDOW", 1024),
+            ("RING", 1024),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 7,
         push_bytes: 4,
         subgroup_size: 0,
         raw: true,

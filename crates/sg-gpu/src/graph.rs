@@ -68,7 +68,11 @@ pub struct CommandGraph {
 
 /// Records dispatches (and optional timestamps) into a [`CommandGraph`].
 /// vulkano's auto-sync inserts the pipeline barriers implied by buffer
-/// reuse across dispatches.
+/// reuse across dispatches — **as far as it can see**: usage is derived
+/// from SPIR-V reflection, which misses cooperative-matrix accesses (the
+/// same blindness `kernel.rs` works around for descriptor layouts). A
+/// buffer consumed only via coopLoad gets NO barrier after its producer;
+/// record a `touch` dispatch on it first (see `shaders/touch.wgsl`).
 pub struct GraphRecorder<'a> {
     ctx: &'a GpuContext,
     builder: AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,

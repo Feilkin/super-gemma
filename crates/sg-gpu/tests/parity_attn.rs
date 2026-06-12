@@ -331,6 +331,104 @@ fn attn_prefill_sliding_matches_reference() {
     }
 }
 
+/// Two-range sliding prefill (plan 03 §prefill): history keys from the
+/// pre-append ring (`pos % 1024` slots), the chunk's own keys from the
+/// chunk buffers. Reference: the same f64 attention over an equivalent
+/// LINEAR key layout. Cases: cold start, partial ring, window saturating
+/// mid-chunk, and a wrapped ring.
+#[test]
+fn attn_prefill_sliding_ring_matches_reference() {
+    let Some(ctx) = ctx() else { return };
+    let kernel = ctx.load_kernel("attn_prefill_sliding_ring").unwrap();
+    let mut rng = Rng::new(0xA7C);
+    let m = 64usize;
+    const WINDOW: usize = 1024;
+    const RING: usize = 1024;
+    let row = SL_KV_HEADS * SL_DIM;
+
+    // q0 = history length: 0 cold; 100 partial ring; 1000 window saturates
+    // mid-chunk (positions 1000..1063 cross 1023); 1531 wrapped ring.
+    for q0 in [0usize, 100, 1000, 1531] {
+        let l = q0 + m;
+        let q = through_f16(&rng.f32_vec(m * N_Q_HEADS * SL_DIM));
+        // Linear ground truth over all positions...
+        let k_all = through_f16(&rng.f32_vec(l * row));
+        let v_all = through_f16(&rng.f32_vec(l * row));
+        // ...scattered into the two ranges the kernel reads: history rows
+        // at ring slot pos % RING (pre-append state), chunk rows linear.
+        let mut k_ring = vec![0.0f32; RING * row];
+        let mut v_ring = vec![0.0f32; RING * row];
+        for t in q0.saturating_sub(RING)..q0 {
+            let slot = t % RING;
+            k_ring[slot * row..][..row].copy_from_slice(&k_all[t * row..][..row]);
+            v_ring[slot * row..][..row].copy_from_slice(&v_all[t * row..][..row]);
+        }
+        let k_chunk = &k_all[q0 * row..][..m * row];
+        let v_chunk = &v_all[q0 * row..][..m * row];
+
+        let buf16 = |data: &[f32]| {
+            ctx.buffer_from_iter(to_f16_bits(data), BufferUsage::STORAGE_BUFFER)
+                .unwrap()
+        };
+        let out_buf = ctx
+            .new_buffer::<u16>((m * N_Q_HEADS * SL_DIM) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                WriteDescriptorSet::buffer(0, buf16(&q)),
+                WriteDescriptorSet::buffer(1, buf16(&k_ring)),
+                WriteDescriptorSet::buffer(2, buf16(&v_ring)),
+                WriteDescriptorSet::buffer(3, buf16(k_chunk)),
+                WriteDescriptorSet::buffer(4, buf16(v_chunk)),
+                WriteDescriptorSet::buffer(5, out_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    6,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            q0: q0 as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            ],
+            Some(SL_SCALE),
+            [SL_KV_HEADS as u32, m as u32, 1],
+        )
+        .unwrap();
+        let got = from_f16_bits(&out_buf.read().unwrap());
+
+        for qh in [0usize, 1, 9, 16, 31] {
+            for i in 0..m {
+                let qpos = q0 + i;
+                let t0 = (qpos + 1).saturating_sub(WINDOW);
+                let want = attention_head(
+                    &q,
+                    &k_all,
+                    &v_all,
+                    i,
+                    qh,
+                    N_Q_HEADS,
+                    SL_KV_HEADS,
+                    SL_DIM,
+                    SL_SCALE as f64,
+                    t0,
+                    qpos,
+                );
+                assert_close(
+                    &got[(i * N_Q_HEADS + qh) * SL_DIM..][..SL_DIM],
+                    &want,
+                    ATOL,
+                    RTOL,
+                    &format!("prefill_sliding_ring q0={q0} i={i} qh={qh}"),
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn attn_prefill_global_matches_reference() {
     let Some(ctx) = ctx() else { return };
