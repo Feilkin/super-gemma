@@ -1436,6 +1436,8 @@ name = "sg-model"
 version = "0.1.0"
 dependencies = [
  "half",
+ "rayon",
+ "serde_json",
  "sg-gguf",
  "sg-gpu",
  "thiserror",

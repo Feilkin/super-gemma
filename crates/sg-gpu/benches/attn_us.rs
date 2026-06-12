@@ -197,7 +197,13 @@ fn bench(c: &mut Criterion) {
             let q = ctx
                 .buffer_from_iter(f16_fill(N_Q_HEADS * GL_DIM), BufferUsage::STORAGE_BUFFER)
                 .unwrap();
-            let kv = ctx
+            let kv_k = ctx
+                .buffer_from_iter(
+                    f16_fill(kv_len * GL_KV_HEADS * GL_DIM),
+                    BufferUsage::STORAGE_BUFFER,
+                )
+                .unwrap();
+            let kv_v = ctx
                 .buffer_from_iter(
                     f16_fill(kv_len * GL_KV_HEADS * GL_DIM),
                     BufferUsage::STORAGE_BUFFER,
@@ -219,10 +225,11 @@ fn bench(c: &mut Criterion) {
                     p_layout.set_layouts()[0].clone(),
                     vec![
                         WriteDescriptorSet::buffer(0, q.clone()),
-                        WriteDescriptorSet::buffer(1, kv.clone()),
-                        WriteDescriptorSet::buffer(2, part.clone()),
+                        WriteDescriptorSet::buffer(1, kv_k.clone()),
+                        WriteDescriptorSet::buffer(2, kv_v.clone()),
+                        WriteDescriptorSet::buffer(3, part.clone()),
                         WriteDescriptorSet::buffer(
-                            3,
+                            4,
                             step_buf(
                                 &ctx,
                                 StepState {
@@ -419,7 +426,13 @@ fn bench(c: &mut Criterion) {
                 BufferUsage::STORAGE_BUFFER,
             )
             .unwrap();
-        let kv = ctx
+        let kv_k = ctx
+            .buffer_from_iter(
+                f16_fill(l * GL_KV_HEADS * GL_DIM),
+                BufferUsage::STORAGE_BUFFER,
+            )
+            .unwrap();
+        let kv_v = ctx
             .buffer_from_iter(
                 f16_fill(l * GL_KV_HEADS * GL_DIM),
                 BufferUsage::STORAGE_BUFFER,
@@ -434,10 +447,11 @@ fn bench(c: &mut Criterion) {
             layout.set_layouts()[0].clone(),
             vec![
                 WriteDescriptorSet::buffer(0, q),
-                WriteDescriptorSet::buffer(1, kv),
-                WriteDescriptorSet::buffer(2, out),
+                WriteDescriptorSet::buffer(1, kv_k),
+                WriteDescriptorSet::buffer(2, kv_v),
+                WriteDescriptorSet::buffer(3, out),
                 WriteDescriptorSet::buffer(
-                    3,
+                    4,
                     step_buf(
                         &ctx,
                         StepState {

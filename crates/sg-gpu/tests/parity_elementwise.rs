@@ -113,14 +113,22 @@ fn rope_matches_reference_for_all_sites() {
             reference::rope(&mut want, head_dim, rot_dims, n_heads, &cos_sin);
             assert_close(&got, &want, ATOL, RTOL, &format!("{variant}@{start_pos}"));
 
-            // The unrotated tail must pass through untouched.
+            // The frozen pairs must pass through untouched: with NEOX
+            // pairing (i, i+head_dim/2), that's dims [rot/2, head_dim/2)
+            // and [head_dim/2 + rot/2, head_dim).
             if rot_dims < head_dim {
+                let (live, half) = (rot_dims / 2, head_dim / 2);
                 for row in 0..tokens * n_heads {
                     let base = row * head_dim;
                     assert_eq!(
-                        got[base + rot_dims..base + head_dim],
-                        x[base + rot_dims..base + head_dim],
-                        "{variant}: tail modified in row {row}"
+                        got[base + live..base + half],
+                        x[base + live..base + half],
+                        "{variant}: frozen low-half dims modified in row {row}"
+                    );
+                    assert_eq!(
+                        got[base + half + live..base + head_dim],
+                        x[base + half + live..base + head_dim],
+                        "{variant}: frozen high-half dims modified in row {row}"
                     );
                 }
             }
@@ -163,6 +171,45 @@ fn geglu_matches_reference() {
     let got = from_f16_bits(&y_buf.read().unwrap());
     let want = reference::geglu(&gate, &up);
     assert_close(&got, &want, ATOL, RTOL, "geglu");
+}
+
+#[test]
+fn add_scaled_matches_reference() {
+    let Some(ctx) = ctx() else { return };
+    let mut rng = Rng::new(0xADD5);
+    let kernel = ctx.load_kernel("add_scaled").unwrap();
+
+    let n = 5376 * 3 + 5; // hidden rows × a few tokens, plus a ragged tail
+    let a = through_f16(&rng.f32_vec(n));
+    let b = through_f16(&rng.f32_vec(n));
+
+    for scale in [1.0f32, 0.83] {
+        let a_buf = ctx
+            .buffer_from_iter(to_f16_bits(&a), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let b_buf = ctx
+            .buffer_from_iter(to_f16_bits(&b), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let y_buf = ctx
+            .new_buffer::<u16>(n as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                WriteDescriptorSet::buffer(0, a_buf),
+                WriteDescriptorSet::buffer(1, b_buf),
+                WriteDescriptorSet::buffer(2, y_buf.clone()),
+            ],
+            Some(scale),
+            kernel.groups_for(n as u64),
+        )
+        .unwrap();
+
+        let got = from_f16_bits(&y_buf.read().unwrap());
+        let want: Vec<f32> = a.iter().zip(&b).map(|(&x, &y)| (x + y) * scale).collect();
+        assert_close(&got, &want, ATOL, RTOL, &format!("add_scaled s={scale}"));
+    }
 }
 
 /// Plan 02 determinism requirement: same inputs → bit-identical outputs.

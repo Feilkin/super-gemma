@@ -6,7 +6,7 @@ Three cooperating state stores:
 
 1. **Sliding ring** (RAM/GPU): per sliding layer, a 1024-token ring of K and V. Fixed ~820 MB f16.
 2. **Resident global KV** (RAM/GPU): the *active conversation's* global-layer KV for its full
-   context — what `attn_decode_global` reads. 40 KB/token, up to ~10.5 GB at 256K.
+   context — what `attn_decode_global` reads. 80 KB/token (separate K and V — M3 amendment, see `docs/reference/gemma4-forward-graph.md`), up to ~21 GB at 256K.
 3. **cache2** (NVMe): persistent paged radix trie over token-id sequences storing global-layer KV
    pages + sliding-ring **tail snapshots**, enabling prefix resume across requests and restarts.
 
@@ -43,7 +43,7 @@ storage (dedup), not compute — the eviction cost model must value it according
 
 - Keys: token-id sequences. Edges hold token spans; nodes own **pages** of global KV.
 - Page = `page_size` tokens (config 16–512, default 256), all 10 global layers bundled:
-  256 tok × 40 KB = 10 MB/page, one contiguous NVMe extent → single large sequential read.
+  256 tok × 80 KB = 20 MB/page (K and V), one contiguous NVMe extent → single large sequential read.
 - Node = { edge tokens, page refs, child map, snapshot refs, stats (last_use, hit_count,
   created_at, bytes, tokens) }.
 - Insert on commit: split nodes at divergence points (page-aligned splits preferred; a split

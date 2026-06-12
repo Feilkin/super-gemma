@@ -113,20 +113,22 @@ pub fn cos_sin_table(inv_freq: &[f64], start_pos: u32, tokens: usize) -> Vec<f32
     out
 }
 
-/// Rotate-half RoPE over rows of [token × head × head_dim]; rotates the
-/// first `rot_dims` of each head with the tabulated cos/sin, leaves the tail
-/// untouched.
+/// Rotate-half RoPE over rows of [token × head × head_dim]: NEOX pairing
+/// over the FULL head — pair `i` couples dims `(i, i + head_dim/2)` — with
+/// only the first `rot_dims/2` pairs live (tabulated); the frozen tail
+/// pairs are identities (docs/reference/gemma4-forward-graph.md).
 pub fn rope(x: &mut [f32], head_dim: usize, rot_dims: usize, n_heads: usize, cos_sin: &[f32]) {
-    let half = rot_dims / 2;
+    let live = rot_dims / 2;
+    let partner = head_dim / 2;
     for (row_idx, row) in x.chunks_exact_mut(head_dim).enumerate() {
         let token = row_idx / n_heads;
-        for pair in 0..half {
-            let c = cos_sin[(token * half + pair) * 2] as f64;
-            let s = cos_sin[(token * half + pair) * 2 + 1] as f64;
+        for pair in 0..live {
+            let c = cos_sin[(token * live + pair) * 2] as f64;
+            let s = cos_sin[(token * live + pair) * 2 + 1] as f64;
             let a = row[pair] as f64;
-            let b = row[pair + half] as f64;
+            let b = row[pair + partner] as f64;
             row[pair] = (a * c - b * s) as f32;
-            row[pair + half] = (b * c + a * s) as f32;
+            row[pair + partner] = (b * c + a * s) as f32;
         }
     }
 }

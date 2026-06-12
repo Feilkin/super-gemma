@@ -1,9 +1,10 @@
 // Global prefill attention (plan 02): a chunk of M query tokens against
-// the full resident context, causal. GQA 32:4, head_dim 512, and K = V —
-// each KV element is read ONCE and used as both key and value (the model
-// ties them; plan 02 says build for it natively). Query token i sits at
-// key index q0 + i (q0 = number of history keys) and attends keys
-// 0 ..= q0+i.
+// the full resident context, causal. GQA 32:4, head_dim 512. K and V are
+// SEPARATE stores even though the model shares their projection: cached K
+// is k_norm-weighted + roped, cached V is weightless-normed and unroped
+// (docs/reference/gemma4-forward-graph.md, amended 2026-06-12). Query
+// token i sits at key index q0 + i (q0 = number of history keys) and
+// attends keys 0 ..= q0+i.
 //
 // One wave-sized workgroup per (KV head, query token) computes the
 // Q_PER_KV query heads sharing the KV head, so each KV element is read
@@ -19,12 +20,13 @@
 enable f16;
 
 @group(0) @binding(0) var<storage, read> q: array<f16>; // [M × 32 × HEAD_DIM]
-@group(0) @binding(1) var<storage, read> kv: array<f16>; // [L × N_KV_HEADS × HEAD_DIM]
-@group(0) @binding(2) var<storage, read_write> out: array<f16>; // [M × 32 × HEAD_DIM]
+@group(0) @binding(1) var<storage, read> k: array<f16>; // [L × N_KV_HEADS × HEAD_DIM]
+@group(0) @binding(2) var<storage, read> v: array<f16>; // [L × N_KV_HEADS × HEAD_DIM]
+@group(0) @binding(3) var<storage, read_write> out: array<f16>; // [M × 32 × HEAD_DIM]
 // Per-step dynamic state, rewritten by the CPU between submits of the
 // pre-recorded graph (sg_gpu::StepState): [pos, kv_len_sliding,
 // kv_len_global, q0].
-@group(0) @binding(3) var<storage, read> step: array<u32>;
+@group(0) @binding(4) var<storage, read> step: array<u32>;
 
 struct Push {
     scale: f32,
@@ -71,10 +73,11 @@ fn main(
 
     for (var t = 0u; t <= qpos; t += 1u) {
         let kv_base = (t * N_KV_HEADS + kvh) * HEAD_DIM + d0;
-        // K = V: one read serves the score and the weighted sum.
         var kk: array<f32, D>;
+        var vv: array<f32, D>;
         for (var d = 0u; d < D; d += 1u) {
-            kk[d] = f32(kv[kv_base + d]);
+            kk[d] = f32(k[kv_base + d]);
+            vv[d] = f32(v[kv_base + d]);
         }
         for (var qi = 0u; qi < Q_PER_KV; qi += 1u) {
             var dot = 0.0;
@@ -87,7 +90,7 @@ fn main(
             let w = exp(s - m_new);
             l[qi] = l[qi] * corr + w;
             for (var d = 0u; d < D; d += 1u) {
-                acc[qi][d] = acc[qi][d] * corr + w * kk[d];
+                acc[qi][d] = acc[qi][d] * corr + w * vv[d];
             }
             m[qi] = m_new;
         }

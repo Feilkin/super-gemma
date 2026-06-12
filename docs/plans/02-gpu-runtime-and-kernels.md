@@ -67,9 +67,9 @@ recording for prefill and decode, and per-kernel validation against CPU referenc
 | `rmsnorm` | 4×/layer + final | fused optional residual-add; weight convention (`w` vs `1+w`) is a specialization constant decided by parity tests |
 | `rope_sliding` | sliding layers | θ=10k, full rotary over head_dim 256; fused QK-norm option |
 | `rope_global` | global layers | θ=1M, `proportional` type, partial rotary (rotate first ¼ of 512 dims — exact formula pinned by parity tests); fused QK-norm option |
-| `attn_prefill` | prefill | flash-attention-style streaming softmax over KV tiles; two variants: sliding (banded mask, window 1024) and global (causal, K=V aliased) |
+| `attn_prefill` | prefill | flash-attention-style streaming softmax over KV tiles; two variants: sliding (banded mask, window 1024) and global (causal); separate K/V buffers on both (M3 amendment: cached K ≠ cached V even on the shared-projection global layers) |
 | `attn_decode_sliding` | decode | 1 query token vs ring buffer (≤1024 KV); GQA 32:16, head_dim 256 |
-| `attn_decode_global` | decode | 1 query vs full context; GQA 32:4, head_dim 512, K=V (single buffer read — halves bandwidth); split-K across workgroups + reduction pass for long contexts |
+| `attn_decode_global` | decode | 1 query vs full context; GQA 32:4, head_dim 512, separate K/V buffers (M3 amendment — the K=V single-read optimization was based on a misreading); split-K across workgroups + reduction pass for long contexts |
 | `mlp_geglu` | both | gate·GELU(tanh)·up fused where profitable; down-proj via gemv/gemm |
 | `kv_append` / `kv_quant` | both | write new K/V into ring & resident global KV; optional f16→Q8_0 for cache2 page flush; Q8_0→f16 on page load |
 | `logits_softcap` | last step | tied-embedding matmul (reuses gemv/gemm with embedding tensor) + tanh cap 30; emits f32 logits |
@@ -77,9 +77,11 @@ recording for prefill and decode, and per-kernel validation against CPU referenc
 | drafter kernels | MTP draft (plan 07, M7.5) | tiny GEMMs (hidden 1024), shared-KV attention reading target KV buffers, centroid head (centroid GEMV → top-32 select → gather → scored GEMV over ~4k candidates) |
 | `argmax_partial` (optional) | decode | GPU top-k prereduction if CPU sampling over 262k ever shows up in profile (don't build until measured) |
 
-Attention K=V on global layers means `attn_decode_global` reads each KV element **once** and uses it
-as both key and value (softcap/score from it, then weighted-sum the same vector). This is unusual —
-write the kernel for it natively rather than materializing a duplicate V.
+~~Attention K=V on global layers means `attn_decode_global` reads each KV element once and uses it
+as both key and value.~~ **Amended in M3 (2026-06-12): wrong.** The model ties only the K/V
+*projection*; cached K (weighted k_norm + rope) ≠ cached V (weightless norm, no rope), so the
+global kernels bind separate K and V buffers and global attention reads 2× the KV bytes
+(`docs/reference/gemma4-forward-graph.md`).
 
 ## Performance plan
 

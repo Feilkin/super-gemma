@@ -162,13 +162,17 @@ fn attn_decode_global_matches_reference() {
     // (empty partials), and a longer context.
     for (kv_len, n_splits) in [(333usize, 1u32), (333, 5), (3, 8), (4096, 4)] {
         let q = through_f16(&rng.f32_vec(N_Q_HEADS * GL_DIM));
-        let kv = through_f16(&rng.f32_vec(kv_len * GL_KV_HEADS * GL_DIM));
+        let k = through_f16(&rng.f32_vec(kv_len * GL_KV_HEADS * GL_DIM));
+        let v = through_f16(&rng.f32_vec(kv_len * GL_KV_HEADS * GL_DIM));
 
         let q_buf = ctx
             .buffer_from_iter(to_f16_bits(&q), BufferUsage::STORAGE_BUFFER)
             .unwrap();
-        let kv_buf = ctx
-            .buffer_from_iter(to_f16_bits(&kv), BufferUsage::STORAGE_BUFFER)
+        let k_buf = ctx
+            .buffer_from_iter(to_f16_bits(&k), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let v_buf = ctx
+            .buffer_from_iter(to_f16_bits(&v), BufferUsage::STORAGE_BUFFER)
             .unwrap();
         let part_buf = ctx
             .new_buffer::<f32>(
@@ -184,10 +188,11 @@ fn attn_decode_global_matches_reference() {
             &part_k,
             vec![
                 WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, kv_buf),
-                WriteDescriptorSet::buffer(2, part_buf.clone()),
+                WriteDescriptorSet::buffer(1, k_buf),
+                WriteDescriptorSet::buffer(2, v_buf),
+                WriteDescriptorSet::buffer(3, part_buf.clone()),
                 WriteDescriptorSet::buffer(
-                    3,
+                    4,
                     step_buf(
                         &ctx,
                         StepState {
@@ -219,8 +224,8 @@ fn attn_decode_global_matches_reference() {
         for qh in 0..N_Q_HEADS {
             let want = attention_head(
                 &q,
-                &kv,
-                &kv, // K = V
+                &k,
+                &v,
                 0,
                 qh,
                 N_Q_HEADS,
@@ -336,13 +341,17 @@ fn attn_prefill_global_matches_reference() {
     for q0 in [0usize, 200] {
         let l = q0 + m;
         let q = through_f16(&rng.f32_vec(m * N_Q_HEADS * GL_DIM));
-        let kv = through_f16(&rng.f32_vec(l * GL_KV_HEADS * GL_DIM));
+        let k = through_f16(&rng.f32_vec(l * GL_KV_HEADS * GL_DIM));
+        let v = through_f16(&rng.f32_vec(l * GL_KV_HEADS * GL_DIM));
 
         let q_buf = ctx
             .buffer_from_iter(to_f16_bits(&q), BufferUsage::STORAGE_BUFFER)
             .unwrap();
-        let kv_buf = ctx
-            .buffer_from_iter(to_f16_bits(&kv), BufferUsage::STORAGE_BUFFER)
+        let k_buf = ctx
+            .buffer_from_iter(to_f16_bits(&k), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let v_buf = ctx
+            .buffer_from_iter(to_f16_bits(&v), BufferUsage::STORAGE_BUFFER)
             .unwrap();
         let out_buf = ctx
             .new_buffer::<u16>((m * N_Q_HEADS * GL_DIM) as u64, BufferUsage::STORAGE_BUFFER)
@@ -352,10 +361,11 @@ fn attn_prefill_global_matches_reference() {
             &kernel,
             vec![
                 WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, kv_buf),
-                WriteDescriptorSet::buffer(2, out_buf.clone()),
+                WriteDescriptorSet::buffer(1, k_buf),
+                WriteDescriptorSet::buffer(2, v_buf),
+                WriteDescriptorSet::buffer(3, out_buf.clone()),
                 WriteDescriptorSet::buffer(
-                    3,
+                    4,
                     step_buf(
                         &ctx,
                         StepState {
@@ -375,8 +385,8 @@ fn attn_prefill_global_matches_reference() {
             for i in 0..m {
                 let want = attention_head(
                     &q,
-                    &kv,
-                    &kv,
+                    &k,
+                    &v,
                     i,
                     qh,
                     N_Q_HEADS,
@@ -409,7 +419,8 @@ fn attn_is_bit_deterministic() {
 
     let (kv_len, n_splits) = (1000usize, 3u32);
     let q = to_f16_bits(&rng.f32_vec(N_Q_HEADS * GL_DIM));
-    let kv = to_f16_bits(&rng.f32_vec(kv_len * GL_KV_HEADS * GL_DIM));
+    let kv_k = to_f16_bits(&rng.f32_vec(kv_len * GL_KV_HEADS * GL_DIM));
+    let kv_v = to_f16_bits(&rng.f32_vec(kv_len * GL_KV_HEADS * GL_DIM));
     let m = 16usize;
     let pq = to_f16_bits(&rng.f32_vec(m * N_Q_HEADS * SL_DIM));
     let pk = to_f16_bits(&rng.f32_vec(m * SL_KV_HEADS * SL_DIM));
@@ -420,8 +431,11 @@ fn attn_is_bit_deterministic() {
         let q_buf = ctx
             .buffer_from_iter(q.iter().copied(), BufferUsage::STORAGE_BUFFER)
             .unwrap();
-        let kv_buf = ctx
-            .buffer_from_iter(kv.iter().copied(), BufferUsage::STORAGE_BUFFER)
+        let k_buf = ctx
+            .buffer_from_iter(kv_k.iter().copied(), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let v_buf = ctx
+            .buffer_from_iter(kv_v.iter().copied(), BufferUsage::STORAGE_BUFFER)
             .unwrap();
         let part_buf = ctx
             .new_buffer::<f32>(
@@ -436,10 +450,11 @@ fn attn_is_bit_deterministic() {
             &part_k,
             vec![
                 WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, kv_buf),
-                WriteDescriptorSet::buffer(2, part_buf.clone()),
+                WriteDescriptorSet::buffer(1, k_buf),
+                WriteDescriptorSet::buffer(2, v_buf),
+                WriteDescriptorSet::buffer(3, part_buf.clone()),
                 WriteDescriptorSet::buffer(
-                    3,
+                    4,
                     step_buf(
                         &ctx,
                         StepState {

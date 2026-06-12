@@ -169,6 +169,18 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: false,
     },
+    // Residual join: y = (a + b) * s; s carries layer_output_scale on the
+    // FFN join, 1.0 on the attention join (M3 graph).
+    Variant {
+        name: "add_scaled",
+        src: "add_scaled",
+        defs: &[],
+        workgroup: [256, 1, 1],
+        bindings: 3,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: false,
+    },
     // Q4_0 GEMV, one variant per matmul-site K (the N dimension is the
     // dispatch size). Workgroup = one wave (probe: subgroup 64).
     Variant {
@@ -276,7 +288,9 @@ const VARIANTS: &[Variant] = &[
         raw: false,
     },
     // Attention (plan 02 step 6). Sliding: GQA 32:16, head_dim 256, window
-    // 1024, separate K/V. Global: GQA 32:4, head_dim 512, K = V aliased.
+    // 1024. Global: GQA 32:4, head_dim 512. K and V are separate stores on
+    // BOTH layer kinds (the global "K = V aliased" M2 reading was wrong —
+    // docs/reference/gemma4-forward-graph.md).
     // Workgroups cover one KV head (× query token / split), computing the
     // Q_PER_KV query heads that share it.
     // (The subgroupAdd kernels compile via plain naga, like coopmat:
@@ -298,7 +312,7 @@ const VARIANTS: &[Variant] = &[
         src: "attn_decode_global",
         defs: &[("HEAD_DIM", 512), ("N_KV_HEADS", 4), ("Q_PER_KV", 8)],
         workgroup: [64, 1, 1],
-        bindings: 4,
+        bindings: 5,
         push_bytes: 8,
         subgroup_size: 0,
         raw: true,
@@ -343,7 +357,7 @@ const VARIANTS: &[Variant] = &[
         src: "attn_prefill_global",
         defs: &[("HEAD_DIM", 512), ("N_KV_HEADS", 4), ("Q_PER_KV", 8)],
         workgroup: [64, 1, 1],
-        bindings: 4,
+        bindings: 5,
         push_bytes: 4,
         subgroup_size: 0,
         raw: true,

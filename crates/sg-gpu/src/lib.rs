@@ -17,6 +17,11 @@ mod kernel;
 pub use context::GpuContext;
 pub use graph::{CommandGraph, GpuTimer, GraphRecorder, STEP_WORDS, StepState};
 pub use kernel::{KERNELS, Kernel, KernelBlob, kernel_blob};
+// The buffer/descriptor currency of this crate's API, re-exported so graph
+// assembly (sg-model) names them without a direct vulkano dependency — one
+// place pins the vulkano version.
+pub use vulkano::buffer::{BufferUsage, Subbuffer};
+pub use vulkano::descriptor_set::WriteDescriptorSet;
 
 /// Runtime GPU errors. Off-target conditions (no Vulkan, no capable device)
 /// are ordinary variants so tests can skip rather than fail.

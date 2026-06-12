@@ -50,12 +50,12 @@ each gets a parity test in M3 before being trusted):
 |---|---|
 | Weights Q4_0 (~4.5 bit/weight, 31B) | ~18 GB |
 | Sliding KV ring (50 layers × 1024 tok × (K+V) 16 KB, f16) | ~820 MB |
-| Global KV per token (10 layers × 4 heads × 512 × f16, K=V) | **40 KB/token** |
-| Global KV resident @128K ctx / @256K ctx | 5.2 GB / 10.5 GB |
+| Global KV per token (10 layers × 4 heads × 512 × f16, **K and V cached separately** — the shared projection diverges through the norms/rope, see `docs/reference/gemma4-forward-graph.md`) | **80 KB/token** |
+| Global KV resident @128K ctx / @256K ctx | 10.5 GB / 21 GB |
 | Activations + scratch | < 1 GB |
 | **Total GPU-visible @256K ctx** | **< 32 GB** (huge headroom in 128 GB) |
 
-Decode is bandwidth-bound: ~17.3 GB weights + ~0.9 GB sliding-KV + (41 KB × ctx) global-KV per token
+Decode is bandwidth-bound: ~17.3 GB weights + ~0.9 GB sliding-KV + (82 KB × ctx) global-KV per token
 → ceiling ≈ **13–14 tok/s** at short context, ≈ **11 tok/s** at 100K; expect 80–90 % of that from
 real streaming kernels. **MTP speculative decoding (plan 07) multiplies this by the expected
 accepted-tokens-per-verify (~2–3.5× on agent workloads → ~25–35 tok/s effective)** by amortizing
@@ -64,7 +64,7 @@ one weight read over K+1 verified positions. Prefill is compute-bound: 62 GFLOP/
 available through naga on the target — verified). These ceilings calibrate all benchmark targets.
 
 **Consequence that shapes everything:** prefill at ~300 tok/s vs NVMe at ~5 GB/s means loading cached
-global KV (40 KB/token ≈ 125K tok/s) is **~2 orders of magnitude cheaper than recomputing**. cache2
+global KV (80 KB/token ≈ 62K tok/s) is **~2 orders of magnitude cheaper than recomputing**. cache2
 exists to convert NVMe bytes into skipped prefill.
 
 ## System overview

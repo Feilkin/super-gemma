@@ -1,6 +1,6 @@
 # STATUS — read this first
 
-Last updated: **2026-06-11**, working on the Framework Desktop target box. The conversation
+Last updated: **2026-06-12**, working on the Framework Desktop target box. The conversation
 history that produced this repo is gone; everything needed to continue is in this file,
 `AGENTS.md`, and `docs/plans/`.
 
@@ -117,9 +117,10 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
   Both decode kernels are split-K + reduce (`attn_reduce_d256`/`_d512`): their natural workgroup
   counts (16/4 KV heads) leave the 40-CU GPU latency-bound — sliding decode measured 322 µs →
   37 µs with 16 splits. Global decode with splits ∝ ctx holds ~1.2 ms/layer at any context
-  (32 splits at 32K; 36.7 ms unsplit). K=V on global layers is native: one read serves score and
-  weighted sum. GQA: workgroup per KV head computing its Q_PER_KV query heads. Softmax scale is
-  a push constant (M3 verify-item pins the value). Prefill: sliding 3.6 ms/chunk (M=256, full
+  (32 splits at 32K; 36.7 ms unsplit). ~~K=V on global layers is native: one read serves score
+  and weighted sum~~ (**WRONG — amended in M3**: cached K ≠ cached V; the global kernels now
+  bind separate K/V buffers, see the M3 section). GQA: workgroup per KV head computing its
+  Q_PER_KV query heads. Softmax scale is a push constant (pinned 1.0 in M3). Prefill: sliding 3.6 ms/chunk (M=256, full
   windows); **global 34 ms/chunk at 8K ctx and O(ctx²)** — fine to start, the known optimization
   target is a coopmat flash-attention rewrite, deferred until e2e profiling (decision with Ada
   2026-06-12: no more kernel micro-tuning before the full pipeline runs).
@@ -180,29 +181,74 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
   naga 29 implements `subgroupAdd` but not the `enable subgroups` directive — omit the
   directive and compile those shaders via plain naga (`raw: true`, naga_oil rejects them too).
 
+## M3 progress (2026-06-12)
+
+**The M3 gate is green**: per-layer activation parity (CPU oracle vs GPU graph) and
+end-to-end single-token logit parity on the real GGUF, plus a llama.cpp cross-check on the
+same file. All verify-items are pinned — **see `docs/reference/gemma4-forward-graph.md`**,
+resolved by reading transformers `gemma4` (main) + llama.cpp b9254 (the installed build) and
+confirmed empirically. Highlights: RMSNorm is plain `x̂·w`; attention scale is **1.0**; no
+attention softcap; `layer_output_scale` multiplies the whole hidden state at layer end; GQA
+mapping is contiguous blocks (no upload reordering); embedding scale √5376 in f32;
+`rope_freqs.weight` = ggml freq divisors `[1.0 ×64, 1e30 ×192]` (= partial rotary 0.25).
+
+**Two M2 contracts were wrong and have been amended** (details in the findings doc):
+
+- **Cached K ≠ cached V on global layers.** `attention_k_eq_v` ties only the projection; V
+  gets a *weightless* RMS-norm and **no rope** (all layers have this V-norm — new dispatch).
+  The two global attention shaders now bind separate K and V; `kv_append_global` runs twice;
+  **global KV is 80 KB/token, not 40** (21 GB @256K — still fits; plans 00/04 numbers stale).
+- **Global rope pairing was wrong** (paired `(i, i+64)`): NEOX pairs `(i, i+head_dim/2)` with
+  only the first 64 pairs live. Fixed in `rope.wgsl`; sliding variants unaffected.
+
+Landed in `sg-model` (+ `sg-gpu` amendments), all green:
+
+- **CPU reference model** (`reference.rs`): full 60-layer f32 oracle with f64 accumulation,
+  dequant-on-the-fly off the mmap (an f32 copy wouldn't fit in RAM), verify-items behind
+  `Conventions` knobs, activation taps, linear KV with window-as-mask. Decode == prefill
+  **bit-exact** on the oracle. ~7 s/token (rayon, opt-3 in dev profile via workspace override).
+- **rope.rs**: the ONE home of the pinned rope-table math (CPU ref and GPU graph share it).
+- **llama.cpp parity** (`tests/llamacpp_parity.rs` + `tools/gen_logits_fixtures.py`, fixtures
+  from the installed b9254 via llama-server): short prompts **pass** — overlap 18–20/20,
+  KL ≤ 0.003. Thresholds: argmax equal, overlap ≥ 15/20, top-20 KL ≤ 0.02, |Δlogprob| ≤ 0.15
+  where logprob > −5. **OPEN: the 2054-token `long_window` fixture FAILS** — diagnosis in
+  flight (the panic message was lost to output truncation on the first run; rerun pending).
+  Until it's understood, treat window-crossing semantics as unconfirmed vs llama.cpp.
+- **Weight upload** (`weights.rs`): one buffer per tensor, Q4_0 verbatim, Q6_K embeddings
+  repacked to the 4416-byte stride, norm weights f32, ones buffer for the V-norm,
+  `layer_output_scale` CPU-side (baked into `add_scaled` push at record time). Simple
+  mmap-memcpy path; the per-tensor O_DIRECT scatter load is an M4 startup optimization.
+- **GPU graph** (`graph.rs`): decode-shaped 60-layer dispatch sequence (~23 dispatches/layer
+  incl. the new `add_scaled` residual-join kernel), recordable per-range (parity drilling) or
+  whole (production); driven per token by step buffer + CPU-rewritten embedding/rope-table
+  buffers. Split-K baked at record time (16 sliding / 32 global).
+- **M3 parity test** (`tests/gpu_parity.rs`): 5-token prompt token-by-token; per-layer
+  nrmse ≤ 0.02 (observed worst **0.012**, layer 57), logits top-20 overlap **20/20** every
+  token, |Δ| ≤ 0.25 on top logits; the full pre-recorded graph is **bit-identical** to the
+  per-layer submission path.
+
 ## Immediate next steps (in order)
 
-1. **M3: inference pipeline (`sg-model`, plan 03)** — weight upload (incl. Q6_K repack to the
-   padded ROW_WORDS stride and the gemm/gemv weight views), the 60-layer stack wired as
-   decode/prefill command graphs, embedding lookup decision, and the parity harness against
-   transformers `gemma4` that pins the open verify-items (RoPE proportional formula +
-   `rope_freqs.weight`, RMSNorm `w` vs `1+w`, attention scale, attn softcap,
-   `layer_output_scale`, GQA head-mapping convention).
-2. **Full-pipeline e2e profile** (agreed with Ada 2026-06-12) once M3 runs: it decides all
+1. **Diagnose the `long_window` llama.cpp parity failure** (window-crossing semantics or
+   fixture/threshold artifact — rerun with full output is in flight; the prompt is 2054
+   tokens, ~30 min through the scalar oracle).
+2. **M4: chunked prefill + decode loop + CLI** (plan 03 steps 4–5): the two-range sliding
+   prefill kernel variant (plan 03 §prefill), gemm-based prefill graphs, sampler, streaming
+   detok, `sg run --prompt`. Perplexity gate vs llama.cpp.
+3. **Full-pipeline e2e profile** (agreed with Ada 2026-06-12) once M4 runs: it decides all
    further kernel optimization priorities. Known candidates it will rank: coopmat GEMM at ~12
    of 17.7 TFLOPS target (structural levers exhausted, see dead-ends — needs RGP evidence;
    prefill ~190 tok/s vs ≥300 target), prefill-global attention (34 ms/chunk at 8K, O(ctx²) —
-   coopmat flash-attention rewrite), LM head at 83 % of bandwidth ceiling.
-3. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
+   coopmat flash-attention rewrite), LM head at 83 % of bandwidth ceiling. **New entrant:
+   global attention now reads 2× KV bytes (K≠V)** — decode-global split-K timing needs
+   re-measuring.
+4. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)
 
-- Plan 00 §verify-against-reference: proportional-RoPE formula (now incl. `rope_freqs.weight`
-  and `rope.dimension_count` 512/256), attn softcap on text layers, RMSNorm `w` vs `1+w`,
-  attention scaling, **`layer_output_scale` semantics** → resolved by the M3 parity harness
-  against transformers `gemma4` code; isolated behind swappable functions in `sg-model`.
-  (Global Q-head layout and missing global v_proj: resolved by the real tensor table, see
-  findings above.)
+- ~~Plan 00 §verify-against-reference~~ — **ALL RESOLVED 2026-06-12**, pinned in
+  `docs/reference/gemma4-forward-graph.md` and confirmed by llama.cpp logit parity (short
+  contexts; the >1024-token case is the open `long_window` failure above).
 - Plan 01 §open questions: ~~embedding dtype~~ (Q6_K, resolved); Gemma 4 tool-call convention
   (from the chat template — it's in the GGUF); exact `gemma4` tokenizer algorithm.
 - Plan 07 §verify-items: all MTP drafter semantics (conditioning, K, KV-sharing map, centroid

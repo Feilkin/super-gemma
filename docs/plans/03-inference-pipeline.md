@@ -11,7 +11,7 @@ decode loop → streamed output. Single conversation in flight, always.
 Per layer (60×, type from `layer_types` pattern — 5 sliding then 1 global, repeating):
 
 ```
-x ── rmsnorm(input) ── q_proj/k_proj[/v_proj] ── qk-norm ── rope(layer type)
+x ── rmsnorm(input) ── q_proj/k_proj[/v_proj] ── qk-norm (+ weightless V-norm) ── rope(layer type, q/k only)
    ── attention(layer type) ── o_proj ── rmsnorm(post_attn) ── (+residual)
    ── rmsnorm(pre_ffn) ── geglu mlp ── rmsnorm(post_ffn) ── (+residual)
 ```
@@ -19,7 +19,8 @@ x ── rmsnorm(input) ── q_proj/k_proj[/v_proj] ── qk-norm ── rope
 - Embedding lookup scaled by √5376; final rmsnorm; tied-embedding LM head; tanh softcap 30 → logits.
 - **Sliding layers:** Q/K/V 32:16:16 heads × 256; K,V separate; RoPE θ=10k; attend to ring buffer
   (window 1024).
-- **Global layers:** Q 32 × 512; K=V 4 × 512 single projection; RoPE θ=1M proportional, partial
+- **Global layers:** Q 32 × 512; K/V share one 4 × 512 projection but are CACHED separately
+  (K: k_norm + rope; V: weightless norm, no rope — M3 finding); RoPE θ=1M proportional, partial
   rotary 0.25; attend to full context (resident global KV).
 - All "verify-against-reference" details (plan 00) are isolated behind small, swappable functions
   so the M3 parity harness can flip them and identify the correct combination empirically if the

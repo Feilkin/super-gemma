@@ -29,6 +29,16 @@ undocumented_unsafe_blocks = "warn"
 lto = "thin"
 codegen-units = 1
 
+# The CPU reference model streams all 17 GB of quantized weights through
+# scalar dequant per forward pass; unoptimized that makes the Tier-2 oracle
+# tests unusably slow. Optimize the hot crates even under `cargo nextest run`.
+[profile.dev.package.sg-model]
+opt-level = 3
+[profile.dev.package.sg-gguf]
+opt-level = 3
+[profile.dev.package.half]
+opt-level = 3
+
 # Fast-iteration profile for benches that still need optimized kernel-adjacent code.
 [profile.bench-dev]
 inherits = "release"
