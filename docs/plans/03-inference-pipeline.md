@@ -22,19 +22,46 @@ x ── rmsnorm(input) ── q_proj/k_proj[/v_proj] ── qk-norm ── rope
 - **Global layers:** Q 32 × 512; K=V 4 × 512 single projection; RoPE θ=1M proportional, partial
   rotary 0.25; attend to full context (resident global KV).
 - All "verify-against-reference" details (plan 00) are isolated behind small, swappable functions
-  (rope formula, norm convention, attn softcap on/off, scaling) so the M3 parity harness can flip
-  them and identify the correct combination empirically if the reference reading is ambiguous.
+  so the M3 parity harness can flip them and identify the correct combination empirically if the
+  reference reading is ambiguous: rope formula (`proportional` + `rope_freqs.weight`
+  consumption), norm convention (`w` vs `1+w`), attn softcap on/off, attention scaling,
+  **`layer_output_scale` semantics** (per-layer scalar found in the real GGUF, M1), and the
+  **GQA head-mapping convention** — the M2 kernels assume q-head h reads kv-head
+  h / (n_q/n_kv); if the reference interleaves differently, it is fixed by reordering head
+  blocks at weight upload, so it must be pinned before upload code is written.
+- Embedding lookup is **CPU-side** (no kernel exists, deliberately): dequantize the token's Q6_K
+  row via `sg-gguf`, scale by √5376, write ~10.5 KB into the activations buffer — microseconds
+  per decode token, ~3 MB per prefill chunk. Revisit only if the e2e profile disagrees.
 
 `sg-model` is *declarative*: it describes the per-layer dispatch sequence against `sg-gpu` kernel
 descriptors; `sg-gpu` records it. No Vulkan types leak above `sg-gpu`.
 
+## Weight upload
+
+- **One buffer per tensor.** The M0 probe pins `maxStorageBufferRange` at 4 GB, so a single
+  18 GB weights buffer is impossible (the plan 02 open risk, now resolved); the largest single
+  tensor (Q6_K embeddings, 1.16 GB) fits comfortably.
+- Q4_0 tensors upload verbatim (the gemv/gemm kernels consume the GGUF block-pair layout
+  directly). The Q6_K embedding tensor is **repacked to a 4416-byte row stride** (21 × 210-byte
+  blocks padded so every row starts word-aligned) — the layout `gemv_q6_k_logits` requires; the
+  CPU-side embedding lookup reads the same repacked buffer.
+
 ## Prefill
 
-- Chunked (default 256 tokens/chunk, tunable): bounds activation memory, lets cache2 stream page
-  writes behind compute, and gives natural points for sliding-ring **tail snapshot capture** at
-  message boundaries (plan 04).
+- Chunked (default 256 tokens/chunk, tunable; must stay a multiple of the gemm M_BLOCK = 64):
+  bounds activation memory, lets cache2 stream page writes behind compute, and gives natural
+  points for sliding-ring **tail snapshot capture** at message boundaries (plan 04).
 - Per chunk: embed → 60 layers → KV appended to ring + resident global KV; logits computed only for
-  the final token of the last chunk.
+  the final token of the last chunk (gemv on that token's hidden state — no logits GEMM).
+- **Sliding prefill attention sources keys from TWO places** (M2 finding: the chunk cannot be
+  appended to the ring before attending — early queries' windows would already be overwritten).
+  Order per layer: attend, then append. The kernel becomes a two-range variant of
+  `attn_prefill_sliding`: history keys (positions [q0−1023, q0)) read from the ring pre-append
+  via `pos % 1024` indexing, the chunk's own keys read from the chunk K/V activations; one
+  streaming softmax across both ranges in position order (deterministic). No extra memory.
+  Fallback if the kernel proves fiddly: a rolling linear KV scratch (last 1023 + chunk per
+  layer, ~1 GB total + per-chunk copies) feeding the existing linear-view kernel unchanged.
+  Global prefill needs nothing: the resident global KV is already linear.
 - Prefill begins at `resume_pos` (0 if cold): cache2 hands the engine `(resume_pos, loaded global KV
   [0..resume_pos], sliding ring snapshot at resume_pos)`; the engine only computes the suffix.
 
@@ -42,14 +69,27 @@ descriptors; `sg-gpu` records it. No Vulkan types leak above `sg-gpu`.
 
 Steady-state per token:
 
-1. GPU thread submits pre-recorded decode graph (uniform: position, ring head, kv_len, prev token).
-2. CPU waits on timeline value, reads logits from unified memory.
+1. CPU writes the sampled token's embedding row into the activations buffer (CPU-side lookup)
+   and rewrites the 16-byte step buffer (`sg_gpu::StepState`: pos, kv_len_sliding,
+   kv_len_global, q0 — the M2.7 contract; ring-head arithmetic is CPU bookkeeping only, the
+   kernels iterate ring slots in physical order). GPU thread submits the pre-recorded decode
+   graph.
+2. CPU waits for completion, reads logits from unified memory. (M2.7 measured 39 µs CPU
+   overhead per decode-shaped submit with the plain blocking-fence path — the < 300 µs target
+   is already met; the timeline-semaphore submission is an optimization to adopt only if the
+   engine's pipelining wants it.)
 3. Sampler (CPU): temperature → top-k → top-p → categorical draw with per-request RNG seed
    (Anthropic API params; greedy if temperature 0).
 4. Stop check: EOS ids {1, 106}, `stop_sequences` (decoded-text matcher with overlap buffer),
    `max_tokens`.
 5. Streaming detok (UTF-8-safe) → SSE delta out; incremental tool-call parser fed in parallel.
-6. Token id written into next step's uniform; ring/KV bookkeeping advances; goto 1.
+6. Ring/KV bookkeeping advances; goto 1.
+
+**Split-K policy:** the decode graph's attention split counts are push constants, baked at
+record time (one graph, fixed splits — e.g. 16 sliding / 32 global; revisit with the e2e
+profile). kv_len growth shrinks the per-split chunks via the step buffer; empty splits are
+handled by the reducers. Split count changes the float reduction order, so it is part of the
+determinism contract: same recorded graph ⇒ bit-identical reruns.
 
 Pipelining: while GPU runs step N, CPU does sampling/detok/SSE for N−1 — hides essentially all
 CPU work. Abort (client disconnect, timeout) checked each iteration; aborts must still flush
@@ -103,12 +143,14 @@ validate → PromptBuilder (messages+tools → token ids)
 1. CPU reference model (f32, ndarray-style, slow) for a **single layer** then full graph — this is
    the parity oracle for M3 and the kernel tests' ground truth. Must load the real GGUF (scalar
    dequant from `sg-gguf`).
-2. GPU graph assembly for one layer → parity vs CPU ref → all 60 layers → end-to-end single-token
-   parity (M3 gate).
-3. Chunked prefill + KV append; greedy decode loop; CLI bin (`sg run --prompt`) for eyeballing (M4).
-4. Sampler + stop handling + streaming detok integration.
-5. Engine orchestration with cache2 stubbed (in-memory only, M5), then real cache2 (M6).
-6. Abort/cancellation paths; overlap tuning (prefill vs page-load, decode vs SSE).
+2. Weight upload: per-tensor buffers, Q4_0 verbatim, Q6_K repacked to the padded row stride
+   (see §Weight upload); GQA head order pinned before this lands.
+3. GPU graph assembly for one layer → parity vs CPU ref → all 60 layers → end-to-end single-token
+   parity (M3 gate). Includes the two-range sliding-prefill kernel variant (§Prefill).
+4. Chunked prefill + KV append; greedy decode loop; CLI bin (`sg run --prompt`) for eyeballing (M4).
+5. Sampler + stop handling + streaming detok integration.
+6. Engine orchestration with cache2 stubbed (in-memory only, M5), then real cache2 (M6).
+7. Abort/cancellation paths; overlap tuning (prefill vs page-load, decode vs SSE).
 
 ## Testing & validation
 
@@ -120,8 +162,16 @@ validate → PromptBuilder (messages+tools → token ids)
   GGUF — see plan 06).
 - **Perplexity:** wikitext-2 + a code corpus slice through prefill path; must match llama.cpp same-
   GGUF perplexity within 0.5 % (M4 gate).
-- **Decode==prefill consistency:** logits for token N via (prefill N) vs (prefill N−1 + decode 1)
-  bit-identical — catches ring/RoPE/position bugs.
+- **Decode==prefill consistency:** logits for token N via (prefill N) vs (prefill N−1 + decode 1).
+  Bit-identical is only achievable where the two paths perform the same float ops (M2 finding):
+  decode attention is split-K, so the bit-exact form of this test runs a **single-split** decode
+  graph at ctx ≤ 1024 (unwrapped ring; verified op-for-op equal to the prefill kernel's
+  streaming softmax there). The general case (production split counts, wrapped ring) asserts
+  tight tolerance + top-k rank stability instead — still catches ring/RoPE/position bugs.
+  Related non-goal: K/V rows for the same token computed by decode (gemv) vs prefill (coopmat
+  gemm) differ in low bits by construction — never assert bitwise equality between them; the
+  determinism invariant is "given (seed, prompt, cache state)", and cached pages are
+  internally consistent whichever path produced them.
 - **Sampler unit tests:** distribution tests (chi-squared vs expected for known logits), top-k/p
   edge cases, determinism per seed, stop-sequence matcher property tests (random overlap splits
   across token boundaries).
