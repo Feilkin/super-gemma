@@ -39,6 +39,17 @@ const SPLITS_GLOBAL: u32 = 32;
 const HIDDEN: usize = 5376;
 const FFN: usize = 21504;
 
+/// Which logits a prefill graph computes. (The all-positions perplexity
+/// path is NOT a mode here: its LM-head work runs as separate batched
+/// submissions — see `prefill_all_logits`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LogitsMode {
+    /// None — interior chunks of a prompt.
+    None,
+    /// Final norm + LM head over the chunk's last real row (generation).
+    Last,
+}
+
 /// A single-token (decode-shaped) GPU forward pass over the whole stack.
 ///
 /// Holds every buffer the recorded graph binds; the CPU rewrites the small
@@ -62,9 +73,21 @@ pub struct GpuModel<'a> {
     max_chunk: usize,
     /// Capacity of the linear global-KV stores, in tokens.
     global_cap: usize,
-    /// Recorded prefill graphs keyed by (padded_len, real_len, with_logits)
+    /// Recorded prefill graphs keyed by (padded_len, real_len, logits mode)
     /// — the dispatch grids and append slices are shape-specific.
-    prefill_graphs: std::collections::HashMap<(usize, usize, bool), CommandGraph>,
+    prefill_graphs: std::collections::HashMap<(usize, usize, LogitsMode), CommandGraph>,
+    /// `[max_chunk × vocab]` f32, allocated on first all-logits prefill
+    /// (the perplexity path); ~270 MB at the default chunk size.
+    logits_all: Option<Subbuffer<[f32]>>,
+    /// Final-norm-over-all-rows graphs (keyed by m_pad) and LM-head row
+    /// batches (keyed by row range), for the all-logits path. Batched into
+    /// SEPARATE submissions: a single graph carrying the whole 60-layer
+    /// chunk plus 256 LM-head gemvs (~1.4 s of saturated-bandwidth work)
+    /// tripped the amdgpu watchdog's soft recovery — observed as a "context
+    /// lost / guilty of hard recovery" device loss on the SECOND chunk and
+    /// silently-cancelled waves on the first.
+    norm_all_graphs: std::collections::HashMap<usize, CommandGraph>,
+    logits_batch_graphs: std::collections::HashMap<(usize, usize), CommandGraph>,
     /// Absolute position of the NEXT token to decode.
     pub pos: u32,
 }
@@ -337,6 +360,9 @@ impl<'a> GpuModel<'a> {
             max_chunk,
             global_cap,
             prefill_graphs: std::collections::HashMap::new(),
+            logits_all: None,
+            norm_all_graphs: std::collections::HashMap::new(),
+            logits_batch_graphs: std::collections::HashMap::new(),
             kv,
             step: ctx.new_step_buffer()?,
             cs_sliding,
@@ -621,17 +647,109 @@ impl<'a> GpuModel<'a> {
         &self,
         m_pad: usize,
         n_real: usize,
-        with_logits: bool,
+        logits: LogitsMode,
     ) -> Result<CommandGraph, GpuError> {
         self.ctx.record_graph(|rec| {
             for i in 0..self.desc.n_layers {
                 self.record_prefill_layer(rec, i, m_pad, n_real)?;
             }
-            if with_logits {
-                self.record_prefill_logits(rec, n_real)?;
+            match logits {
+                LogitsMode::None => Ok(()),
+                LogitsMode::Last => self.record_prefill_logits(rec, n_real),
             }
-            Ok(())
         })
+    }
+
+    /// Chunked prefill returning per-position logits, `[n × vocab]` f32 —
+    /// the perplexity evaluation path (plan 06 rung 4 / the M4 gate).
+    /// Slower than [`Self::prefill`] by ~5.5 ms LM-head cost per position;
+    /// the head runs in batched submissions of [`LOGITS_BATCH`] rows to
+    /// stay far from the GPU watchdog (see `norm_all_graphs`).
+    pub fn prefill_all_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>, GpuError> {
+        /// ~175 ms of LM-head work per submission.
+        const LOGITS_BATCH: usize = 32;
+        if self.logits_all.is_none() {
+            self.logits_all = Some(self.ctx.new_buffer::<f32>(
+                (self.max_chunk * self.desc.vocab_size) as u64,
+                BufferUsage::STORAGE_BUFFER,
+            )?);
+        }
+        let vocab = self.desc.vocab_size;
+        let mut out = Vec::with_capacity(tokens.len() * vocab);
+        for chunk in tokens.chunks(self.max_chunk).collect::<Vec<_>>() {
+            let n_real = chunk.len();
+            let m_pad = n_real.next_multiple_of(64);
+
+            // The 60 layers (same graph as an interior prompt chunk).
+            let key = (m_pad, n_real, LogitsMode::None);
+            if !self.prefill_graphs.contains_key(&key) {
+                let g = self.record_prefill(m_pad, n_real, LogitsMode::None)?;
+                self.prefill_graphs.insert(key, g);
+            }
+            self.stage_prefill_chunk(chunk)?;
+            self.ctx.submit_blocking(&self.prefill_graphs[&key])?;
+            self.pos += n_real as u32;
+
+            // Final norm over all rows, then the LM head in row batches.
+            if !self.norm_all_graphs.contains_key(&m_pad) {
+                let g = self.ctx.record_graph(|rec| {
+                    rms(
+                        rec,
+                        &self.k.rms5376,
+                        &self.p.x,
+                        &self.weights.output_norm,
+                        &self.p.xn,
+                        m_pad,
+                    )
+                })?;
+                self.norm_all_graphs.insert(m_pad, g);
+            }
+            self.ctx.submit_blocking(&self.norm_all_graphs[&m_pad])?;
+            let mut r0 = 0usize;
+            while r0 < n_real {
+                let len = LOGITS_BATCH.min(n_real - r0);
+                if !self.logits_batch_graphs.contains_key(&(r0, len)) {
+                    let all = self.logits_all.as_ref().unwrap();
+                    let g = self.ctx.record_graph(|rec| {
+                        for r in r0 as u64..(r0 + len) as u64 {
+                            rec.dispatch(
+                                &self.k.logits,
+                                vec![
+                                    buf(0, self.weights.token_embd.clone()),
+                                    buf(
+                                        1,
+                                        self.p
+                                            .xn
+                                            .clone()
+                                            .slice(r * HIDDEN as u64..(r + 1) * HIDDEN as u64),
+                                    ),
+                                    buf(
+                                        2,
+                                        all.clone().slice(r * vocab as u64..(r + 1) * vocab as u64),
+                                    ),
+                                ],
+                                None::<u32>,
+                                [vocab as u32, 1, 1],
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                    self.logits_batch_graphs.insert((r0, len), g);
+                }
+                self.ctx
+                    .submit_blocking(&self.logits_batch_graphs[&(r0, len)])?;
+                r0 += len;
+            }
+
+            let r = self
+                .logits_all
+                .as_ref()
+                .unwrap()
+                .read()
+                .map_err(|e| GpuError::Validation(e.to_string()))?;
+            out.extend_from_slice(&r[..n_real * vocab]);
+        }
+        Ok(out)
     }
 
     /// Per-layer-range prefill graph for the parity harness (mirrors
@@ -1058,9 +1176,14 @@ impl<'a> GpuModel<'a> {
         for (ci, chunk) in tokens.chunks(self.max_chunk).enumerate() {
             let n_real = chunk.len();
             let m_pad = n_real.next_multiple_of(64);
-            let key = (m_pad, n_real, ci == n_chunks - 1);
+            let mode = if ci == n_chunks - 1 {
+                LogitsMode::Last
+            } else {
+                LogitsMode::None
+            };
+            let key = (m_pad, n_real, mode);
             if !self.prefill_graphs.contains_key(&key) {
-                let g = self.record_prefill(m_pad, n_real, key.2)?;
+                let g = self.record_prefill(m_pad, n_real, mode)?;
                 self.prefill_graphs.insert(key, g);
             }
             self.stage_prefill_chunk(chunk)?;

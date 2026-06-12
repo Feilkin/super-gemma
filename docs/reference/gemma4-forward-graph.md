@@ -70,6 +70,15 @@ Final: `output_norm(RMS,w)` → tied Q6_K head → `logits = 30·tanh(logits/30)
 
 ## Notes
 
+- **BOS convention (found via the M4 ppl gate):** llama.cpp *overrides* the GGUF's
+  `tokenizer.ggml.add_bos_token = false` to **true** for the Gemma4 arch (`load: override
+  'tokenizer.ggml.add_bos_token' to 'true' for Gemma4`), so plain completions and its
+  perplexity tool always start the stream with `<bos>` (ppl additionally replaces each
+  chunk's first fed token with it). Our chat path is unaffected (the template emits
+  `<bos>` itself), but anything comparing against llama.cpp on raw text must mirror the
+  override — the effect is huge on this IT model: BOS-anchored raw text scores ~8× worse
+  ppl than un-anchored mid-text continuation (measured 2026-06-12).
+
 - The cos/sin tables the M2 rope kernels consume are CPU-built; the proportional
   formula above lives in ONE place (`sg-model`'s table builder) for both the CPU
   reference and the GPU graph. Build angles in f64, store (cos, sin) f32; consume

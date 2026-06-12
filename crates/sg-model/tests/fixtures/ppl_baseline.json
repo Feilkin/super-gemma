@@ -1,0 +1,17 @@
+{
+ "generator": "version: 9254 (unknown)",
+ "corpora": [
+  {
+   "file": "ppl_wikitext.txt",
+   "ppl": 1119.3472,
+   "n_chunk": 28,
+   "n_ctx": 512
+  },
+  {
+   "file": "ppl_code.txt",
+   "ppl": 22.3287,
+   "n_chunk": 20,
+   "n_ctx": 512
+  }
+ ]
+}

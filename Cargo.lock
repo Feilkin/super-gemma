@@ -1440,6 +1440,7 @@ dependencies = [
  "serde_json",
  "sg-gguf",
  "sg-gpu",
+ "sg-tokenizer",
  "thiserror",
 ]
 

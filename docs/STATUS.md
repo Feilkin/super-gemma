@@ -237,18 +237,67 @@ Landed in `sg-model` (+ `sg-gpu` amendments), all green:
   token, |Δ| ≤ 0.25 on top logits; the full pre-recorded graph is **bit-identical** to the
   per-layer submission path.
 
+## M4 progress (2026-06-12) — COMPLETE
+
+Working end to end: **the model generates coherent text on this box** —
+`cargo run --release -p sg-model --example run -- --prompt "…"` streams answers at
+**12.2 tok/s decode** (plan 00 ceiling 13–14), TTFT 0.5 s on short prompts, model load
+3.8 s. Landed, all parity-tested:
+
+- **Two-range sliding prefill kernel** (`attn_prefill_sliding_ring`): history from the
+  pre-append ring (`pos % 1024`) + the chunk's own K/V, one position-ordered streaming
+  softmax. Kernel parity incl. wrapped-ring and window-saturation cases.
+- **Chunked prefill graph** (coopmat gemm path): chunks padded to M_BLOCK 64 (default 256),
+  global layers append-then-attend, sliding attend-then-append, appends bind n_real-sliced
+  sources, logits for the last real row. Graphs cached per chunk shape. Per-layer parity
+  ≤ 0.0025 nrmse; prefill-vs-oracle and prefill-vs-decode logits 20/20 top-20 overlap.
+- **Found + fixed a recorded-graph race**: vulkano auto-sync derives barriers from SPIR-V
+  reflection, which does NOT see cooperative-matrix accesses — gemm's coopLoad-only `x`
+  binding got no write→read barrier (scattered ~9 % corruption on real data; direct
+  dispatches were clean because fences sync everything). Fix: `touch` no-op kernel with a
+  reflection-visible read_write, dispatched on the producer buffer before each gemm
+  (touch.wgsl documents the mechanism). **Any future coopmat kernel in a recorded graph
+  needs the same treatment.**
+- **Sampler** (`sampler.rs`): temperature → top-k (quickselect ≤ 1024) → top-p →
+  categorical; self-contained xoshiro256++ (seed determinism never depends on a crate
+  version); with top-k off, top-p measures against the FULL distribution's mass (working
+  set expands as needed). Chi-squared + edge-case tests.
+- **Generation loop** (`generate.rs`): prefill → sample → decode with EOS {1, 106} /
+  max_tokens / abort-callback; tokenizer-free by design. The CLI example (`examples/run.rs`)
+  layers chat template / raw mode, streaming detok, and stop-sequence matching with
+  longest-prefix holdback.
+- **Perplexity gate** (plan 06 rung 4, the M4 exit): methodology byte-matched to
+  llama-perplexity at b9254 (n_ctx 512, fresh context, NLL over the window's second half,
+  **chunk-level BOS anchoring — llama.cpp overrides `add_bos_token` to true for Gemma4**,
+  see the findings doc; the convention is worth ~8× in ppl on this IT model). Corpus
+  fixtures committed (wikitext-2 test slice + a code snapshot);
+  `tools/gen_ppl_baseline.py` pins the baselines. **wikitext: ours 1115.66 vs llama.cpp
+  1119.35 — 0.33 %, PASSES the 0.5 % gate.** Code slice: 2.11 % BELOW llama.cpp — token
+  streams verified identical; located by a three-way measurement (3 chunks cumulative):
+  our f64-accumulation oracle 79.26, our GPU 78.99 (−0.3 %), llama.cpp GPU 82.78 (+4.4 %)
+  — **our pipeline tracks the high-precision oracle; llama.cpp is the outlier** (its CPU
+  and GPU backends quantize ACTIVATIONS to int8/Q8 for quantized-weight matmuls, a bias
+  that code's peaked distributions amplify; its own backend spread there is ±0.6 %).
+  Code-corpus tolerance calibrated to 3 % with this evidence (perplexity.rs documents the
+  numbers); tightening below the reference's own bias envelope is not meaningful.
+- Two GPU-watchdog lessons pinned: a single command buffer with ~1.4 s of saturated
+  LM-head work tripped amdgpu soft recovery (context lost on the NEXT submit, silently
+  cancelled waves on the current one) — the all-logits ppl path now submits the LM head
+  in 32-row batches.
+
+Suite hygiene: the model-heavy GPU tests each upload 17.5 GB and overflow the 80 GB heap
+when nextest runs them concurrently — they're serialized via a `gpu-model` test group in
+`.config/nextest.toml`. Full workspace suite: 109 tests, ~5 min.
+
 ## Immediate next steps (in order)
 
-1. **M4: chunked prefill + decode loop + CLI** (plan 03 steps 4–5): the two-range sliding
-   prefill kernel variant (plan 03 §prefill), gemm-based prefill graphs, sampler, streaming
-   detok, `sg run --prompt`. Perplexity gate vs llama.cpp.
-2. **Full-pipeline e2e profile** (agreed with Ada 2026-06-12) once M4 runs: it decides all
-   further kernel optimization priorities. Known candidates it will rank: coopmat GEMM at ~12
-   of 17.7 TFLOPS target (structural levers exhausted, see dead-ends — needs RGP evidence;
-   prefill ~190 tok/s vs ≥300 target), prefill-global attention (34 ms/chunk at 8K, O(ctx²) —
-   coopmat flash-attention rewrite), LM head at 83 % of bandwidth ceiling. **New entrant:
-   global attention now reads 2× KV bytes (K≠V)** — decode-global split-K timing needs
-   re-measuring.
+1. **Full-pipeline e2e profile** (agreed with Ada 2026-06-12), now that M4 runs: it ranks
+   all further kernel work — coopmat GEMM ~12 of 17.7 TFLOPS, prefill-global attention
+   O(ctx²), LM head at 83 % of ceiling, global decode KV traffic ×2 (K≠V), and the
+   int8-coopmat (SINT8×SINT8→SINT32, probed available) MMQ-style GEMM as a possible
+   accuracy+speed lever.
+2. **M5: in-memory caching across requests** (sliding ring + resident global KV reuse,
+   incremental decode; cache-on ≡ cache-off bit-identical gate).
 3. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)

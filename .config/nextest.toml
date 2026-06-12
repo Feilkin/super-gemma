@@ -1,6 +1,16 @@
 [profile.default]
 fail-fast = false
 
+# Each of these tests uploads the full 17.5 GB of weights to the GPU; run
+# concurrently they overflow the 80 GB device heap (observed: perplexity
+# failing in seconds under the full workspace suite, passing standalone).
+[test-groups]
+gpu-model = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(sg-model) and (test(gpu_graph) or test(prefill) or test(perplexity))'
+test-group = 'gpu-model'
+
 [profile.ci]
 fail-fast = false
 retries = 0

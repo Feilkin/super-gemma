@@ -18,3 +18,4 @@ thiserror = "2.0.18"
 
 [dev-dependencies]
 serde_json = "1.0.150"
+sg-tokenizer = { path = "../sg-tokenizer" }
