@@ -11,9 +11,11 @@
 mod buffer;
 mod context;
 mod exec;
+mod graph;
 mod kernel;
 
 pub use context::GpuContext;
+pub use graph::{CommandGraph, GpuTimer, GraphRecorder, STEP_WORDS, StepState};
 pub use kernel::{KERNELS, Kernel, KernelBlob, kernel_blob};
 
 /// Runtime GPU errors. Off-target conditions (no Vulkan, no capable device)

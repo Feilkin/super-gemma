@@ -7,8 +7,8 @@
 mod reference;
 
 use reference::{Rng, dequant_q8_0, from_f16_bits, quant_q8_0, through_f16, to_f16_bits};
-use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
+use sg_gpu::{GpuContext, StepState};
+use vulkano::buffer::{BufferUsage, Subbuffer};
 use vulkano::descriptor_set::WriteDescriptorSet;
 
 fn ctx() -> Option<GpuContext> {
@@ -19,6 +19,18 @@ fn ctx() -> Option<GpuContext> {
             None
         }
     }
+}
+
+/// Step buffer carrying the append position.
+fn step_buf(ctx: &GpuContext, pos: u32) -> Subbuffer<[u32]> {
+    let buf = ctx.new_step_buffer().unwrap();
+    StepState {
+        pos,
+        ..Default::default()
+    }
+    .write_to(&buf)
+    .unwrap();
+    buf
 }
 
 #[test]
@@ -50,8 +62,9 @@ fn kv_append_sliding_wraps_the_ring() {
         vec![
             WriteDescriptorSet::buffer(0, src_buf),
             WriteDescriptorSet::buffer(1, ring_buf.clone()),
+            WriteDescriptorSet::buffer(2, step_buf(&ctx, pos)),
         ],
-        Some(pos),
+        None::<u32>,
         kernel.groups_for((n_tokens * ROW) as u64),
     )
     .unwrap();
@@ -92,8 +105,9 @@ fn kv_append_global_is_linear() {
         vec![
             WriteDescriptorSet::buffer(0, src_buf),
             WriteDescriptorSet::buffer(1, dst_buf.clone()),
+            WriteDescriptorSet::buffer(2, step_buf(&ctx, pos)),
         ],
-        Some(pos),
+        None::<u32>,
         kernel.groups_for((n_tokens * ROW) as u64),
     )
     .unwrap();

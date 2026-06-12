@@ -22,9 +22,12 @@ enable f16;
 @group(0) @binding(1) var<storage, read> k: array<f16>; // [L × N_KV_HEADS × HEAD_DIM]
 @group(0) @binding(2) var<storage, read> v: array<f16>; // [L × N_KV_HEADS × HEAD_DIM]
 @group(0) @binding(3) var<storage, read_write> out: array<f16>; // [M × 32 × HEAD_DIM]
+// Per-step dynamic state, rewritten by the CPU between submits of the
+// pre-recorded graph (sg_gpu::StepState): [pos, kv_len_sliding,
+// kv_len_global, q0].
+@group(0) @binding(4) var<storage, read> step: array<u32>;
 
 struct Push {
-    q0: u32,
     scale: f32,
 }
 var<immediate> push: Push;
@@ -47,7 +50,7 @@ fn main(
     let i = wg_id.y; // query token within the chunk
     let d0 = lid * D;
 
-    let qpos = push.q0 + i; // inclusive last visible key
+    let qpos = step[3] + i; // q0 + i: inclusive last visible key
     var t_begin = 0u;
     if qpos + 1u > WINDOW {
         t_begin = qpos + 1u - WINDOW;

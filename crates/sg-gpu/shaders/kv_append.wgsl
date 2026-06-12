@@ -1,6 +1,6 @@
 // KV append (plan 02): copy freshly projected K or V rows for `n` tokens
-// into the per-layer KV store. The destination slot comes from a push
-// constant so the pre-recorded decode graph never needs re-recording.
+// into the per-layer KV store. The destination slot comes from the step
+// buffer so the pre-recorded decode graph never needs re-recording.
 //
 // Variants: kv_append_sliding writes into the 1024-slot ring (slot =
 // (pos + token) mod RING); kv_append_global appends linearly (slot =
@@ -14,12 +14,10 @@ enable f16;
 
 @group(0) @binding(0) var<storage, read> src: array<f16>; // [n_tokens × ROW_LEN]
 @group(0) @binding(1) var<storage, read_write> dst: array<f16>; // [slots × ROW_LEN]
-
-struct Push {
-    /// Absolute position of the first appended token.
-    pos: u32,
-}
-var<immediate> push: Push;
+// Per-step dynamic state, rewritten by the CPU between submits of the
+// pre-recorded graph (sg_gpu::StepState): [pos, kv_len_sliding,
+// kv_len_global, q0]. pos = absolute position of the first appended token.
+@group(0) @binding(2) var<storage, read> step: array<u32>;
 
 const ROW_LEN: u32 = #{ROW_LEN}u;
 
@@ -31,9 +29,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let token = gid.x / ROW_LEN;
     let j = gid.x % ROW_LEN;
 #ifdef RING
-    let slot = (push.pos + token) % #{RING}u;
+    let slot = (step[0] + token) % #{RING}u;
 #else
-    let slot = push.pos + token;
+    let slot = step[0] + token;
 #endif
     dst[slot * ROW_LEN + j] = src[gid.x];
 }

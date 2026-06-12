@@ -6,8 +6,8 @@
 //! policy.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use sg_gpu::GpuContext;
-use vulkano::buffer::{BufferContents, BufferUsage};
+use sg_gpu::{GpuContext, StepState};
+use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
 };
@@ -28,21 +28,20 @@ const DISPATCHES: usize = 8;
 
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
-struct PushLenScale {
-    len: u32,
-    scale: f32,
-}
-
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct PushSplit {
-    kv_len: u32,
+struct PushSplitScale {
     n_splits: u32,
     scale: f32,
 }
 
 fn f16_fill(n: usize) -> impl ExactSizeIterator<Item = u16> {
     (0..n).map(|i| half::f16::from_f32((i % 23) as f32 * 0.1 - 1.1).to_bits())
+}
+
+/// Step buffer holding the per-step dynamic state.
+fn step_buf(ctx: &GpuContext, state: StepState) -> Subbuffer<[u32]> {
+    let buf = ctx.new_step_buffer().unwrap();
+    state.write_to(&buf).unwrap();
+    buf
 }
 
 fn bench(c: &mut Criterion) {
@@ -94,6 +93,16 @@ fn bench(c: &mut Criterion) {
                     WriteDescriptorSet::buffer(1, k.clone()),
                     WriteDescriptorSet::buffer(2, v.clone()),
                     WriteDescriptorSet::buffer(3, part.clone()),
+                    WriteDescriptorSet::buffer(
+                        4,
+                        step_buf(
+                            &ctx,
+                            StepState {
+                                kv_len_sliding: kv_len as u32,
+                                ..Default::default()
+                            },
+                        ),
+                    ),
                 ],
                 [],
             )
@@ -134,8 +143,7 @@ fn bench(c: &mut Criterion) {
                                 .push_constants(
                                     p_layout.clone(),
                                     0,
-                                    PushSplit {
-                                        kv_len: kv_len as u32,
+                                    PushSplitScale {
                                         n_splits,
                                         scale: SL_SCALE,
                                     },
@@ -213,6 +221,16 @@ fn bench(c: &mut Criterion) {
                         WriteDescriptorSet::buffer(0, q.clone()),
                         WriteDescriptorSet::buffer(1, kv.clone()),
                         WriteDescriptorSet::buffer(2, part.clone()),
+                        WriteDescriptorSet::buffer(
+                            3,
+                            step_buf(
+                                &ctx,
+                                StepState {
+                                    kv_len_global: kv_len as u32,
+                                    ..Default::default()
+                                },
+                            ),
+                        ),
                     ],
                     [],
                 )
@@ -253,8 +271,7 @@ fn bench(c: &mut Criterion) {
                                     .push_constants(
                                         p_layout.clone(),
                                         0,
-                                        PushSplit {
-                                            kv_len: kv_len as u32,
+                                        PushSplitScale {
                                             n_splits,
                                             scale: GL_SCALE,
                                         },
@@ -335,6 +352,16 @@ fn bench(c: &mut Criterion) {
                 WriteDescriptorSet::buffer(1, k),
                 WriteDescriptorSet::buffer(2, v),
                 WriteDescriptorSet::buffer(3, out),
+                WriteDescriptorSet::buffer(
+                    4,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            q0: q0 as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
             ],
             [],
         )
@@ -359,14 +386,7 @@ fn bench(c: &mut Criterion) {
                             set.clone(),
                         )
                         .unwrap()
-                        .push_constants(
-                            layout.clone(),
-                            0,
-                            PushLenScale {
-                                len: q0 as u32,
-                                scale: SL_SCALE,
-                            },
-                        )
+                        .push_constants(layout.clone(), 0, SL_SCALE)
                         .unwrap();
                     for _ in 0..DISPATCHES {
                         // SAFETY: [kv_heads, M] grid, the kernel's contract.
@@ -416,6 +436,16 @@ fn bench(c: &mut Criterion) {
                 WriteDescriptorSet::buffer(0, q),
                 WriteDescriptorSet::buffer(1, kv),
                 WriteDescriptorSet::buffer(2, out),
+                WriteDescriptorSet::buffer(
+                    3,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            q0: q0 as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
             ],
             [],
         )
@@ -440,14 +470,7 @@ fn bench(c: &mut Criterion) {
                             set.clone(),
                         )
                         .unwrap()
-                        .push_constants(
-                            layout.clone(),
-                            0,
-                            PushLenScale {
-                                len: q0 as u32,
-                                scale: GL_SCALE,
-                            },
-                        )
+                        .push_constants(layout.clone(), 0, GL_SCALE)
                         .unwrap();
                     for _ in 0..DISPATCHES {
                         // SAFETY: [kv_heads, M] grid, the kernel's contract.

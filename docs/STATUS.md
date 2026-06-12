@@ -139,6 +139,19 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
   amax·(1/127), a multiply); **pack2x16float truncates toward zero on RADV** (unspecified
   rounding in SPIR-V) — use an `f16()` value conversion when RTNE matters. Also naga 29 and
   naga_oil 0.22 both miscompile `bitcast<u32>(vec2<f16>)` (per-component lowering) — avoid.
+- **Command graphs (M2.7) green — M2 is complete.** `record_graph`/`submit_blocking` +
+  `GraphRecorder::dispatch` (vulkano auto-sync inserts the inter-dispatch barriers), recorded
+  once and re-submitted. Per-step dynamic state moved OUT of push constants (those are baked at
+  record time) into a 16-byte step buffer (`StepState`: pos, kv_len_sliding, kv_len_global, q0
+  — layout pinned in graph.rs and each shader header) that the CPU rewrites between submits;
+  push constants now carry only record-time statics (scale, n_splits). Split-K grids are
+  recorded at a fixed split count; kv_len shrinks the chunks (empty splits already handled).
+  `GpuTimer` wraps timestamp queries for per-kernel GPU timing inside a graph.
+  **Decode-shaped overhead: 39 µs CPU per 240-dispatch submit (target < 300 µs)** with the
+  blocking fence path — the timeline-semaphore submission belongs to the engine loop (M3),
+  the criterion is already met without it. Graph test: mini decode step (append K/V → split-K
+  attention → reduce) recorded once, driven 3 steps by step-buffer rewrites, matches the f64
+  reference each step and is bit-identical when re-driven.
 - Attention layouts (kernels and engine must agree): activations `[token × head × head_dim]`;
   ring/linear KV `[slot|token × n_kv_heads × head_dim]`; decode iterates ring slots in PHYSICAL
   order (order-invariant softmax; no ring-head arithmetic in-kernel); prefill takes a linear KV
@@ -169,15 +182,17 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
 
 ## Immediate next steps (in order)
 
-1. **gemm_q4_0 tuning to ≥30 % of peak (17.7 TFLOPS; at ~12).** The cheap structural levers
-   are exhausted (see dead-ends above — every variant of the naive
-   load→dequant→barrier→MMA→barrier loop measured slower). Next step is evidence-first:
-   profile with RGP/`RADV_DEBUG` wave occupancy counters to find the actual stall reason
-   before touching the kernel again. At ~12 TFLOPS prefill is ~190 tok/s vs the ≥300 target;
-   may also revisit after M2.7 command graphs (dispatch overhead currently in every number).
-2. **M2.7 pre-recorded command graphs** + uniform update + timestamp timing (plan 02 step 8) —
-   the last M2 step; after it, the full-pipeline e2e profile (agreed with Ada 2026-06-12)
-   decides all further kernel optimization priorities.
+1. **M3: inference pipeline (`sg-model`, plan 03)** — weight upload (incl. Q6_K repack to the
+   padded ROW_WORDS stride and the gemm/gemv weight views), the 60-layer stack wired as
+   decode/prefill command graphs, embedding lookup decision, and the parity harness against
+   transformers `gemma4` that pins the open verify-items (RoPE proportional formula +
+   `rope_freqs.weight`, RMSNorm `w` vs `1+w`, attention scale, attn softcap,
+   `layer_output_scale`, GQA head-mapping convention).
+2. **Full-pipeline e2e profile** (agreed with Ada 2026-06-12) once M3 runs: it decides all
+   further kernel optimization priorities. Known candidates it will rank: coopmat GEMM at ~12
+   of 17.7 TFLOPS target (structural levers exhausted, see dead-ends — needs RGP evidence;
+   prefill ~190 tok/s vs ≥300 target), prefill-global attention (34 ms/chunk at 8K, O(ctx²) —
+   coopmat flash-attention rewrite), LM head at 83 % of bandwidth ceiling.
 3. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)

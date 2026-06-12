@@ -11,8 +11,8 @@
 mod reference;
 
 use reference::{Rng, assert_close, attention_head, from_f16_bits, through_f16, to_f16_bits};
-use sg_gpu::GpuContext;
-use vulkano::buffer::{BufferContents, BufferUsage};
+use sg_gpu::{GpuContext, StepState};
+use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::WriteDescriptorSet;
 
 const N_Q_HEADS: usize = 32;
@@ -43,17 +43,16 @@ fn ctx() -> Option<GpuContext> {
 
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
-struct PushLenScale {
-    len: u32,
+struct PushSplitScale {
+    n_splits: u32,
     scale: f32,
 }
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct PushSplit {
-    kv_len: u32,
-    n_splits: u32,
-    scale: f32,
+/// Step buffer holding the per-step dynamic state (kv lengths / q0).
+fn step_buf(ctx: &GpuContext, state: StepState) -> Subbuffer<[u32]> {
+    let buf = ctx.new_step_buffer().unwrap();
+    state.write_to(&buf).unwrap();
+    buf
 }
 
 #[test]
@@ -97,9 +96,18 @@ fn attn_decode_sliding_matches_reference() {
                 WriteDescriptorSet::buffer(1, k_buf),
                 WriteDescriptorSet::buffer(2, v_buf),
                 WriteDescriptorSet::buffer(3, part_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    4,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            kv_len_sliding: kv_len as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
             ],
-            Some(PushSplit {
-                kv_len: kv_len as u32,
+            Some(PushSplitScale {
                 n_splits,
                 scale: SL_SCALE,
             }),
@@ -178,9 +186,18 @@ fn attn_decode_global_matches_reference() {
                 WriteDescriptorSet::buffer(0, q_buf),
                 WriteDescriptorSet::buffer(1, kv_buf),
                 WriteDescriptorSet::buffer(2, part_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    3,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            kv_len_global: kv_len as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
             ],
-            Some(PushSplit {
-                kv_len: kv_len as u32,
+            Some(PushSplitScale {
                 n_splits,
                 scale: GL_SCALE,
             }),
@@ -261,11 +278,18 @@ fn attn_prefill_sliding_matches_reference() {
                 WriteDescriptorSet::buffer(1, k_buf),
                 WriteDescriptorSet::buffer(2, v_buf),
                 WriteDescriptorSet::buffer(3, out_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    4,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            q0: q0 as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
             ],
-            Some(PushLenScale {
-                len: q0 as u32,
-                scale: SL_SCALE,
-            }),
+            Some(SL_SCALE),
             [SL_KV_HEADS as u32, m as u32, 1],
         )
         .unwrap();
@@ -330,11 +354,18 @@ fn attn_prefill_global_matches_reference() {
                 WriteDescriptorSet::buffer(0, q_buf),
                 WriteDescriptorSet::buffer(1, kv_buf),
                 WriteDescriptorSet::buffer(2, out_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    3,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            q0: q0 as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
             ],
-            Some(PushLenScale {
-                len: q0 as u32,
-                scale: GL_SCALE,
-            }),
+            Some(GL_SCALE),
             [GL_KV_HEADS as u32, m as u32, 1],
         )
         .unwrap();
@@ -407,9 +438,18 @@ fn attn_is_bit_deterministic() {
                 WriteDescriptorSet::buffer(0, q_buf),
                 WriteDescriptorSet::buffer(1, kv_buf),
                 WriteDescriptorSet::buffer(2, part_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    3,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            kv_len_global: kv_len as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
             ],
-            Some(PushSplit {
-                kv_len: kv_len as u32,
+            Some(PushSplitScale {
                 n_splits,
                 scale: GL_SCALE,
             }),
@@ -446,11 +486,9 @@ fn attn_is_bit_deterministic() {
                 WriteDescriptorSet::buffer(1, pk_buf),
                 WriteDescriptorSet::buffer(2, pv_buf),
                 WriteDescriptorSet::buffer(3, pout_buf.clone()),
+                WriteDescriptorSet::buffer(4, step_buf(&ctx, StepState::default())),
             ],
-            Some(PushLenScale {
-                len: 0,
-                scale: SL_SCALE,
-            }),
+            Some(SL_SCALE),
             [SL_KV_HEADS as u32, m as u32, 1],
         )
         .unwrap();

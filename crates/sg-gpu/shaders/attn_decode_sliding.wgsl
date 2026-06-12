@@ -30,9 +30,12 @@ enable f16;
 @group(0) @binding(1) var<storage, read> k_ring: array<f16>; // [slot × N_KV_HEADS × HEAD_DIM]
 @group(0) @binding(2) var<storage, read> v_ring: array<f16>; // same layout
 @group(0) @binding(3) var<storage, read_write> part: array<f32>;
+// Per-step dynamic state, rewritten by the CPU between submits of the
+// pre-recorded graph (sg_gpu::StepState): [pos, kv_len_sliding,
+// kv_len_global, q0].
+@group(0) @binding(4) var<storage, read> step: array<u32>;
 
 struct Push {
-    kv_len: u32,
     n_splits: u32,
     scale: f32,
 }
@@ -55,9 +58,10 @@ fn main(
     let split = wg_id.y;
     let d0 = lid * D;
 
-    let chunk = (push.kv_len + push.n_splits - 1u) / push.n_splits;
-    let t_begin = min(split * chunk, push.kv_len);
-    let t_end = min(t_begin + chunk, push.kv_len);
+    let kv_len = step[1];
+    let chunk = (kv_len + push.n_splits - 1u) / push.n_splits;
+    let t_begin = min(split * chunk, kv_len);
+    let t_end = min(t_begin + chunk, kv_len);
 
     // This lane's slice of the Q_PER_KV query heads.
     var qr: array<array<f32, D>, Q_PER_KV>;
