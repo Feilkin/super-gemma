@@ -517,6 +517,41 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // 4×4 tiling — the f16 gemm's tiling, for an apples-to-apples compare. 16
+    // accumulators is the most ILP to hide the coopmat-rescale chain, but yacc
+    // (f32) + acc (i32) both live = high VGPR; watch for spill (shaderstats).
+    Variant {
+        name: "gemm_q4_0_i8_t44_k512_n256",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 256),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 4),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_t44_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 4),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // Diagnostic: int8 MMA throughput ceiling (no rescale). 3 bindings.
     Variant {
         name: "gemm_q4_0_i8_raw_k5376_n21504",

@@ -148,6 +148,8 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
         // Occupancy-sweep tilings (validate the 2×2 / 1×2 index paths).
         ("gemm_q4_0_i8_t22_k512_n128", 32, 512, 128, 32, 32),
         ("gemm_q4_0_i8_t12_k512_n128", 16, 512, 128, 16, 32),
+        // 4×4 tiling (f16-equivalent), validates the 64×64 tile index path.
+        ("gemm_q4_0_i8_t44_k512_n256", 64, 512, 256, 64, 64),
     ];
 
     for (variant, m, k, n, m_rows, n_cols) in cases {

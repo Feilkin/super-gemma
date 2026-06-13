@@ -94,11 +94,12 @@ fn bench(c: &mut Criterion) {
         WriteDescriptorSet::buffer(1, x_i8.clone()),
         WriteDescriptorSet::buffer(2, y.clone()),
     ];
-    let cases: [(&str, Vec<WriteDescriptorSet>, u32, u32); 5] = [
+    let cases: [(&str, Vec<WriteDescriptorSet>, u32, u32); 6] = [
         ("gemm_q4_0_k5376_n21504", f16_writes, 64, 64), // f16, 4×4 tiles
         ("gemm_q4_0_i8_k5376_n21504", i8_writes.clone(), 64, 32), // int8 MMQ, 2×4 tiles
         ("gemm_q4_0_i8_t22_k5376_n21504", i8_writes.clone(), 32, 32), // 2×2 tiles
-        ("gemm_q4_0_i8_t12_k5376_n21504", i8_writes, 32, 16), // 1×2 tiles
+        ("gemm_q4_0_i8_t12_k5376_n21504", i8_writes.clone(), 32, 16), // 1×2 tiles
+        ("gemm_q4_0_i8_t44_k5376_n21504", i8_writes, 64, 64), // 4×4 tiles (f16-equivalent)
         ("gemm_q4_0_i8_raw_k5376_n21504", raw_writes, 64, 32), // int8 MMA ceiling, no rescale
     ];
 

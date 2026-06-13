@@ -366,19 +366,40 @@ bench/kernel (commit e68e502) — a drifty/optimistic original reading, re-basel
 `mmq_tflops` (f16 vs int8 tilings, same shape). Pinned-clock methodology is the prerequisite for
 every comparison — every perf number below is at perf=high unless noted.
 
-**Rank #2 — int8-MMQ GEMM: working, understood, clear path to beating f16 (NOT a dead end).**
-The naga i8 fork landed (`coop_i8_smoke` proves signed `i8×i8→i32` on the box, bit-exact;
-`docs/naga-int8-coopmat-patch.md`). The kernel `gemm_q4_0_i8.wgsl` is parity-green (nrmse ~2e-4 vs
-the `mmq_q4_0_q8` oracle across 1×1/2×4/2×2/1×2 tilings; bench: parity_mmq) and runs **4.4 TFLOPS
-(bench: mmq_tflops, perf=high) ≈ 0.46× f16.** The bottleneck is the **per-32-block rescale**
-(coopStore the i32 dot + 2 barriers/block), NOT occupancy — a tiling sweep proved it: raising
-occupancy 4→8→12 waves/SIMD (2×4→2×2→1×2 tiles) made it *slower*, 4.4→3.8→1.0 TFLOPS
-(bench: mmq_tflops + RADV shaderstats), because smaller tiles amortize the fixed per-block barrier
-cost worse. The fix is an **in-register rescale** (convert the i32 dot to f32, apply the scale with
-component-wise coopmat ops, keep Y in registers → no per-block coopStore, no per-block barriers).
-SPV_KHR_cooperative_matrix + the hardware support the needed ops (`OpConvertSToF`, component-wise
-`OpFMul`); naga doesn't expose them yet → **`docs/naga-coopmat-arith-patch.md`** (handed to a
-separate session). int8 WMMA peak is ~2× f16 on gfx11, so the upside is real once the barriers go.
+**Rank #2 — int8-MMQ GEMM: in-register rescale landed, 0.27× → 0.83× f16 via ISA-guided tuning
+(2026-06-14).** `gemm_q4_0_i8.wgsl` now does the per-block rescale **in registers** (the coopmat-arith
+fork — `f32(coop<i32>)` `OpConvertSToF` + component-wise `OpFMul` + `OpFAdd`; `docs/naga-coopmat-arith-patch.md`):
+the f32 output `yacc` is register-resident, the scale is built in LDS and applied with coopmat ops.
+Parity-green (nrmse ~2e-4 vs the `mmq_q4_0_q8` oracle across 1×1/2×4/2×2/1×2/**4×4** tilings;
+bench: parity_mmq). **Best: 7.85 TFLOPS at 2×4 (bench: mmq_tflops, perf=high) ≈ 0.83× f16**, up from
+the old scalar-rescale kernel's 4.5 and the naive in-register 2.52. The path, each step from RADV
+`asm`/`shaderstats`, not guesses:
+
+- **2.52 → 4.80**: the naive scale build re-read `d_a`/`d_w` from global per output element — ~64
+  redundant f16 loads + ~340 address-arith ops per thread per block (tiling-invariant, which is why
+  it sat ~2.5 at every tile size). Fix: load the `M_ROWS` + `N_COLS` scale *vectors* once, form the
+  outer product from LDS.
+- **4.80 → 7.22**: the β-loop was rolled; ACO did not overlap consecutive (independent) blocks' WMMAs,
+  so each block's substep0→substep1 dependency stalled the matrix unit. Fix: **unroll the β-loop ×2**,
+  interleaving two blocks' MMAs. (RDNA3 hides WMMA latency via *within-wave* ILP, not wave-switching —
+  more occupancy did NOT help, unrolling did.)
+- **7.22 → 7.85**: the LDS outer-product fill was serialized (`load da_l[m]` → `lgkmcnt(0)` → mul →
+  store, per element). Fix: ×4-unroll the fill so independent `da_l` loads pipeline.
+
+**The `_raw` "MMA ceiling" was bogus** — it's WMMA-latency-exposed (rolled loop, no concurrent work
+to fill the depth-2 bubble), so it read ~1.1 TFLOPS; unrolling *it* ×2 → 3.3. The true int8 MMA
+throughput is ≥7.85. The lesson: a kernel doing *more* work is faster when that work (scale build on
+VALU/LDS, + unrolled WMMAs) keeps the matrix unit fed; bare back-to-back WMMAs can't feed it alone.
+
+Remaining gap to f16: the scale must round-trip LDS (`da_l/dw_l` → `stage` → `coopLoad`) because KHR
+coopmat1 has **no fragment-element access** — can't scale the accumulator in registers. That LDS
+round-trip is now the binder (profiled). 4×4 is LDS-occupancy-bound by its 32 KB double-buffered
+`stage` (~2.96, kept in the bench as the documented slower point). **int8 must BEAT f16 to justify
+its activation-Q8 accuracy risk (gate on the perplexity harness) — at 0.83× it does not yet**, so the
+f16 path stays in production; closing the last ~17 % needs a scale application that avoids the LDS
+round-trip (speculative on coopmat1). Fork quirk found: coopmat `+` emits `OpFAdd` regardless of
+scalar kind, so *integer* coopmat accumulation is silently a float add (harmless here — `_raw` discards
+output, the kernel only adds f32 `yacc` — but a latent fork bug to guard).
 
 **Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
 both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +
@@ -414,10 +435,10 @@ the divergence path matches a cold run bitwise.
    `out = sc * f32(di)` bit-exact, SPIR-V shows `OpConvertSToF`/`OpFMul` on C-use coopmats
    (confirms `coopLoad` into C-use works); all coopmat parity green on the new rev.
    `docs/naga-coopmat-arith-patch.md`.
-2. **int8-MMQ in-register rescale + re-bench** (now unblocked): rewrite `gemm_q4_0_i8.wgsl` to
-   convert the i32 dot in-register, apply the scale with component-wise mul, accumulate Y in
-   registers (scale via a 1 KB LDS buffer) — removing the per-block coopStore + barriers. Re-run
-   `parity_mmq` and `mmq_tflops` (perf=high) vs the 4.4 (int8) / ~9.5 (f16) TFLOPS baseline; gate
+2. **int8-MMQ in-register rescale — DONE (2026-06-14), now 7.85 TFLOPS / 0.83× f16** (see Rank #2
+   above). Still below f16, so the f16 prefill path stays. Open: close the last ~17 % (the scale's
+   LDS round-trip, forced by coopmat1's lack of fragment access — needs a register-only scale
+   application, speculative); if/when int8 beats f16, wire it into the prefill graph and gate
    activation-Q8 accuracy on the perplexity harness behind a build flag.
 3. **Operational:** pin `power_dpm_force_performance_level=high` on the box (the ~30 % fabric-clock
    finding) and set `amdgpu.lockup_timeout=10000` (the watchdog finding).
