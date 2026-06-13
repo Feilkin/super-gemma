@@ -25,6 +25,13 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
 
+# int8 cooperative-matrix support added to a naga 29.0.3 fork (i8/u8 scalars,
+# integer coopmat validation + signed MulAdd operands). See
+# docs/naga-int8-coopmat-patch.md. naga_oil 0.22 inherits this transitively;
+# the int8 GEMM kernel itself compiles via the raw-naga path.
+[patch.crates-io]
+naga = { git = "https://github.com/Feilkin/wgpu", rev = "8366d92e145e7ddec337bc2cc94dad6c0809896c" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

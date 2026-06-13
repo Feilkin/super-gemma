@@ -32,6 +32,14 @@ name = "gemm_tflops"
 harness = false
 
 [[bench]]
+name = "mmq_tflops"
+harness = false
+
+[[bench]]
+name = "gemm_variance"
+harness = false
+
+[[bench]]
 name = "attn_us"
 harness = false
 

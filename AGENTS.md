@@ -1,10 +1,28 @@
 # AGENTS.md — working on super-gemma
 
-Bespoke single-purpose inference server: **Gemma 4 31B QAT Q4_0 (GGUF)** on one specific machine
-(Framework Desktop, AMD Ryzen AI Max+ 395, 128 GB unified RAM, Radeon 8060S iGPU, NVMe, **Linux**).
-Anthropic-style `/v1/messages` API for AI coding agents. Not a general framework: no training, no
-batching, no portability work. The only second model in scope is the official 0.5B MTP drafter
-(`gemma-4-31B-it-assistant`) for speculative decoding — see `docs/plans/07-mtp-speculative-decoding.md`.
+**The goal: the FASTEST Gemma 4 31B QAT Q4_0 (GGUF) inference server for the Framework Desktop
+mainboard.** Not just *a* server — the fastest one. The strict one-model/one-machine focus
+(Framework Desktop, AMD Ryzen AI Max+ 395, 128 GB unified RAM, Radeon 8060S iGPU, NVMe, **Linux**)
+is the whole point: it *licenses and demands* hardware-specific optimization. Speed is a primary
+goal, not a finishing polish — kernel optimization, cache2, and tokio_uring all carry equal weight.
+Exposes an Anthropic-style `/v1/messages` API for AI coding agents. Not a general framework: no
+training, no batching, no portability work. The only second model in scope is the official 0.5B MTP
+drafter (`gemma-4-31B-it-assistant`) for speculative decoding — see
+`docs/plans/07-mtp-speculative-decoding.md`.
+
+**What "bespoke" means (operating principle):** hand-tailored for *this* model on *this* hardware.
+We do **not** follow llama.cpp/transformers patterns — no hardware compatibility, no wide model
+support to preserve. If a standard technique (e.g. flash attention) is slow on this hardware, we're
+free to drop it or, better, redesign it *for* this hardware. Innovating and thinking outside the box
+is expected — the quality/parity tests (plan 06) exist precisely so we can. The toolchain is not a
+hard limit either: prefer naga (and upstream our changes), but extending the naga fork — or even
+hand-writing SPIR-V — is on the table when it yields the best performance.
+
+**When to optimize (why now is correct):** correctness + quality gates come first (M0–M5, done),
+but with the full e2e pipeline proven, optimizing the inference kernels *before* layering on
+cache2/server is deliberate — it's the cleanest point to measure (no extra overhead), and the
+reproducible benchmarks built here make optimizing the later layers tractable. Building those
+benchmarks and pinning the operating point (see the perf-level gotcha) is part of the work.
 
 **Read `docs/STATUS.md` first** — current milestone state, immediate next steps, decisions already
 made, and known gotchas. **The plans under `docs/plans/` are the source of truth** for architecture
@@ -63,6 +81,17 @@ cargo clippy --workspace --all-targets -- -D warnings    # lint (CI enforces)
 
 ## Conventions
 
+- **Every performance number must cite its source, inline, wherever it appears** (docs, code
+  comments, commit messages, STATUS). Measured results name the benchmark and the operating point,
+  e.g. `9.1 TFLOPS (bench: gemm_variance, perf=high)` or `4.4 TFLOPS (bench: mmq_tflops, perf=high)`;
+  non-measured numbers are labelled `(target)`, `(probe)` (measured HW ceiling), or `(peak)`
+  (theoretical). A bare number with no source is a documentation bug — an uncited "12 TFLOPS" once
+  cost a full session of chasing a number that wasn't reproducible.
+- **Keep numbers and benchmarks in sync.** When a benchmark's result changes, update every number
+  derived from it (grep the repo for the old value). Before committing a change that affects
+  performance or benchmark results, **re-run the relevant benchmark(s) and update the numbers (and
+  citations) in the same commit** — at the pinned operating point (`perf=high`; see the perf-level
+  gotcha, `auto` idles the fabric clock and reads ~30% low).
 - Correctness ladder (plan 06) gates milestones: don't build on a rung whose tests aren't green.
 - The four cache/determinism invariants in plan 06 are tested guarantees — code that would break
   bit-exact cache resume needs a plan change, not a tolerance bump.

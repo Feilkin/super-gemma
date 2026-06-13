@@ -1,8 +1,12 @@
 # STATUS — read this first
 
-Last updated: **2026-06-12**, working on the Framework Desktop target box. The conversation
-history that produced this repo is gone; everything needed to continue is in this file,
-`AGENTS.md`, and `docs/plans/`.
+Last updated: **2026-06-13** (kernel-optimization + benchmark-baselining session), working on the
+Framework Desktop target box. The conversation history that produced this repo is gone; everything
+needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
+
+**Perf-number rule (AGENTS.md):** every performance number here cites its benchmark + operating
+point, e.g. `(bench: gemm_variance, perf=high)`. Numbers are at `perf=high` unless noted; `auto`
+reads ~30 % low. When a benchmark changes, update the numbers (grep for the old value).
 
 ## Where the project stands
 
@@ -159,8 +163,12 @@ Done, all parity-tested against f64 CPU references and bit-deterministic:
   view with `q0` history keys, query i at key index q0+i. Split-K partials
   `[q_head × split × (head_dim + 2)]` f32 (acc, m, l); n_splits must be a deterministic
   function of kv_len for bit-exact reruns.
-- **gemm_q4_0 (coopmat): 11.5–12.5 TFLOPS (≈20 % of peak; run-to-run clock drift); gemm_st
-  fallback: 3.3 TFLOPS.** Target ≥30 % of peak (17.7) not yet met → see below. Was 0.4 before
+- **gemm_q4_0 (coopmat): ~9.5 TFLOPS (bench: gemm_variance / gemm_tflops, perf=high; ~16 % of the
+  ~59 TFLOPS peak); gemm_st fallback: ~3.3 TFLOPS (bench: gemm_tflops, perf=high).** Target ≥30 %
+  of peak (17.7 TFLOPS) (target) not yet met → see below. (Re-baselined 2026-06-13: the original
+  "11.5–12.5 TFLOPS" here was **not reproducible** even at pinned-high clocks on the same
+  byte-identical bench/kernel — likely a drifty/optimistic reading; see the operating-point finding
+  in the 2026-06-13 section. `auto` perf level reads ~7.2 — pin `high`.) Was 0.4 before
   fixing three poisons: per-byte serialized global loads in dequant (now 9-word block-pair
   loads like gemv), naga's injected per-iteration loop bounding (`force_loop_bounding: false`),
   and single-lane LDS zero-init (`zero_initialize_workgroup_memory: None` — kernels never read
@@ -311,9 +319,11 @@ Consequences, both landed:
   cmdline) as a backstop — a 2 s budget is tight for an inference workstation, and the
   flash-attention rewrite only lowers, never removes, long-context submission times.
 
-Measured (median of 5, this box):
+Measured (median of 5, this box; bench: `sg-bench profile`). **NOTE: taken at `perf=auto`, which
+idles the fabric clock and reads ~30 % low (2026-06-13 finding) — re-profile at `perf=high` for
+true numbers.** Targets are from plan 06.
 
-| Phase | Result | Target (plan 06) |
+| Phase | Result (perf=auto) | Target (plan 06) |
 |---|---|---|
 | decode @ 1K / 8K / 32K | **11.7 / 11.4 / 10.3 tok/s** | ≥ 10 / 10 / 9.5 ✓ |
 | prefill 256-chunk @ q0 0 / 8K / 32K | **179 / 128 / 83 tok/s** | ≥ 300 ✗ |
@@ -325,8 +335,10 @@ Optimization ranking (per-layer medians from the rep-layer breakdown):
    chunk at 32K and growing linearly per chunk (quadratic per prompt). The coopmat
    flash-attention rewrite is both the prefill-throughput fix at context and the
    watchdog-pressure fix. Clear #1.
-2. **Coopmat GEMM** (~12 TFLOPS): the FFN pair (`n21504` + `n5376`) is ~17–21 ms of every
-   ~28 ms layer — ~70 % of short-context prefill; 179 vs ≥300 tok/s is mostly this.
+2. **Coopmat GEMM** (~9.5 TFLOPS, bench: gemm_variance/gemm_tflops, perf=high — this profile's
+   per-layer ms were taken at perf=auto, so they read low; re-profile at high): the FFN pair
+   (`n21504` + `n5376`) is ~70 % of short-context prefill; 179 vs ≥300 tok/s (target) is mostly
+   this.
    Structural levers exhausted (M2 dead-ends); the **int8 coopmat path
    (SINT8×SINT8→SINT32, probed available) is the MMQ-style candidate** — likely faster
    AND more accurate than f16×f16 (llama.cpp's quantization bias measured in the ppl
@@ -338,6 +350,49 @@ Optimization ranking (per-layer medians from the rep-layer breakdown):
    MTP (M7.5) multiplies decode value.
 4. CPU side is a non-issue (stage_chunk 3.6 ms per 256 tokens, single-threaded dequant —
    rayon it if it ever shows).
+
+## Prefill-optimization investigation (2026-06-13) — operating point fixed, int8 path identified
+
+**Operating point (the foundational finding).** Under `power_dpm_force_performance_level=auto` the
+GPU boosts sclk (2900 MHz) and mclk (1000 MHz) but **idles the fabric/SoC clocks (fclk/socclk)** —
+costing ~30 % on compute kernels. Pinning `=high` pins every clock domain and took f16 gemm from
+**7.2 → ~9.5 TFLOPS, +32 % (bench: gemm_variance / gemm_tflops, perf=high vs auto).** This also
+killed the phantom "12 TFLOPS" baseline: not reproducible even pinned on the byte-identical
+bench/kernel (commit e68e502) — a drifty/optimistic original reading, re-baselined to ~9.5.
+**Pin `high` for all benchmarking AND production** (perf-level gotcha, Known gotchas below).
+
+**Reproducible benchmarks built (the reason to optimize now, before cache2/server overhead):**
+`gemm_variance` (steady-state f16 gemm after a clock warm-up; 0.2 % CV at perf=high — trustworthy),
+`mmq_tflops` (f16 vs int8 tilings, same shape). Pinned-clock methodology is the prerequisite for
+every comparison — every perf number below is at perf=high unless noted.
+
+**Rank #2 — int8-MMQ GEMM: working, understood, clear path to beating f16 (NOT a dead end).**
+The naga i8 fork landed (`coop_i8_smoke` proves signed `i8×i8→i32` on the box, bit-exact;
+`docs/naga-int8-coopmat-patch.md`). The kernel `gemm_q4_0_i8.wgsl` is parity-green (nrmse ~2e-4 vs
+the `mmq_q4_0_q8` oracle across 1×1/2×4/2×2/1×2 tilings; bench: parity_mmq) and runs **4.4 TFLOPS
+(bench: mmq_tflops, perf=high) ≈ 0.46× f16.** The bottleneck is the **per-32-block rescale**
+(coopStore the i32 dot + 2 barriers/block), NOT occupancy — a tiling sweep proved it: raising
+occupancy 4→8→12 waves/SIMD (2×4→2×2→1×2 tiles) made it *slower*, 4.4→3.8→1.0 TFLOPS
+(bench: mmq_tflops + RADV shaderstats), because smaller tiles amortize the fixed per-block barrier
+cost worse. The fix is an **in-register rescale** (convert the i32 dot to f32, apply the scale with
+component-wise coopmat ops, keep Y in registers → no per-block coopStore, no per-block barriers).
+SPV_KHR_cooperative_matrix + the hardware support the needed ops (`OpConvertSToF`, component-wise
+`OpFMul`); naga doesn't expose them yet → **`docs/naga-coopmat-arith-patch.md`** (handed to a
+separate session). int8 WMMA peak is ~2× f16 on gfx11, so the upside is real once the barriers go.
+
+**Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
+both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +
+barrier-bound rescale); (b) register-O two-pass: ~1.2× slower (0.66 / 42.6 / 168 ms-per-layer vs
+naive 0.42 / 35.6 / 141 @ q0 0/8K/32K; bench: `sg-bench profile` — measured at perf=auto, re-measure
+at high). Same root cause as int8's barrier problem: KHR coopmat1 (the box has this, not
+NV_coopmat2) has no per-element fragment access. `attn_prefill_global_flash.wgsl` + its parity case
+stay in-tree (unwired). **Revisit once the coopmat-arith ops land** — the same convert /
+component-wise ops may enable a better in-register flash rescale; the naive kernel stays in use
+meanwhile.
+
+**Decode** is near the bandwidth ceiling (gemv ~91 %, bench: gemv_bw); its lever is MTP (M7.5), not
+these kernels. `cache2` (M6) is the orthogonal win for the append-only workload (prefix reuse
+avoids cold long-context prefill).
 
 ## M5 (2026-06-12) — in-memory incremental sessions, gate green
 
@@ -353,12 +408,25 @@ the divergence path matches a cold run bitwise.
 
 ## Immediate next steps (in order)
 
-1. **Coopmat flash-attention rewrite of `attn_prefill_global`** (profile rank #1), then
-   re-profile; consider the int8-MMQ GEMM (rank #2) behind a quality gate.
-2. **M6: cache2** (NVMe radix trie, paging, tail snapshots, eviction) — the in-memory
-   session substrate (M5) is proven; plan 04.
-3. Ask Ada to set `amdgpu.lockup_timeout=10000` on the box (see the watchdog finding).
-4. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
+1. ~~**naga coopmat-arith patch**~~ **DONE (2026-06-13):** the `Feilkin/wgpu` fork rev
+   `8366d92e` adds component-wise `OpFMul` + `f32(coopmat<i32>)` conversion (`OpConvertSToF`);
+   `Cargo.toml` `[patch]` bumped. Verified on the box: `coop_arith_smoke` (kernel + test) does
+   `out = sc * f32(di)` bit-exact, SPIR-V shows `OpConvertSToF`/`OpFMul` on C-use coopmats
+   (confirms `coopLoad` into C-use works); all coopmat parity green on the new rev.
+   `docs/naga-coopmat-arith-patch.md`.
+2. **int8-MMQ in-register rescale + re-bench** (now unblocked): rewrite `gemm_q4_0_i8.wgsl` to
+   convert the i32 dot in-register, apply the scale with component-wise mul, accumulate Y in
+   registers (scale via a 1 KB LDS buffer) — removing the per-block coopStore + barriers. Re-run
+   `parity_mmq` and `mmq_tflops` (perf=high) vs the 4.4 (int8) / ~9.5 (f16) TFLOPS baseline; gate
+   activation-Q8 accuracy on the perplexity harness behind a build flag.
+3. **Operational:** pin `power_dpm_force_performance_level=high` on the box (the ~30 % fabric-clock
+   finding) and set `amdgpu.lockup_timeout=10000` (the watchdog finding).
+4. **Revisit rank #1 flash attention** with the new coopmat-arith ops (in-register rescale may now
+   beat the naive kernel) and/or re-measure the parked variants at perf=high.
+5. **M6: cache2** (NVMe radix trie, paging, tail snapshots, eviction) — the append-only-workload
+   win; M5 substrate proven; plan 04. (Optimizing the inference kernels first is deliberate — see
+   the top of this file and AGENTS.md.)
+6. Optionally set up the self-hosted runner and enable Tier 2 triggers in `target-box.yml`.
 
 ## Open questions / verify-items (do not guess these)
 
@@ -386,6 +454,12 @@ the divergence path matches a cold run bitwise.
 
 ## Known gotchas
 
+- **GPU perf level: pin `high` before measuring anything (and in production).** Under
+  `power_dpm_force_performance_level=auto` the box boosts sclk/mclk but idles the fabric/SoC
+  clocks (fclk/socclk) — ~30 % low on compute (f16 gemm 7.2 vs ~9.5 TFLOPS; bench: gemm_variance).
+  `rocm-smi`/`pp_dpm_*` only report fclk/socclk once `high` is forced. Needs root:
+  `echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level`. This
+  invalidated the old "12 TFLOPS" gemm number — re-baseline at `high`.
 - The crates.io sparse index occasionally served stale entries during `cargo add`
   (spurious "failed to select a version"); a retry / `cargo update` fixes it.
 - vulkano 0.35 does not wrap the coopmat properties query — `sg-probe/src/vulkan.rs` calls it raw

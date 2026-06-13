@@ -216,6 +216,47 @@ pub fn dequant_q8_0(scales: &[u16], quants: &[u8]) -> Vec<f32> {
     out
 }
 
+/// int8-MMQ reference — the EXACT arithmetic the int8 coopmat GEMM performs,
+/// f64 accumulation. `Y[M×N] = X[M×K] · W[N×K]ᵀ` where X is quantized per
+/// 32-element block to Q8_0 (`quant_q8_0`) and W is Q4_0 (row-major `[N×K]`
+/// bytes). Per block β the dot is `d_a·d_w·Σ(aq·wq)` with `wq = nibble − 8`
+/// and `aq` the Q8_0 i8 quant — an EXACT i32 inner product, scaled to f32.
+///
+/// Weight logical position `k = 32β + j` pairs with activation `X[m][k]`:
+/// within a Q4_0 block, `j < 16` is the low nibble of `qs[j]`, `j ≥ 16` the
+/// high nibble of `qs[j−16]` (the `BlockQ4_0::dequantize` layout). The kernel
+/// must extract its i8 operands in this same logical order.
+pub fn mmq_q4_0_q8(weights: &[u8], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    use sg_gguf::q4_0::{BLOCK_Q4_0_SIZE, blocks_from_bytes};
+    assert!(k.is_multiple_of(32), "K must be a multiple of 32");
+    let nb = k / 32;
+    let row_bytes = nb * BLOCK_Q4_0_SIZE;
+    let mut out = vec![0f32; m * n];
+    for mi in 0..m {
+        let (a_scales, a_quants) = quant_q8_0(&x[mi * k..][..k]);
+        for ni in 0..n {
+            let wblocks = blocks_from_bytes(&weights[ni * row_bytes..][..row_bytes]).unwrap();
+            let mut acc = 0f64;
+            for (b, wblk) in wblocks.iter().enumerate() {
+                let da = half::f16::from_bits(a_scales[b]).to_f32() as f64;
+                let dw = wblk.d.to_f32() as f64;
+                let mut dot = 0i32;
+                for j in 0..32usize {
+                    let wq = if j < 16 {
+                        (wblk.qs[j] & 0x0F) as i32 - 8
+                    } else {
+                        (wblk.qs[j - 16] >> 4) as i32 - 8
+                    };
+                    dot += (a_quants[b * 32 + j] as i8 as i32) * wq;
+                }
+                acc += da * dw * dot as f64;
+            }
+            out[mi * n + ni] = acc as f32;
+        }
+    }
+    out
+}
+
 /// gelu_pytorch_tanh(gate) * up.
 pub fn geglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     gate.iter()

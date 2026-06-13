@@ -1,0 +1,208 @@
+//! int8-MMQ GEMM parity (profile rank #2; docs/naga-int8-coopmat-patch.md).
+//!
+//! Two checks:
+//!  - `mmq_reference_tracks_full_precision`: the `mmq_q4_0_q8` oracle vs the
+//!    dequantized matmul. Q4_0 weights are exactly `d·(q−8)`, so the ONLY
+//!    error is the Q8_0 activation quant → MMQ must track truth within the
+//!    int8 envelope (≈ 1 %). Pins the oracle. No GPU.
+//!  - `gemm_q4_0_i8_matches_mmq_reference`: the `gemm_q4_0_i8` coopmat kernel
+//!    vs that oracle (same Q8_0 quant of the SAME activations → the only
+//!    divergence is f32 accumulation order + the f16 output). Needs the GPU
+//!    and the int8-coopmat naga fork.
+
+mod reference;
+
+use reference::{Rng, assert_close, from_f16_bits, mmq_q4_0_q8, quant_q8_0, through_f16};
+use sg_gguf::q4_0::{BLOCK_Q4_0_SIZE, QK4_0, blocks_from_bytes};
+use sg_gpu::GpuContext;
+use vulkano::buffer::BufferUsage;
+use vulkano::descriptor_set::WriteDescriptorSet;
+
+/// Extract Q4_0 weight bytes to signed-int8 quants `[N×K]` (logical order:
+/// low nibble of `qs[j]` for `j<16`, high nibble of `qs[j−16]` for `j≥16`,
+/// each minus 8) plus per-block scales `[N×(K/32)]` as f16 bits — the layout
+/// the kernel's `coopLoad` and `mmq_q4_0_q8` both assume.
+fn extract_q4_0_i8(weights: &[u8], n: usize, k: usize) -> (Vec<i8>, Vec<u16>) {
+    let nb = k / QK4_0;
+    let row_bytes = nb * BLOCK_Q4_0_SIZE;
+    let mut q = vec![0i8; n * k];
+    let mut scales = vec![0u16; n * nb];
+    for ni in 0..n {
+        let blocks = blocks_from_bytes(&weights[ni * row_bytes..][..row_bytes]).unwrap();
+        for (b, blk) in blocks.iter().enumerate() {
+            scales[ni * nb + b] = blk.d.to_bits();
+            for j in 0..QK4_0 {
+                let v = if j < 16 {
+                    (blk.qs[j] & 0x0F) as i32 - 8
+                } else {
+                    (blk.qs[j - 16] >> 4) as i32 - 8
+                };
+                q[ni * k + b * QK4_0 + j] = v as i8;
+            }
+        }
+    }
+    (q, scales)
+}
+
+/// Q4_0 weight bytes, `n_blocks` blocks (matches parity_gemm's generator:
+/// small f16 scale, random nibbles).
+fn random_q4_0(rng: &mut Rng, n_blocks: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n_blocks * BLOCK_Q4_0_SIZE);
+    for _ in 0..n_blocks {
+        let d = half::f16::from_f32(rng.f32() * 0.05);
+        out.extend_from_slice(&d.to_bits().to_le_bytes());
+        for _ in 0..16 {
+            out.push((rng.next_u64() & 0xFF) as u8);
+        }
+    }
+    out
+}
+
+/// Full-precision truth: W dequantized to f32 (`d·(q−8)`, exact), f32
+/// activations, f64 accumulation. `Y = X · Wᵀ`.
+fn true_matmul(weights: &[u8], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let row_bytes = k / QK4_0 * BLOCK_Q4_0_SIZE;
+    let mut out = vec![0f32; m * n];
+    let mut tmp = [0.0f32; QK4_0];
+    for ni in 0..n {
+        let blocks = blocks_from_bytes(&weights[ni * row_bytes..][..row_bytes]).unwrap();
+        let mut wrow = vec![0.0f32; k];
+        for (b, blk) in blocks.iter().enumerate() {
+            blk.dequantize(&mut tmp);
+            wrow[b * QK4_0..(b + 1) * QK4_0].copy_from_slice(&tmp);
+        }
+        for mi in 0..m {
+            let acc: f64 = (0..k).map(|j| wrow[j] as f64 * x[mi * k + j] as f64).sum();
+            out[mi * n + ni] = acc as f32;
+        }
+    }
+    out
+}
+
+fn nrmse(got: &[f32], want: &[f32]) -> f32 {
+    let mse: f64 = got
+        .iter()
+        .zip(want)
+        .map(|(&g, &w)| ((g - w) as f64).powi(2))
+        .sum::<f64>()
+        / got.len() as f64;
+    let denom: f64 = want.iter().map(|&w| (w as f64).powi(2)).sum::<f64>() / want.len() as f64;
+    (mse.sqrt() / denom.sqrt().max(1e-12)) as f32
+}
+
+#[test]
+fn mmq_reference_tracks_full_precision() {
+    let mut rng = Rng::new(0x319);
+    // Small shape — pure CPU, exercises multiple 32-blocks per row.
+    let (m, k, n) = (16usize, 512usize, 64usize);
+
+    let weights = random_q4_0(&mut rng, n * k / QK4_0);
+    // f16-representable activations (what the kernel sees from the prior layer).
+    let x = through_f16(&rng.f32_vec(m * k));
+
+    let mmq = mmq_q4_0_q8(&weights, &x, m, k, n);
+    let truth = true_matmul(&weights, &x, m, k, n);
+
+    let err = nrmse(&mmq, &truth);
+    let max_abs = mmq
+        .iter()
+        .zip(&truth)
+        .map(|(&g, &w)| (g - w).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("MMQ vs full-precision: nrmse {err:.5}, max abs {max_abs:.5}");
+
+    // int8 activation quant only — should track truth within ~1 %.
+    assert!(err < 0.02, "MMQ nrmse {err} exceeds the int8 envelope");
+}
+
+fn ctx() -> Option<GpuContext> {
+    match GpuContext::new() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("skipping: no usable GPU ({e})");
+            None
+        }
+    }
+}
+
+#[test]
+fn gemm_q4_0_i8_matches_mmq_reference() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.cooperative_matrix {
+        eprintln!("skipping: no VK_KHR_cooperative_matrix");
+        return;
+    }
+    let mut rng = Rng::new(0x4D);
+    // (variant, m, k, n, M_TILES·16, N_TILES·16) — 1×1 and 2×4 tilings, so
+    // both the single-tile path and the tiled rescale/index logic are covered.
+    let cases = [
+        (
+            "gemm_q4_0_i8_k512_n64",
+            16usize,
+            512usize,
+            64usize,
+            16usize,
+            16usize,
+        ),
+        ("gemm_q4_0_i8_k512_n128", 32, 512, 128, 32, 64),
+        // Occupancy-sweep tilings (validate the 2×2 / 1×2 index paths).
+        ("gemm_q4_0_i8_t22_k512_n128", 32, 512, 128, 32, 32),
+        ("gemm_q4_0_i8_t12_k512_n128", 16, 512, 128, 16, 32),
+    ];
+
+    for (variant, m, k, n, m_rows, n_cols) in cases {
+        let kernel = ctx.load_kernel(variant).expect(variant);
+        let nb = k / QK4_0;
+
+        let weights = random_q4_0(&mut rng, n * k / QK4_0);
+        let x = through_f16(&rng.f32_vec(m * k));
+
+        // Oracle: same Q8_0 quant of the same activations.
+        let want = mmq_q4_0_q8(&weights, &x, m, k, n);
+
+        // GPU operands: W → i8 + scales; X → Q8_0 i8 + scales (per row).
+        let (w_i8, w_scales) = extract_q4_0_i8(&weights, n, k);
+        let mut x_i8 = Vec::with_capacity(m * k);
+        let mut x_scales = Vec::with_capacity(m * nb);
+        for mi in 0..m {
+            let (sc, q) = quant_q8_0(&x[mi * k..][..k]);
+            x_scales.extend_from_slice(&sc);
+            x_i8.extend(q.iter().map(|&b| b as i8));
+        }
+
+        let w_buf = ctx
+            .buffer_from_iter(w_i8, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let ws_buf = ctx
+            .buffer_from_iter(w_scales, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let x_buf = ctx
+            .buffer_from_iter(x_i8, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let xs_buf = ctx
+            .buffer_from_iter(x_scales, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let y_buf = ctx
+            .new_buffer::<u16>((m * n) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                WriteDescriptorSet::buffer(0, w_buf),
+                WriteDescriptorSet::buffer(1, ws_buf),
+                WriteDescriptorSet::buffer(2, x_buf),
+                WriteDescriptorSet::buffer(3, xs_buf),
+                WriteDescriptorSet::buffer(4, y_buf.clone()),
+            ],
+            None::<u32>,
+            [(n / n_cols) as u32, (m / m_rows) as u32, 1],
+        )
+        .unwrap();
+
+        let got = from_f16_bits(&y_buf.read().unwrap());
+        let err = nrmse(&got, &want);
+        eprintln!("{variant}: kernel vs MMQ oracle nrmse {err:.6}");
+        assert_close(&got, &want, 2e-2, 2e-2, variant);
+    }
+}

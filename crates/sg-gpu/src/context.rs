@@ -25,6 +25,8 @@ fn required_features() -> DeviceFeatures {
         uniform_and_storage_buffer16_bit_access: true,
         timeline_semaphore: true,
         shader_int8: true,
+        // int8 coopmat operands load from array<i8> storage buffers.
+        storage_buffer8_bit_access: true,
         ..Default::default()
     }
 }

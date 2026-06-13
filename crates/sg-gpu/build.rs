@@ -30,8 +30,11 @@ struct Variant {
     bindings: u32,
     /// Push-constant byte size (0 = none).
     push_bytes: u32,
-    /// Required subgroup size, 0 = driver default. The coopmat GEMM kernels
-    /// pin 32: RDNA3 WMMA runs at half rate in wave64.
+    /// Required subgroup size, 0 = driver default (wave64 on this box). All
+    /// kernels currently use 0: the coopmat GEMM measured NO wave64 penalty and
+    /// forcing wave32 was −25% (STATUS "Tuning dead-ends"). The plumbing exists
+    /// but is unused; pinning a size also needs `subgroup_size_control` enabled
+    /// in `GpuContext`.
     subgroup_size: u32,
     /// Skip naga-oil and compile with plain naga (textual `#{NAME}`
     /// substitution only, no `#ifdef`/`#import`). Required for cooperative-
@@ -395,6 +398,186 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // int8-MMQ GEMM (profile rank #2), one variant per (K, N) prefill site.
+    // k512_n64 (1×1 tiles) pins parity; k5376_n21504 (2×4) is the bench shape.
+    Variant {
+        name: "gemm_q4_0_i8_k512_n64",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 64),
+            ("WG_X", 64),
+            ("M_TILES", 1),
+            ("N_TILES", 1),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Small 2×4-tile shape to parity-check the tiled path before benching.
+    Variant {
+        name: "gemm_q4_0_i8_k512_n128",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Occupancy sweep (rank #2): smaller tilings cut VGPR (~24/tile) and LDS
+    // (2 KB/tile). int8 is occupancy-bound, not bandwidth-bound, so smaller
+    // tiles should raise waves/SIMD with no bandwidth penalty. Parity variant
+    // + bench variant per tiling.
+    Variant {
+        name: "gemm_q4_0_i8_t22_k512_n128",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_t12_k512_n128",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 64),
+            ("M_TILES", 1),
+            ("N_TILES", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_t22_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_t12_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 64),
+            ("M_TILES", 1),
+            ("N_TILES", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Diagnostic: int8 MMA throughput ceiling (no rescale). 3 bindings.
+    Variant {
+        name: "gemm_q4_0_i8_raw_k5376_n21504",
+        src: "gemm_q4_0_i8_raw",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // coopmat-arith smoke test (docs/naga-coopmat-arith-patch.md): proves the
+    // fork's component-wise FMul + f32(coop<i32>) convert. 3 bindings.
+    Variant {
+        name: "coop_arith_smoke",
+        src: "coop_arith_smoke",
+        defs: &[],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // int8-coopmat toolchain smoke test (docs/naga-int8-coopmat-patch.md):
+    // proves the naga fork emits signed-int8 coopmat SPIR-V. Not production.
+    Variant {
+        name: "coop_i8_smoke",
+        src: "coop_i8_smoke",
+        defs: &[],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Coopmat global-prefill rewrite (profile rank #1), register-resident-O
+    // two-pass. S_STAGE_LEN = M_Q·N_K.
+    Variant {
+        name: "attn_prefill_global_flash",
+        src: "attn_prefill_global_flash",
+        defs: &[
+            ("HEAD_DIM", 512),
+            ("N_KV_HEADS", 4),
+            ("Q_PER_KV", 8),
+            ("M_Q", 16),
+            ("N_K", 64),
+            ("WG_X", 64),
+            ("S_STAGE_LEN", 1024),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: true,
+    },
     // Coopmat Q4_0 GEMM (prefill), one variant per (K, N) site.
     Variant {
         name: "gemm_q4_0_k5376_n8192",
@@ -703,6 +886,7 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         naga::back::spv::Capability::Float16,
         naga::back::spv::Capability::Int8,
         naga::back::spv::Capability::Int16,
+        naga::back::spv::Capability::StorageBuffer8BitAccess,
         naga::back::spv::Capability::StorageBuffer16BitAccess,
         naga::back::spv::Capability::UniformAndStorageBuffer16BitAccess,
         naga::back::spv::Capability::GroupNonUniform,
