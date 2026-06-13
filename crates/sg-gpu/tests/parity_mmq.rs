@@ -18,32 +18,6 @@ use sg_gpu::GpuContext;
 use vulkano::buffer::BufferUsage;
 use vulkano::descriptor_set::WriteDescriptorSet;
 
-/// Extract Q4_0 weight bytes to signed-int8 quants `[N×K]` (logical order:
-/// low nibble of `qs[j]` for `j<16`, high nibble of `qs[j−16]` for `j≥16`,
-/// each minus 8) plus per-block scales `[N×(K/32)]` as f16 bits — the layout
-/// the kernel's `coopLoad` and `mmq_q4_0_q8` both assume.
-fn extract_q4_0_i8(weights: &[u8], n: usize, k: usize) -> (Vec<i8>, Vec<u16>) {
-    let nb = k / QK4_0;
-    let row_bytes = nb * BLOCK_Q4_0_SIZE;
-    let mut q = vec![0i8; n * k];
-    let mut scales = vec![0u16; n * nb];
-    for ni in 0..n {
-        let blocks = blocks_from_bytes(&weights[ni * row_bytes..][..row_bytes]).unwrap();
-        for (b, blk) in blocks.iter().enumerate() {
-            scales[ni * nb + b] = blk.d.to_bits();
-            for j in 0..QK4_0 {
-                let v = if j < 16 {
-                    (blk.qs[j] & 0x0F) as i32 - 8
-                } else {
-                    (blk.qs[j - 16] >> 4) as i32 - 8
-                };
-                q[ni * k + b * QK4_0 + j] = v as i8;
-            }
-        }
-    }
-    (q, scales)
-}
-
 /// Q4_0 weight bytes, `n_blocks` blocks (matches parity_gemm's generator:
 /// small f16 scale, random nibbles).
 fn random_q4_0(rng: &mut Rng, n_blocks: usize) -> Vec<u8> {
@@ -162,8 +136,8 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
         // Oracle: same Q8_0 quant of the same activations.
         let want = mmq_q4_0_q8(&weights, &x, m, k, n);
 
-        // GPU operands: W → i8 + scales; X → Q8_0 i8 + scales (per row).
-        let (w_i8, w_scales) = extract_q4_0_i8(&weights, n, k);
+        // GPU operands: W stays Q4_0 packed (unpacked to i8 in-kernel, uploaded
+        // as u32 words); X → Q8_0 i8 + scales (per row).
         let mut x_i8 = Vec::with_capacity(m * k);
         let mut x_scales = Vec::with_capacity(m * nb);
         for mi in 0..m {
@@ -173,10 +147,12 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
         }
 
         let w_buf = ctx
-            .buffer_from_iter(w_i8, BufferUsage::STORAGE_BUFFER)
-            .unwrap();
-        let ws_buf = ctx
-            .buffer_from_iter(w_scales, BufferUsage::STORAGE_BUFFER)
+            .buffer_from_iter(
+                weights
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap())),
+                BufferUsage::STORAGE_BUFFER,
+            )
             .unwrap();
         let x_buf = ctx
             .buffer_from_iter(x_i8, BufferUsage::STORAGE_BUFFER)
@@ -192,10 +168,9 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
             &kernel,
             vec![
                 WriteDescriptorSet::buffer(0, w_buf),
-                WriteDescriptorSet::buffer(1, ws_buf),
-                WriteDescriptorSet::buffer(2, x_buf),
-                WriteDescriptorSet::buffer(3, xs_buf),
-                WriteDescriptorSet::buffer(4, y_buf.clone()),
+                WriteDescriptorSet::buffer(1, x_buf),
+                WriteDescriptorSet::buffer(2, xs_buf),
+                WriteDescriptorSet::buffer(3, y_buf.clone()),
             ],
             None::<u32>,
             [(n / n_cols) as u32, (m / m_rows) as u32, 1],

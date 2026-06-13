@@ -54,12 +54,6 @@ fn bench(c: &mut Criterion) {
             BufferUsage::STORAGE_BUFFER,
         )
         .expect("w_i8");
-    let w_sc = ctx
-        .buffer_from_iter(
-            (0..N * NB).map(|i| half::f16::from_f32((i % 7) as f32 * 0.01).to_bits()),
-            BufferUsage::STORAGE_BUFFER,
-        )
-        .expect("w_sc");
     let x_i8 = ctx
         .buffer_from_iter(
             (0..M * K).map(|i| (i % 31) as i8 - 15),
@@ -82,12 +76,13 @@ fn bench(c: &mut Criterion) {
         WriteDescriptorSet::buffer(1, x_f16.clone()),
         WriteDescriptorSet::buffer(2, y.clone()),
     ];
+    // int8 MMQ now reads the SAME Q4_0 packed weights the f16 gemm does (it
+    // unpacks nibbles → i8 in LDS in-kernel) — apples-to-apples, no repack.
     let i8_writes = vec![
-        WriteDescriptorSet::buffer(0, w_i8.clone()),
-        WriteDescriptorSet::buffer(1, w_sc.clone()),
-        WriteDescriptorSet::buffer(2, x_i8.clone()),
-        WriteDescriptorSet::buffer(3, x_sc.clone()),
-        WriteDescriptorSet::buffer(4, y.clone()),
+        WriteDescriptorSet::buffer(0, w_f16.clone()),
+        WriteDescriptorSet::buffer(1, x_i8.clone()),
+        WriteDescriptorSet::buffer(2, x_sc.clone()),
+        WriteDescriptorSet::buffer(3, y.clone()),
     ];
     let raw_writes = vec![
         WriteDescriptorSet::buffer(0, w_i8.clone()),

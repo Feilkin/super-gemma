@@ -1,60 +1,49 @@
 // int8-MMQ GEMM, Q4_0 weights × Q8_0 activations (plan 02, profile rank #2).
 // Y[M×N] = X[M×K] · W[N×K]ᵀ via SIGNED int8 cooperative matrices (enabled by
 // the naga fork — docs/naga-int8-coopmat-patch.md). The MMQ alternative to
-// the f16 `gemm_q4_0`: weights stay int8 (no dequant), activations are
-// quantized to Q8_0, and each 32-element block's dot is an EXACT i8×i8→i32
+// the f16 `gemm_q4_0`: each 32-element block's dot is an EXACT i8×i8→i32
 // cooperative-matrix product, rescaled to f32 by the block's `d_a·d_w`.
+//
+// WEIGHTS read Q4_0 PACKED, like the f16 gemm (apples-to-apples — and the
+// deployable form: no weight repack, no 2× memory). Each thread bulk-loads its
+// W row's aligned 9-word block PAIR (= 64 weights = the β-unroll's two blocks),
+// unpacks the nibbles to i8 (q−8) in an LDS tile (`wb`) and writes the two
+// per-block `d_w` scales — folding away the separate w_scales buffer. The MMA
+// then `coopLoad`s the int8 B tiles straight from `wb` (LDS i8 coopmat verified
+// by coop_i8_lds_smoke). Activations stay pre-quantized Q8_0 (a separate
+// `kv_quant_q8` pass over X — small and amortized across a layer's gemms).
 //
 // One wave-sized workgroup computes an (M_TILES·16)×(N_TILES·16) block of Y.
 // PER-BLOCK RESCALE (the crux): the (d_a[m]·d_w[n]) scale is per-32-block AND
 // an outer product over the tile, so a single i32 accumulation across all K is
 // impossible — every block's i32 dot must be pulled out, converted to f32 and
-// scaled before it can be summed into Y.
+// scaled before it can be summed into Y. The f32 output `yacc` is
+// register-resident across all blocks (a `coop_mat<f32,C>` array, zeroed once);
+// the scale is built in LDS and applied with component-wise coopmat ops
+// (`yacc += scale * f32(acc)`: OpConvertSToF + OpFMul + OpFAdd, per-lane).
 //
-// IN-REGISTER RESCALE (the coopmat-arith fork — docs/naga-coopmat-arith-patch.md
-// — unblocks this): the f32 output `yacc` is register-resident across all NB
-// blocks (a `coop_mat<f32,C>` array, zeroed once). Per 32-block β:
-//   - the ACC = M_TILES·N_TILES i32 accumulators get the block's dot via 2
-//     substeps of 16 (a Q4_0 block is 32 = low-nibble half then high-nibble
-//     half, in the logical order the reference pins);
-//   - the rank-1 scale `d_a[m]·d_w[n]` is materialized into a small LDS buffer
-//     (`stage`), then loaded per tile as a `coop_mat<f32,C>` and applied with
-//     component-wise ops: `yacc += scale * f32(acc)` (OpConvertSToF on the i32
-//     dot, OpFMul for the scale, OpFAdd to accumulate — all per-lane, no LDS
-//     round-trip of the dot, no per-element scalar loop).
-// vs the prior version this removes the per-block i32 `coopStore` (8 KB at 2×4)
-// and the per-element f32 rescale-into-LDS loop.
-//
-// Three ISA-guided tunings got 2×4 from 2.52 → 7.85 TFLOPS / 0.83× f16 (RADV
-// asm + bench: mmq_tflops, perf=high; STATUS 2026-06-14):
-//   1. SCALE BUILD: build the row/col scale VECTORS in LDS (`da_l`, `dw_l`) and
-//      form `stage` = their outer product from LDS — vs reading the full product
-//      from global, ~64 redundant f16 loads + ~340 address ops/thread/block
-//      (tiling-invariant → naive sat ~2.5 at every tile size). [2.52→4.80]
+// ISA-guided tuning + reading Q4_0 directly: ~11 TFLOPS at 2×2 ≈ 1.03× f16
+// (bench: mmq_tflops, perf=high; STATUS 2026-06-14). 2×2 is the production
+// tiling (the i8 weight-staging shifted the sweet spot off 2×4). The steps,
+// each from RADV asm/shaderstats:
+//   1. SCALE BUILD: build the row/col scale VECTORS in LDS (`da_l`, `dw{a,b}`)
+//      and form `stage` = their outer product from LDS — not the full product
+//      from global (which was ~64 redundant loads + ~340 address ops/thread).
 //   2. β-LOOP UNROLLED ×2: two independent blocks' MMAs interleaved so WMMA ILP
 //      covers the per-block substep0→substep1 stall — RDNA3 hides WMMA latency
-//      via within-wave ILP, not occupancy (more waves did NOT help). [4.80→7.22]
-//   3. The outer-product fill is ×4-unrolled so independent `da_l` loads pipeline
-//      instead of one load→lgkmcnt(0)→mul→store per element. [7.22→7.85]
-// The rescale (ACC `coopLoad`s + per-lane convert/FMul/FAdd) was never the cost;
-// feeding it the scale was. `stage` is DOUBLE-BUFFERED (halves 0/1 = the two
-// unrolled blocks); two barriers/block frame da_l/dw_l→stage→coopLoad, and the
-// single da_l/dw_l buffer is safe to reuse (the stage→coopLoad barrier orders the
-// next block's overwrite). Occupancy is not the binder (no spill through 4×4);
-// the residual binder is the scale's LDS round-trip, forced by coopmat1 having no
+//      via within-wave ILP, not occupancy.
+//   3. The outer-product fill is ×4-unrolled so independent `da_l` loads
+//      pipeline instead of one load→lgkmcnt(0)→mul→store per element.
+// `stage` is DOUBLE-BUFFERED (halves 0/1 = the two unrolled blocks). The residual
+// binder is the scale's LDS round-trip, forced by coopmat1 having no
 // fragment-element access (can't scale the accumulator in registers).
 //
 // Element layout: `coopMultiplyAdd(A=Xᵀ-loaded, B=Wᵀ)` gives `acc[i][j]` = the
 // dot for output row (tile_m+j), col (tile_n+i) — the transpose of the output
 // tile (derived from the prior kernel's parity-green coopStoreT path). So the
 // scale, laid out [M_ROWS×N_COLS] row-major as `d_a[m]·d_w[n]` and loaded with
-// `coopLoadT`, lines up element-for-element with `acc`; the epilogue
-// `coopStoreT`s `yacc` back to that same layout to write y row-major.
-//
-// W is i8 in global → coopLoad reads B=Wᵀ directly (no dequant staging, unlike
-// f16 gemm). A=X (coopLoadT), B=Wᵀ (coopLoad of row-major W). Operand i8 data
-// must live in `array<i8>` buffers (VK_KHR_8bit_storage; the <i8> generic on
-// coopLoad is ignored — the scalar comes from the pointer base type).
+// `coopLoadT`, lines up element-for-element with `acc`; the epilogue converts
+// `f16(yacc)` and coopStores it straight to y.
 //
 // naga_oil corrupts coopmat IR → raw: true. A `var` coop-mat re-declared in a
 // loop is NOT re-zeroed (naga/ACO keeps the registers live) → `acc[]`/`yacc[]`
@@ -63,11 +52,10 @@
 enable f16;
 enable wgpu_cooperative_matrix;
 
-@group(0) @binding(0) var<storage, read> w: array<i8>;          // [N×K] Q4_0 quants (q−8)
-@group(0) @binding(1) var<storage, read> w_scales: array<f16>;  // [N×(K/32)] d_w
-@group(0) @binding(2) var<storage, read> x: array<i8>;          // [M×K] Q8_0 quants
-@group(0) @binding(3) var<storage, read> x_scales: array<f16>;  // [M×(K/32)] d_a
-@group(0) @binding(4) var<storage, read_write> y: array<f16>;   // [M×N]
+@group(0) @binding(0) var<storage, read> weights: array<u32>;   // [N×K] Q4_0 packed (18 B/block)
+@group(0) @binding(1) var<storage, read> x: array<i8>;          // [M×K] Q8_0 quants
+@group(0) @binding(2) var<storage, read> x_scales: array<f16>;  // [M×(K/32)] d_a
+@group(0) @binding(3) var<storage, read_write> y: array<f16>;   // [M×N]
 
 const K: u32 = #{K_DIM}u;
 const N: u32 = #{N_DIM}u;
@@ -80,18 +68,34 @@ const ACC: u32 = M_TILES * N_TILES; // 16×16 output tiles per workgroup
 const M_ROWS: u32 = M_TILES * 16u;
 const N_COLS: u32 = N_TILES * 16u;
 const TILE_ELEMS: u32 = ACC * 256u;
+const ROW_WORDS: u32 = NB * 18u / 4u; // Q4_0 words per W row (NB even → exact)
 
-// The per-block outer-product scale d_a[m]·d_w[n], [M_ROWS×N_COLS] row-major,
-// DOUBLE-BUFFERED (two halves of TILE_ELEMS, selected by β&1). Buffer 0 is also
-// the f32→f16 epilogue staging scratch.
-var<workgroup> stage: array<f32, 2u * TILE_ELEMS>;
-// The block's row/col scale VECTORS (M_ROWS + N_COLS values), loaded from global
-// once per block; `stage` is then the LDS-only outer product of these. Loading
-// the full outer product straight from global instead cost ~64 redundant f16
-// global loads + ~340 address-arith ops per thread per block (RADV asm) — the
-// dominant term, swamping the 16 MMAs (ISA-evidenced; STATUS 2026-06-14).
+// Unpacked int8 weights for the current 64-K block pair: [N_COLS rows × 64 K]
+// row-major (cols 0..32 = block β, 32..64 = block β+1).
+var<workgroup> wb: array<i8, N_COLS * 64u>;
+// The two blocks' per-row d_w scales, extracted from the Q4_0 blocks.
+var<workgroup> dwa: array<f32, N_COLS>;
+var<workgroup> dwb: array<f32, N_COLS>;
+// The block's row scales d_a, and the outer-product scale d_a[m]·d_w[n]
+// (DOUBLE-BUFFERED, halves 0/1; buffer 0 also the f32→f16 epilogue scratch).
 var<workgroup> da_l: array<f32, M_ROWS>;
-var<workgroup> dw_l: array<f32, N_COLS>;
+var<workgroup> stage: array<f32, 2u * TILE_ELEMS>;
+
+// Unpack one Q4_0 block (4 qs words in registers) to i8 (q−8) at wb[base..+32].
+// Low nibble of byte j → position j, high nibble → position 16+j (the
+// BlockQ4_0 logical order the reference pins).
+fn unpack_block(q0: u32, q1: u32, q2: u32, q3: u32, base: u32) {
+    var qs = array<u32, 4>(q0, q1, q2, q3);
+    for (var w = 0u; w < 4u; w += 1u) {
+        let word = qs[w];
+        for (var b = 0u; b < 4u; b += 1u) {
+            let byte = (word >> (8u * b)) & 0xFFu;
+            let j = 4u * w + b;
+            wb[base + j] = i8(i32(byte & 0xFu) - 8);
+            wb[base + 16u + j] = i8(i32(byte >> 4u) - 8);
+        }
+    }
+}
 
 @compute @workgroup_size(#{WG_X})
 fn main(
@@ -111,54 +115,74 @@ fn main(
         yacc[i] = zero_f;
     }
 
-    // β-loop UNROLLED ×2 (NB even on every shape). Two independent blocks' MMAs
-    // are interleaved so the WMMA ILP covers the per-block substep0→substep1
-    // dependency stall — RDNA3 hides WMMA latency via within-wave ILP, not
-    // wave-switching (the bare-MMA kernel jumped 1.1→3.3 TFLOPS under the same
-    // unroll; RADV 2026-06-14). The two blocks rescale into the two `stage`
-    // halves (0 / 1), so the double buffer is now consumed within one iteration.
+    // β-loop unrolled ×2 = one Q4_0 block PAIR (64 K) per iteration.
     for (var beta = 0u; beta < NB; beta += 2u) {
         for (var i = 0u; i < ACC; i += 1u) {
             acc[i] = zero_i;
             acc2[i] = zero_i;
         }
-        let kb0 = beta * 32u;
-        let kb1 = kb0 + 32u;
+        // Each thread (one W row) bulk-loads + unpacks its aligned 9-word block
+        // pair into `wb`, and writes the two block scales.
+        if (lid < N_COLS) {
+            let wbase = (n0 + lid) * ROW_WORDS + (beta / 2u) * 9u;
+            let w0 = weights[wbase];
+            let w1 = weights[wbase + 1u];
+            let w2 = weights[wbase + 2u];
+            let w3 = weights[wbase + 3u];
+            let w4 = weights[wbase + 4u];
+            let w5 = weights[wbase + 5u];
+            let w6 = weights[wbase + 6u];
+            let w7 = weights[wbase + 7u];
+            let w8 = weights[wbase + 8u];
+            // Block β: d in w0.lo, 16 qs bytes spanning w0.hi..w4.lo.
+            dwa[lid] = unpack2x16float(w0).x;
+            unpack_block(
+                (w0 >> 16u) | (w1 << 16u),
+                (w1 >> 16u) | (w2 << 16u),
+                (w2 >> 16u) | (w3 << 16u),
+                (w3 >> 16u) | (w4 << 16u),
+                lid * 64u,
+            );
+            // Block β+1: d in w4.hi, qs in w5..w8.
+            dwb[lid] = unpack2x16float(w4).y;
+            unpack_block(w5, w6, w7, w8, lid * 64u + 32u);
+        }
+        workgroupBarrier(); // wb + dwa/dwb written before MMA / rescale read them
+
+        // Interleaved MMA for the two blocks (independent → WMMA ILP). B tiles
+        // come from `wb` (LDS i8); A tiles from X (global i8). Block β occupies
+        // wb cols 0..32, block β+1 cols 32..64; row stride is 64.
+        let k0 = beta * 32u;
         for (var s = 0u; s < 2u; s += 1u) {
             var b0: array<coop_mat16x16<i8, B>, N_TILES>;
             var b1: array<coop_mat16x16<i8, B>, N_TILES>;
             for (var nt = 0u; nt < N_TILES; nt += 1u) {
-                b0[nt] = coopLoad<coop_mat16x16<i8, B>>(&w[(n0 + nt * 16u) * K + kb0 + s * 16u], K);
-                b1[nt] = coopLoad<coop_mat16x16<i8, B>>(&w[(n0 + nt * 16u) * K + kb1 + s * 16u], K);
+                b0[nt] = coopLoad<coop_mat16x16<i8, B>>(&wb[(nt * 16u) * 64u + s * 16u], 64u);
+                b1[nt] = coopLoad<coop_mat16x16<i8, B>>(&wb[(nt * 16u) * 64u + 32u + s * 16u], 64u);
             }
             for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                let a0 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + kb0 + s * 16u], K);
-                let a1 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + kb1 + s * 16u], K);
+                let a0 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
+                let a1 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
                 for (var nt = 0u; nt < N_TILES; nt += 1u) {
                     acc[mt * N_TILES + nt] = coopMultiplyAdd(a0, b0[nt], acc[mt * N_TILES + nt]);
                     acc2[mt * N_TILES + nt] = coopMultiplyAdd(a1, b1[nt], acc2[mt * N_TILES + nt]);
                 }
             }
         }
-        // Rescale both blocks into yacc. Each `u` is one block: load its row/col
-        // scale vectors, form the outer product in its `stage` half (u = the
-        // half index since β is even), then yacc += scale · f32(dot).
+
+        // Rescale both blocks into yacc. Each `u` is one block: load its row
+        // scales `d_a`, form the outer product with the block's `d_w` (dwa/dwb)
+        // in its `stage` half, then yacc += scale · f32(dot).
         for (var u = 0u; u < 2u; u += 1u) {
             let bb = beta + u;
             for (var i = lid; i < M_ROWS; i += WG) {
                 da_l[i] = f32(x_scales[(m0 + i) * NB + bb]);
             }
-            for (var i = lid; i < N_COLS; i += WG) {
-                dw_l[i] = f32(w_scales[(n0 + i) * NB + bb]);
-            }
-            workgroupBarrier(); // da_l/dw_l written before the outer product reads them
+            workgroupBarrier(); // da_l written before the outer product reads it
             let base = u * TILE_ELEMS;
             let n = lid % N_COLS;
-            let dw = dw_l[n];
-            // Walk the column ×4-unrolled: issue four independent `da_l` loads
-            // before the multiplies so the LDS latency pipelines, instead of one
-            // load→lgkmcnt(0)→mul→store per element (ACO won't batch it itself;
-            // RADV asm 2026-06-14). M_ROWS/step is a multiple of 4 every variant.
+            let dw = select(dwb[n], dwa[n], u == 0u);
+            // ×4-unrolled column walk so independent da_l loads pipeline.
             let step = WG / N_COLS;
             for (var m = lid / N_COLS; m < M_ROWS; m += 4u * step) {
                 let d0 = da_l[m];
@@ -186,9 +210,7 @@ fn main(
         }
     }
 
-    // Epilogue: convert yacc (f32) to f16 IN-REGISTER and coopStore straight to
-    // y — no LDS staging, no scalar convert loop. Tests the fork's OpFConvert on
-    // a coopmat (f16(coop<f32>)) + coopStore of a C-use f16 matrix to array<f16>.
+    // Epilogue: convert yacc (f32) to f16 in-register and coopStore straight to y.
     for (var mt = 0u; mt < M_TILES; mt += 1u) {
         for (var nt = 0u; nt < N_TILES; nt += 1u) {
             coopStoreT(
