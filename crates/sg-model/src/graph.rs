@@ -140,6 +140,11 @@ struct Kernels {
     gemm_o_gl: Kernel,
     gemm_up: Kernel,
     gemm_down: Kernel,
+    // int8-MMQ FFN (feature int8-ffn): Q8 activation quant + Q4_0-reading int8
+    // gemm at 2×2. Loaded unconditionally; the dispatch path is cfg-gated.
+    quant_q8: Kernel,
+    gemm_up_i8: Kernel,
+    gemm_down_i8: Kernel,
     prefill_sl: Kernel,
     prefill_gl: Kernel,
     /// Sync shim: the gemm kernels read `x` only via coopmat loads, which
@@ -213,6 +218,13 @@ struct PrefillBufs {
     gu: Subbuffer<[u16]>,
     f: Subbuffer<[u16]>,
     fn2: Subbuffer<[u16]>,
+    /// int8-ffn activation-quant scratch: Q8_0 quants (u32-packed, the format
+    /// `kv_quant_q8` writes and the int8 gemm reads as `array<i8>`) + f16 scales,
+    /// for the FFN input (`fin`, HIDDEN) and the gate⊙up product (`gu`, FFN).
+    fin_i8: Subbuffer<[u32]>,
+    fin_scales: Subbuffer<[u16]>,
+    gu_i8: Subbuffer<[u32]>,
+    gu_scales: Subbuffer<[u16]>,
     /// Per-chunk rope tables: `[max_chunk × live_pairs × 2]` f32.
     cs_sl: Subbuffer<[f32]>,
     cs_gl: Subbuffer<[f32]>,
@@ -306,6 +318,10 @@ impl<'a> GpuModel<'a> {
             gu: f16buf(m * FFN)?,
             f: f16buf(m * HIDDEN)?,
             fn2: f16buf(m * HIDDEN)?,
+            fin_i8: ctx.new_buffer::<u32>((m * HIDDEN / 4) as u64, usage)?,
+            fin_scales: f16buf(m * HIDDEN / 32)?,
+            gu_i8: ctx.new_buffer::<u32>((m * FFN / 4) as u64, usage)?,
+            gu_scales: f16buf(m * FFN / 32)?,
             cs_sl: ctx.new_buffer::<f32>((m * desc.sliding.head_dim / 2 * 2) as u64, usage)?,
             cs_gl: ctx.new_buffer::<f32>((m * desc.global.head_dim / 8 * 2) as u64, usage)?,
         };
@@ -355,6 +371,9 @@ impl<'a> GpuModel<'a> {
             gemm_o_gl: load("gemm_q4_0_k16384_n5376")?,
             gemm_up: load("gemm_q4_0_k5376_n21504")?,
             gemm_down: load("gemm_q4_0_k21504_n5376")?,
+            quant_q8: load("kv_quant_q8")?,
+            gemm_up_i8: load("gemm_q4_0_i8_t22_k5376_n21504")?,
+            gemm_down_i8: load("gemm_q4_0_i8_t22_k21504_n5376")?,
             prefill_sl: load("attn_prefill_sliding_ring")?,
             prefill_gl: load("attn_prefill_global")?,
             touch: load("touch")?,
@@ -1088,17 +1107,48 @@ impl<'a> GpuModel<'a> {
         // ── FFN block ────────────────────────────────────────────────────
         rms(rec, &self.k.rms5376, &p.x2, &lw.ffn_norm, &p.fin, m_pad)?;
         touch(rec, &p.fin)?;
-        for (w, dst) in [(&lw.ffn_gate, &p.g), (&lw.ffn_up, &p.u)] {
+        // FFN gate+up: f16 gemm, or (feature int8-ffn) Q8-quantize `fin` once
+        // (shared by gate and up) and run the Q4_0-reading int8 gemm at 2×2.
+        if cfg!(feature = "int8-ffn") {
             rec.dispatch(
-                &self.k.gemm_up,
+                &self.k.quant_q8,
                 vec![
-                    buf(0, w.clone()),
-                    buf(1, p.fin.clone()),
-                    buf(2, (*dst).clone()),
+                    buf(0, p.fin.clone()),
+                    buf(1, p.fin_scales.clone()),
+                    buf(2, p.fin_i8.clone()),
                 ],
                 no_push,
-                [(FFN / 64) as u32, mg, 1],
+                self.k.quant_q8.groups_for((m_pad * HIDDEN / 32) as u64),
             )?;
+            // The int8 gemm coopLoads its quants → invisible to auto-sync.
+            rec.dispatch(&self.k.touch, vec![buf(0, p.fin_i8.clone())], no_push, [1, 1, 1])?;
+            let mg2 = (m_pad / 32) as u32; // int8 2×2 M-block count
+            for (w, dst) in [(&lw.ffn_gate, &p.g), (&lw.ffn_up, &p.u)] {
+                rec.dispatch(
+                    &self.k.gemm_up_i8,
+                    vec![
+                        buf(0, w.clone()),
+                        buf(1, p.fin_i8.clone()),
+                        buf(2, p.fin_scales.clone()),
+                        buf(3, (*dst).clone()),
+                    ],
+                    no_push,
+                    [(FFN / 32) as u32, mg2, 1],
+                )?;
+            }
+        } else {
+            for (w, dst) in [(&lw.ffn_gate, &p.g), (&lw.ffn_up, &p.u)] {
+                rec.dispatch(
+                    &self.k.gemm_up,
+                    vec![
+                        buf(0, w.clone()),
+                        buf(1, p.fin.clone()),
+                        buf(2, (*dst).clone()),
+                    ],
+                    no_push,
+                    [(FFN / 64) as u32, mg, 1],
+                )?;
+            }
         }
         rec.dispatch(
             &self.k.geglu,
@@ -1110,17 +1160,44 @@ impl<'a> GpuModel<'a> {
             no_push,
             self.k.geglu.groups_for(p.gu.len()),
         )?;
-        touch(rec, &p.gu)?;
-        rec.dispatch(
-            &self.k.gemm_down,
-            vec![
-                buf(0, lw.ffn_down.clone()),
-                buf(1, p.gu.clone()),
-                buf(2, p.f.clone()),
-            ],
-            no_push,
-            [(HIDDEN / 64) as u32, mg, 1],
-        )?;
+        // FFN down: f16 gemm, or (feature int8-ffn) Q8-quantize `gu` and int8 gemm.
+        if cfg!(feature = "int8-ffn") {
+            rec.dispatch(
+                &self.k.quant_q8,
+                vec![
+                    buf(0, p.gu.clone()),
+                    buf(1, p.gu_scales.clone()),
+                    buf(2, p.gu_i8.clone()),
+                ],
+                no_push,
+                self.k.quant_q8.groups_for((m_pad * FFN / 32) as u64),
+            )?;
+            rec.dispatch(&self.k.touch, vec![buf(0, p.gu_i8.clone())], no_push, [1, 1, 1])?;
+            let mg2 = (m_pad / 32) as u32;
+            rec.dispatch(
+                &self.k.gemm_down_i8,
+                vec![
+                    buf(0, lw.ffn_down.clone()),
+                    buf(1, p.gu_i8.clone()),
+                    buf(2, p.gu_scales.clone()),
+                    buf(3, p.f.clone()),
+                ],
+                no_push,
+                [(HIDDEN / 32) as u32, mg2, 1],
+            )?;
+        } else {
+            touch(rec, &p.gu)?;
+            rec.dispatch(
+                &self.k.gemm_down,
+                vec![
+                    buf(0, lw.ffn_down.clone()),
+                    buf(1, p.gu.clone()),
+                    buf(2, p.f.clone()),
+                ],
+                no_push,
+                [(HIDDEN / 64) as u32, mg, 1],
+            )?;
+        }
         rms(rec, &self.k.rms5376, &p.f, &lw.post_ffw_norm, &p.fn2, m_pad)?;
         rec.dispatch(
             &self.k.add,

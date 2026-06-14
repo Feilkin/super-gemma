@@ -501,6 +501,23 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // FFN down-projection (K=21504→N=5376), 2×2 — the int8 prefill FFN slice.
+    Variant {
+        name: "gemm_q4_0_i8_t22_k21504_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_i8_t12_k5376_n21504",
         src: "gemm_q4_0_i8",

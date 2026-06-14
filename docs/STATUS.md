@@ -404,12 +404,24 @@ unit fed; bare back-to-back WMMAs can't feed it alone.
 4×4 is LDS-occupancy-bound by its 32 KB double-buffered `stage` (~5.8, kept in the bench as the
 documented slower point). The residual binder is the scale's LDS round-trip (`da_l/dw` → `stage` →
 `coopLoad`), forced because KHR coopmat1 has **no fragment-element access** (can't scale the
-accumulator in registers). **int8 now BEATS f16, so wiring it into the prefill graph is worthwhile**
-(per-shape int8 2×2 variants + a `kv_quant_q8` activation pass — already produces the exact Q8 layout
-the gemm reads — gated on the perplexity harness for the activation-Q8 accuracy risk). Fork quirk
-found: coopmat `+` emits `OpFAdd` regardless of scalar kind, so *integer* coopmat accumulation is
-silently a float add (harmless here — `_raw` discards output, the kernel only adds f32 `yacc` — but a
-latent fork bug to guard).
+accumulator in registers). Fork quirk found: coopmat `+` emits `OpFAdd` regardless of scalar kind, so
+*integer* coopmat accumulation is silently a float add (harmless here — `_raw` discards output, the
+kernel only adds f32 `yacc` — but a latent fork bug to guard).
+
+**FFN int8 prefill slice — WIRED + quality-validated (2026-06-14), behind `--features int8-ffn`.**
+First e2e vertical slice: the FFN gate/up/down projections run the int8 2×2 gemm (`kv_quant_q8`
+quantizes `fin`/`gu` to Q8 once per site → int8 gemm reads Q4_0 + the Q8 activations). **Perplexity
+matches llama.cpp within tolerance** (wikitext 1120.7 vs 1119.3, rel 0.0012; code 21.92 vs 22.33, rel
+0.019) — the activation-Q8 cost is **negligible** because llama.cpp itself Q8-quantizes activations
+for Q4_0 matmuls, so int8 FFN tracks the reference. (Per-layer nrmse vs the *f16* GPU path is ~0.022,
+the int8 envelope — divergence toward llama.cpp, not quality loss.) **Bug fixed in the same change:**
+the int8 gemm `coopStore`d its output straight to `y`, which is INVISIBLE to vulkano's reflection
+auto-sync (like coopLoad/`touch.wgsl`) → the recorded graph raced the consumer (0.24 nrmse). The gemm
+itself was proven correct in isolation (production shapes + GPU-quant, host-synced: nrmse 2e-4); fix
+is the f16 pattern — stage `yacc`→LDS→normal-store `y` (perf-neutral, 2×2 still 10.99 vs f16 10.84).
+A latent correctness bug in the committed kernel, exposed only once it was used in a graph. **Open:
+e2e prefill *timing* (the gemm edge is only ~3 % and int8 adds the quant passes — measure net), then
+extend to the attention 6 shapes.**
 
 **Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
 both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +

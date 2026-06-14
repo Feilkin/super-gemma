@@ -42,8 +42,9 @@
 // dot for output row (tile_m+j), col (tile_n+i) — the transpose of the output
 // tile (derived from the prior kernel's parity-green coopStoreT path). So the
 // scale, laid out [M_ROWS×N_COLS] row-major as `d_a[m]·d_w[n]` and loaded with
-// `coopLoadT`, lines up element-for-element with `acc`; the epilogue converts
-// `f16(yacc)` and coopStores it straight to y.
+// `coopLoadT`, lines up element-for-element with `acc`; the epilogue stages
+// `yacc` to LDS and writes y via normal stores (coopStore to y is invisible to
+// auto-sync — see the epilogue).
 //
 // naga_oil corrupts coopmat IR → raw: true. A `var` coop-mat re-declared in a
 // loop is NOT re-zeroed (naga/ACO keeps the registers live) → `acc[]`/`yacc[]`
@@ -210,12 +211,22 @@ fn main(
         }
     }
 
-    // Epilogue: convert yacc (f32) to f16 in-register and coopStore straight to y.
-    for (var mt = 0u; mt < M_TILES; mt += 1u) {
-        for (var nt = 0u; nt < N_TILES; nt += 1u) {
-            coopStoreT(
-                f16(yacc[mt * N_TILES + nt]),
-                &y[(m0 + mt * 16u) * N + n0 + nt * 16u], N);
-        }
+    // Epilogue: coopStore yacc (f32) to LDS, then write y via NORMAL stores.
+    // coopStore straight to y is INVISIBLE to vulkano's reflection-based
+    // auto-sync (like coopLoad — touch.wgsl), so the recorded prefill graph
+    // would race the consumer (geglu/rms). The LDS round-trip keeps the y write
+    // reflection-visible, exactly as the f16 gemm does. `stage` (buffer 0) is
+    // free here — its last loop use was the rescale's coopLoad.
+    workgroupBarrier(); // last rescale's stage coopLoad done before reuse
+    for (var t = 0u; t < ACC; t += 1u) {
+        coopStoreT(yacc[t], &stage[t * 256u], 16u);
+    }
+    workgroupBarrier();
+    for (var i = lid; i < TILE_ELEMS; i += WG) {
+        let t = i / 256u;
+        let e = i % 256u;
+        let row = m0 + (t / N_TILES) * 16u + e / 16u;
+        let col = n0 + (t % N_TILES) * 16u + e % 16u;
+        y[row * N + col] = f16(stage[i]);
     }
 }

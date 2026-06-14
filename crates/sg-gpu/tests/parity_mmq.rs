@@ -12,7 +12,7 @@
 
 mod reference;
 
-use reference::{Rng, assert_close, from_f16_bits, mmq_q4_0_q8, quant_q8_0, through_f16};
+use reference::{Rng, assert_close, from_f16_bits, mmq_q4_0_q8, quant_q8_0, through_f16, to_f16_bits};
 use sg_gguf::q4_0::{BLOCK_Q4_0_SIZE, QK4_0, blocks_from_bytes};
 use sg_gpu::GpuContext;
 use vulkano::buffer::BufferUsage;
@@ -96,6 +96,88 @@ fn ctx() -> Option<GpuContext> {
             eprintln!("skipping: no usable GPU ({e})");
             None
         }
+    }
+}
+
+/// The FFN PRODUCTION shapes (k5376_n21504 up, k21504_n5376 down) at 2×2, fed
+/// activations quantized by the GPU `kv_quant_q8` kernel (the prefill path),
+/// not the CPU `quant_q8_0`. Localizes the int8-FFN graph regression: the other
+/// parity case only exercises k512 logic with CPU-quantized activations, so a
+/// production-K or GPU-quant-chain bug hides there. Tolerance is looser — GPU
+/// quant may differ ±1 from the CPU oracle's quant at rounding boundaries.
+#[test]
+fn gemm_q4_0_i8_ffn_shapes_with_gpu_quant() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.cooperative_matrix {
+        eprintln!("skipping: no VK_KHR_cooperative_matrix");
+        return;
+    }
+    let quant = ctx.load_kernel("kv_quant_q8").expect("kv_quant_q8");
+    let mut rng = Rng::new(0x5E);
+    // (variant, m, k, n) at 2×2 (m_rows = n_cols = 32).
+    let cases = [
+        ("gemm_q4_0_i8_t22_k5376_n21504", 64usize, 5376usize, 21504usize),
+        ("gemm_q4_0_i8_t22_k21504_n5376", 64, 21504, 5376),
+    ];
+    for (variant, m, k, n) in cases {
+        let kernel = ctx.load_kernel(variant).expect(variant);
+        let nb = k / QK4_0;
+
+        let weights = random_q4_0(&mut rng, n * k / QK4_0);
+        let x = through_f16(&rng.f32_vec(m * k));
+        let want = mmq_q4_0_q8(&weights, &x, m, k, n);
+
+        // GPU-quantize the activations with kv_quant_q8 → x_i8 (u32-packed) +
+        // x_scales (f16), exactly the prefill path.
+        let x_f16 = ctx
+            .buffer_from_iter(to_f16_bits(&x), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let x_scales = ctx
+            .new_buffer::<u16>((m * nb) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let x_i8 = ctx
+            .new_buffer::<u32>((m * k / 4) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        ctx.dispatch_blocking(
+            &quant,
+            vec![
+                WriteDescriptorSet::buffer(0, x_f16),
+                WriteDescriptorSet::buffer(1, x_scales.clone()),
+                WriteDescriptorSet::buffer(2, x_i8.clone()),
+            ],
+            None::<u32>,
+            quant.groups_for((m * nb) as u64),
+        )
+        .unwrap();
+
+        let w_buf = ctx
+            .buffer_from_iter(
+                weights
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap())),
+                BufferUsage::STORAGE_BUFFER,
+            )
+            .unwrap();
+        let y_buf = ctx
+            .new_buffer::<u16>((m * n) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                WriteDescriptorSet::buffer(0, w_buf),
+                WriteDescriptorSet::buffer(1, x_i8.clone()),
+                WriteDescriptorSet::buffer(2, x_scales.clone()),
+                WriteDescriptorSet::buffer(3, y_buf.clone()),
+            ],
+            None::<u32>,
+            [(n / 32) as u32, (m / 32) as u32, 1],
+        )
+        .unwrap();
+
+        let got = from_f16_bits(&y_buf.read().unwrap());
+        let err = nrmse(&got, &want);
+        eprintln!("{variant}: GPU-quant int8 gemm vs oracle nrmse {err:.6}");
+        assert_close(&got, &want, 3e-2, 3e-2, variant);
     }
 }
 
