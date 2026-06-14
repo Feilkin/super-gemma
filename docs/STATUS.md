@@ -455,9 +455,17 @@ change. **DEPLOYED to the prefill graph (2026-06-14):** the 8 f16 gemm sites loa
 worst nrmse 0.00244 unchanged). **e2e: gate/up gemm 11.3 → 9.4 ms/layer (−17 %); prefill @ q0 0
 182 → 192 tok/s (+5.6 %, the clean FFN-dominated point** — higher-q0 deltas include ±4 % cross-run
 attention noise; bench: sg-bench profile). A real prefill win, diluted e2e by the attention/rms work
-the swizzle doesn't touch. **Open: apply the swizzle to the int8 gemm too (also memory-bound), and
-consider cache-blocking for *more* reuse than L2 incidentally gives.** The plain `gemm_q4_0_k*` stay
-for the bench/parity baseline; decode is unaffected (GEMV).
+the swizzle doesn't touch. **Same swizzle DEPLOYED to the int8 FFN gemm (2026-06-14):** the int8 2×2
+kernel is the same memory-bound shape; `SWIZZLE` takes it **11.07 → 13.29 TFLOPS, +20 %** at perf=high
+(bench: mmq_tflops `gemm_q4_0_i8_swz_t22_k5376_n21504`; the earlier +12 % was a perf=auto reading).
+`gemm_up_i8`/`gemm_down_i8` load the `swz` variants with transposed dispatch; `prefill_parity
+--features int8-ffn` green and **bit-identical** (pre/post both 0.02255 per-layer nrmse — launch order
+only; threshold made dtype-aware, 0.025 under int8-ffn vs 0.02 f16). **e2e A/B (sg-bench profile, both
+perf=high, int8-ffn): prefill @ q0 0/8K/32K = 166/127/82 → 206/148/91 tok/s, +24 % / +17 % / +11 %.**
+The int8 FFN up/down gemms are ~75 % of int8-ffn prefill (≈10.8 + 8.0 ms/layer), so the kernel win
+carries the total; the win shrinks with q0 as un-swizzled attention takes a larger share. **Open:
+cache-blocking for *more* reuse than the 2 MB L2 incidentally gives.** The plain `gemm_q4_0_k*` /
+`gemm_q4_0_i8_t22_*` stay for the bench/parity baseline; decode is unaffected (GEMV).
 
 **Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
 both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +
