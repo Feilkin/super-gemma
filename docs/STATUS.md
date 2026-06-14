@@ -319,14 +319,17 @@ Consequences, both landed:
   cmdline) as a backstop — a 2 s budget is tight for an inference workstation, and the
   flash-attention rewrite only lowers, never removes, long-context submission times.
 
-Measured (median of 5, this box; bench: `sg-bench profile`). **NOTE: taken at `perf=auto`, which
-idles the fabric clock and reads ~30 % low (2026-06-13 finding) — re-profile at `perf=high` for
-true numbers.** Targets are from plan 06.
+Measured (median of 5, this box; bench: `sg-bench profile`). The original table below was taken at
+`perf=auto`, which idles the fabric clock and reads ~30 % low (2026-06-13). **Current prefill at
+`perf=high` (2026-06-14, the optimization arc below): f16 default ~192 tok/s @ q0 0; with
+`--features int8-ffn` (whole block int8 + L2 swizzle + 4×1 cache-blocking) 270 / 179 / 101 tok/s @
+q0 0 / 8K / 32K** — see the per-optimization sections. Decode is unaffected by that arc (GEMV path).
+Targets are from plan 06.
 
 | Phase | Result (perf=auto) | Target (plan 06) |
 |---|---|---|
 | decode @ 1K / 8K / 32K | **11.7 / 11.4 / 10.3 tok/s** | ≥ 10 / 10 / 9.5 ✓ |
-| prefill 256-chunk @ q0 0 / 8K / 32K | **179 / 128 / 83 tok/s** | ≥ 300 ✗ |
+| prefill 256-chunk @ q0 0 / 8K / 32K | **179 / 128 / 83** (auto); **270 / 179 / 101** (high, int8-ffn) | ≥ 300 ✗ |
 | CPU per decode step | stage 23 µs + sampler ≤ 423 µs + overhead ~310 µs | ≪ 75 ms budget ✓ |
 
 Optimization ranking (per-layer medians from the rep-layer breakdown):
@@ -335,15 +338,14 @@ Optimization ranking (per-layer medians from the rep-layer breakdown):
    chunk at 32K and growing linearly per chunk (quadratic per prompt). The coopmat
    flash-attention rewrite is both the prefill-throughput fix at context and the
    watchdog-pressure fix. Clear #1.
-2. **Coopmat GEMM** (~9.5 TFLOPS, bench: gemm_variance/gemm_tflops, perf=high — this profile's
-   per-layer ms were taken at perf=auto, so they read low; re-profile at high): the FFN pair
-   (`n21504` + `n5376`) is ~70 % of short-context prefill; 179 vs ≥300 tok/s (target) is mostly
-   this.
-   Structural levers exhausted (M2 dead-ends); the **int8 coopmat path
-   (SINT8×SINT8→SINT32, probed available) is the MMQ-style candidate** — likely faster
-   AND more accurate than f16×f16 (llama.cpp's quantization bias measured in the ppl
-   work was on its activation side; ours would quantize activations Q8 too — needs a
-   quality gate).
+2. **Coopmat GEMM** — the FFN pair (`n21504` + `n5376`) is ~70 % of short-context prefill. **LARGELY
+   ADDRESSED (2026-06-14, behind `--features int8-ffn`):** the whole transformer block runs int8-MMQ
+   (Q4_0 × Q8) with the L2 swizzle and the 4×1 cache-blocked tile — see the dedicated sections below.
+   Prefill @ q0 0 went f16 ~182 → int8+swizzle+cache-block **270 tok/s (perf=high)**, a ~48 % arc;
+   quality stays within the llama.cpp perplexity gate. The int8 path turned out faster than f16 mainly
+   via *weight-traffic* wins (swizzle + tall-thin tile), not the dtype itself — the gemms are
+   memory-bound, not compute-bound (the big finding below). Still short of the ≥300 stretch target;
+   the residual gate is L2 size and attention at long context (#1).
 3. Decode is healthy: gemv-dominated (~1.16 ms/layer of weight streaming = the bandwidth
    floor), `attn_decode_global` 1.23 ms/layer at 32K (the K≠V ×2 traffic is visible but
    only ~12 % of a decode step). LM head 5.45 ms ≈ 6 %. Tuning here buys little until
@@ -496,9 +498,10 @@ kernel is the same memory-bound shape; `SWIZZLE` takes it **11.07 → 13.29 TFLO
 only; threshold made dtype-aware, 0.025 under int8-ffn vs 0.02 f16). **e2e A/B (sg-bench profile, both
 perf=high, int8-ffn): prefill @ q0 0/8K/32K = 166/127/82 → 206/148/91 tok/s, +24 % / +17 % / +11 %.**
 The int8 FFN up/down gemms are ~75 % of int8-ffn prefill (≈10.8 + 8.0 ms/layer), so the kernel win
-carries the total; the win shrinks with q0 as un-swizzled attention takes a larger share. **Open:
-cache-blocking for *more* reuse than the 2 MB L2 incidentally gives.** The plain `gemm_q4_0_k*` /
-`gemm_q4_0_i8_t22_*` stay for the bench/parity baseline; decode is unaffected (GEMV).
+carries the total; the win shrinks with q0 as un-swizzled attention takes a larger share. (Cache-
+blocking for *more* reuse than the 2 MB L2 incidentally gives — DONE, the 4×1 tile section below.)
+The plain `gemm_q4_0_k*` / `gemm_q4_0_i8_t22_*` stay for the bench/parity baseline; decode is
+unaffected (GEMV).
 
 **Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
 both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +
@@ -534,11 +537,13 @@ the divergence path matches a cold run bitwise.
    `out = sc * f32(di)` bit-exact, SPIR-V shows `OpConvertSToF`/`OpFMul` on C-use coopmats
    (confirms `coopLoad` into C-use works); all coopmat parity green on the new rev.
    `docs/naga-coopmat-arith-patch.md`.
-2. **int8-MMQ GEMM — DONE (2026-06-14), ~11 TFLOPS at 2×2 ≈ 1.03× f16, reading Q4_0** (see Rank #2
-   above). Beats f16 and is deployable (no repack). **Next: wire int8 into the prefill graph** —
-   per-shape int8 2×2 variants + a `kv_quant_q8` activation pass (already the right Q8 layout) → 4
-   bindings/site in `sg-model/src/graph.rs`, behind a flag; then run the perplexity harness to gate
-   the activation-Q8 accuracy and the e2e prefill/decode tok/s (decode is GEMV = unaffected).
+2. **int8-MMQ GEMM — DONE & DEPLOYED (2026-06-14)** behind `--features int8-ffn`: the whole
+   transformer block (attention QKV+O, FFN gate/up/down) runs int8 with the L2 swizzle and the 4×1
+   cache-blocked tile (per-shape variants + `kv_quant_q8` activation passes, 4 bindings/site in
+   `sg-model/src/graph.rs`); perplexity-gated, +48 % prefill arc. See the dedicated sections above.
+   **Open follow-ups:** apply the 4×1 tile sweep to the *f16* gemms (default build / decode path),
+   RGP-recapture to confirm the new occupancy/L2 picture, and make `int8-ffn` the default once the
+   f16 path is either retired or matched.
 3. **Operational:** pin `power_dpm_force_performance_level=high` on the box (the ~30 % fabric-clock
    finding) and set `amdgpu.lockup_timeout=10000` (the watchdog finding).
 4. **Revisit rank #1 flash attention** with the new coopmat-arith ops (in-register rescale may now
