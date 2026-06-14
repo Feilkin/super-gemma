@@ -17,9 +17,16 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool)> {
         // int8 2×2 (N-block = M-block = 32).
         "gemm_q4_0_i8_t22_k21504_n5376" => (21504, 5376, 32, 32, true), // FFN down
         "gemm_q4_0_i8_t22_k5376_n21504" => (5376, 21504, 32, 32, true), // FFN gate/up
-        // f16 4×4 (N-block = M-block = 64), for the A/B.
-        "gemm_q4_0_k21504_n5376" => (21504, 5376, 64, 64, false),
-        "gemm_q4_0_k5376_n21504" => (5376, 21504, 64, 64, false),
+        // f16 4×4 (N-block = M-block = 64) — every prefill GEMM site, for the
+        // f16 A/B and the un-RGP'd-f16 investigation (STATUS).
+        "gemm_q4_0_k5376_n21504" => (5376, 21504, 64, 64, false), // FFN gate/up
+        "gemm_q4_0_k21504_n5376" => (21504, 5376, 64, 64, false), // FFN down
+        "gemm_q4_0_k5376_n8192" => (5376, 8192, 64, 64, false),   // Q sliding
+        "gemm_q4_0_k5376_n4096" => (5376, 4096, 64, 64, false),   // KV sliding
+        "gemm_q4_0_k8192_n5376" => (8192, 5376, 64, 64, false),   // O sliding
+        "gemm_q4_0_k5376_n16384" => (5376, 16384, 64, 64, false), // Q global
+        "gemm_q4_0_k5376_n2048" => (5376, 2048, 64, 64, false),   // KV global
+        "gemm_q4_0_k16384_n5376" => (16384, 5376, 64, 64, false), // O global
         _ => return None,
     })
 }
@@ -27,9 +34,9 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool)> {
 pub fn run(kernel: &str) -> anyhow::Result<()> {
     let (k, n, nb, mb, int8) = shape(kernel).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown rgp kernel `{kernel}`; one of: \
-             gemm_q4_0_i8_t22_k21504_n5376, gemm_q4_0_i8_t22_k5376_n21504, \
-             gemm_q4_0_k21504_n5376, gemm_q4_0_k5376_n21504"
+            "unknown rgp kernel `{kernel}`; the int8 FFN gemms \
+             (gemm_q4_0_i8_t22_k{{21504_n5376,5376_n21504}}) or any f16 prefill \
+             site (gemm_q4_0_k<K>_n<N>) — see `shape()`"
         )
     })?;
 
