@@ -138,6 +138,58 @@ fn gemm_q4_0_matches_reference_on_all_shapes() {
     }
 }
 
+/// The L2-reuse workgroup swizzle (SWIZZLE=1: M-blocks fast-varying, dispatch
+/// transposed) must produce BIT-IDENTICAL output to the plain kernel — it only
+/// reorders which workgroup computes which tile. m=128 (2 M-blocks) exercises
+/// the M-block ordering.
+#[test]
+fn gemm_q4_0_swizzle_matches_plain() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.cooperative_matrix {
+        return;
+    }
+    let mut rng = Rng::new(0x5712);
+    let (m, k, n) = (128usize, 5376usize, 21504usize);
+
+    let weights = random_q4_0(&mut rng, n * k / QK4_0);
+    let x = through_f16(&rng.f32_vec(m * k));
+    let w_buf = ctx
+        .buffer_from_iter(
+            weights
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap())),
+            BufferUsage::STORAGE_BUFFER,
+        )
+        .unwrap();
+    let x_buf = ctx
+        .buffer_from_iter(to_f16_bits(&x), BufferUsage::STORAGE_BUFFER)
+        .unwrap();
+
+    let run = |variant: &str, grid: [u32; 3]| -> Vec<u16> {
+        let kernel = ctx.load_kernel(variant).expect(variant);
+        let y = ctx
+            .new_buffer::<u16>((m * n) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                WriteDescriptorSet::buffer(0, w_buf.clone()),
+                WriteDescriptorSet::buffer(1, x_buf.clone()),
+                WriteDescriptorSet::buffer(2, y.clone()),
+            ],
+            None::<u32>,
+            grid,
+        )
+        .expect(variant);
+        y.read().unwrap().to_vec()
+    };
+
+    // Plain: dispatch [N/strip, M/tile]. Swizzled: transposed [M/tile, N/strip].
+    let plain = run("gemm_q4_0_k5376_n21504", [(n / 64) as u32, (m / 64) as u32, 1]);
+    let swz = run("gemm_q4_0_swz_k5376_n21504", [(m / 64) as u32, (n / 64) as u32, 1]);
+    assert_eq!(plain, swz, "swizzled gemm output differs from plain");
+}
+
 /// Plan 02/06: bit-identical across runs.
 #[test]
 fn gemm_is_bit_deterministic() {

@@ -89,21 +89,30 @@ fn bench(c: &mut Criterion) {
         WriteDescriptorSet::buffer(1, x_i8.clone()),
         WriteDescriptorSet::buffer(2, y.clone()),
     ];
-    let cases: [(&str, Vec<WriteDescriptorSet>, u32, u32); 8] = [
-        ("gemm_q4_0_k5376_n21504", f16_writes.clone(), 64, 64), // f16, 4×4 tiles
-        ("gemm_q4_0_m2_k5376_n21504", f16_writes.clone(), 64, 32), // f16 2×4 (occupancy lever)
-        ("gemm_q4_0_m1_k5376_n21504", f16_writes, 64, 16), // f16 1×4 (occupancy lever)
-        ("gemm_q4_0_i8_k5376_n21504", i8_writes.clone(), 64, 32), // int8 MMQ, 2×4 tiles
-        ("gemm_q4_0_i8_t22_k5376_n21504", i8_writes.clone(), 32, 32), // 2×2 tiles
-        ("gemm_q4_0_i8_t12_k5376_n21504", i8_writes.clone(), 32, 16), // 1×2 tiles
-        ("gemm_q4_0_i8_t44_k5376_n21504", i8_writes, 64, 64), // 4×4 tiles (f16-equivalent)
-        ("gemm_q4_0_i8_raw_k5376_n21504", raw_writes, 64, 32), // int8 MMA ceiling, no rescale
+    // (name, descriptor writes, n_block, m_block, swizzle). `swizzle` transposes
+    // the dispatch to [M/m_block, N/n_block] for the M-fast-varying L2 lever.
+    let cases: [(&str, Vec<WriteDescriptorSet>, u32, u32, bool); 9] = [
+        ("gemm_q4_0_k5376_n21504", f16_writes.clone(), 64, 64, false), // f16, 4×4 tiles
+        ("gemm_q4_0_swz_k5376_n21504", f16_writes.clone(), 64, 64, true), // f16 4×4 + L2 swizzle
+        ("gemm_q4_0_m2_k5376_n21504", f16_writes.clone(), 64, 32, false), // f16 2×4 (occupancy lever)
+        ("gemm_q4_0_m1_k5376_n21504", f16_writes, 64, 16, false), // f16 1×4 (occupancy lever)
+        ("gemm_q4_0_i8_k5376_n21504", i8_writes.clone(), 64, 32, false), // int8 MMQ, 2×4 tiles
+        ("gemm_q4_0_i8_t22_k5376_n21504", i8_writes.clone(), 32, 32, false), // 2×2 tiles
+        ("gemm_q4_0_i8_t12_k5376_n21504", i8_writes.clone(), 32, 16, false), // 1×2 tiles
+        ("gemm_q4_0_i8_t44_k5376_n21504", i8_writes, 64, 64, false), // 4×4 tiles (f16-equivalent)
+        ("gemm_q4_0_i8_raw_k5376_n21504", raw_writes, 64, 32, false), // int8 MMA ceiling, no rescale
     ];
 
     let flops = 2.0 * M as f64 * N as f64 * K as f64 * DISPATCHES as f64;
     let mut group = c.benchmark_group("mmq_vs_f16");
-    for (name, writes, n_block, m_block) in cases {
+    for (name, writes, n_block, m_block, swizzle) in cases {
         let kernel = ctx.load_kernel(name).expect(name);
+        // SWIZZLE=1 kernels read m-block from wg.x, n-block from wg.y → transpose.
+        let grid = if swizzle {
+            [M as u32 / m_block, N as u32 / n_block, 1]
+        } else {
+            [N as u32 / n_block, M as u32 / m_block, 1]
+        };
         let layout = kernel.layout().clone();
         let set = DescriptorSet::new(
             ctx.descriptor_set_allocator().clone(),
@@ -135,10 +144,7 @@ fn bench(c: &mut Criterion) {
                         .unwrap();
                     for _ in 0..DISPATCHES {
                         // SAFETY: tile grid covering M×N, the kernel's contract.
-                        unsafe {
-                            builder.dispatch([(N as u32 / n_block), (M as u32 / m_block), 1])
-                        }
-                        .unwrap();
+                        unsafe { builder.dispatch(grid) }.unwrap();
                     }
                     builder
                         .build()

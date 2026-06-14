@@ -446,8 +446,13 @@ with weight reuse** — 4×4/2×4/1×4 = **11.7 / 6.4 / 3.2 TFLOPS** (`gemm_q4_0
 bench: mmq_tflops) — textbook memory-bound. **So int8-vs-f16 was a sideshow: both leave the matrix
 unit ~6× idle, gated by weight-read traffic.** The lever is **weight reuse, not occupancy or the data
 type**: an N-strip is ~774 KB and fits in the 2 MB L2, so a **workgroup-order swizzle** (M-blocks
-fast-varying → one N-strip's M-blocks run consecutively, reused from L2 instead of re-streamed) should
-cut traffic — helps f16 AND int8. **Next: try the swizzle.**
+fast-varying → one N-strip's M-blocks run consecutively, reused from L2 instead of re-streamed) cuts
+traffic — helps f16 AND int8. **DONE & it works: the `SWIZZLE` define (transposed dispatch) takes f16
+4×4 from 10.6 → 12.35 TFLOPS, +16 %** (bench: mmq_tflops, `gemm_q4_0_swz_k5376_n21504`),
+bit-identical to plain (parity_gemm `gemm_q4_0_swizzle_matches_plain`) — a *free* win, no tile/resource
+change. **Next: deploy (SWIZZLE=1 on the f16 gemm variants + transpose the 8 graph dispatch sites,
+re-validate prefill_parity + e2e) and apply the same swizzle to the int8 gemm.** This is the real
+"fastest Gemma" lever — weight-traffic reduction, orthogonal to int8-vs-f16.
 
 **Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
 both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +

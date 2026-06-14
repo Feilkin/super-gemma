@@ -43,6 +43,12 @@ const N: u32 = #{N_DIM}u;
 const WG: u32 = #{WG_X}u;
 const M_TILES: u32 = #{M_TILES}u;
 const N_TILES: u32 = #{N_TILES}u;
+// Workgroup→tile mapping. 0: x=N-block, y=M-block (dispatch [N/strip, M/tile]).
+// 1: x=M-block, y=N-block — so one N-strip's M-blocks launch consecutively
+// (x-fastest order) and the ~774 KB weight strip stays hot in the 2 MB L2
+// across them instead of re-streaming from DRAM (prefill is weight-traffic-
+// bound; RGP 2026-06-14). Dispatch is transposed to [M/tile, N/strip].
+const SWIZZLE: u32 = #{SWIZZLE}u;
 const BLOCKS_PER_ROW: u32 = K / 32u;
 const STRIP_ROWS: u32 = N_TILES * 16u;
 
@@ -59,8 +65,10 @@ fn main(
     @builtin(local_invocation_id) lid_v: vec3<u32>,
 ) {
     let lid = lid_v.x;
-    let n0 = wg_id.x * STRIP_ROWS; // output-column block
-    let m0 = wg_id.y * M_TILES * 16u; // output-row block
+    let n_blk = select(wg_id.x, wg_id.y, SWIZZLE == 1u);
+    let m_blk = select(wg_id.y, wg_id.x, SWIZZLE == 1u);
+    let n0 = n_blk * STRIP_ROWS;       // output-column block
+    let m0 = m_blk * M_TILES * 16u;    // output-row block
 
     var acc: array<coop_mat16x16<f32, C>, #{ACC_LEN}>; // zero-initialized
 

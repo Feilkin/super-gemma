@@ -767,6 +767,26 @@ const VARIANTS: &[Variant] = &[
     // Occupancy-lever experiments: lower M_TILES → fewer acc VGPRs → more waves
     // (f16 prefill gemm is memory-latency-bound at 25 % occupancy; RGP 2026-06-14).
     // N_TILES stays 4 (one W-row per thread = WG_X), so b_tile LDS is unchanged.
+    // Workgroup swizzle (M-blocks fast-varying) for L2 weight-strip reuse — the
+    // memory-bound lever (RGP 2026-06-14). Dispatch is transposed in the bench.
+    Variant {
+        name: "gemm_q4_0_swz_k5376_n21504",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("M_TILES", 4),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 16),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_m2_k5376_n21504",
         src: "gemm_q4_0",
@@ -948,6 +968,8 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         // gemm_q4_0_i8 reads `#{STAGE_BUFS}`; default to 2 (double-buffer) unless
         // the variant set it in `defs` above (large-K shapes use 1 — occupancy).
         substituted = substituted.replace("#{STAGE_BUFS}", "2");
+        // gemm_q4_0 reads `#{SWIZZLE}`; default 0 (x=N, y=M) unless overridden.
+        substituted = substituted.replace("#{SWIZZLE}", "0");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {
