@@ -446,6 +446,10 @@ llama.cpp (which also Q8-quantizes attention activations). Per-layer-vs-f16 nrms
 (worst @ layer 57) — divergence *toward* llama.cpp, not quality loss; `prefill_parity --features
 int8-ffn` asserts on the **global worst** (not per-layer early-exit) with a 0.045 int8 bound. So the
 whole transformer block (attention QKV+O, FFN gate/up/down) now runs int8 under the feature.
+**O-gemm `STAGE_BUFS` tuned (measured, not assumed):** single-buffer beats double at perf=high —
+sliding k8192 **14.50 vs 12.69** (+14 %), global k16384 **14.02 vs 12.70** (+10 %); the FFN-down
+analogy held, the deployed `STAGE_BUFS=1` is optimal. `mmq_tflops` is now per-case `(k, n)` so it
+benches any shape; the `swz_s2_*` double-buffered variants stay as the slower-by-proof baseline.
 
 **THE big finding — prefill gemms are MEMORY-bound, not compute-bound (RGP, 2026-06-14).** RGP'd the
 f16 gemm (the compute-critical kernel): **memory unit 100 % busy / 99 % STALLED, VALU 4.6 %, WMMA

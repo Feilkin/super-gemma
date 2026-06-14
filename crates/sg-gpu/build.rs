@@ -613,6 +613,31 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Double-buffered (STAGE_BUFS=2) O gemms — bench-only A/B against the
+    // single-buffered deployed variants above (mmq_tflops; the O shape's K sits
+    // between FFN up's 5376 and down's 21504, so it's not obvious which wins).
+    Variant {
+        name: "gemm_q4_0_i8_swz_s2_t22_k8192_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 8192), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("STAGE_BUFS", 2), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_s2_t22_k16384_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 16384), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("STAGE_BUFS", 2), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_i8_t12_k5376_n21504",
         src: "gemm_q4_0_i8",

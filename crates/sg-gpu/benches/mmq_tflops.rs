@@ -15,10 +15,12 @@ use vulkano::pipeline::PipelineBindPoint;
 use vulkano::sync::GpuFuture;
 
 const M: usize = 512;
-const K: usize = 5376;
-const N: usize = 21504;
-const NB: usize = K / 32;
 const DISPATCHES: usize = 4;
+// Buffers are sized to the largest benched shape; each case binds the prefix it
+// needs (the kernel's K_DIM/N_DIM defines + dispatch grid bound the reads).
+const MAX_K: usize = 16384; // O global
+const MAX_N: usize = 21504; // FFN up
+const WEIGHT_NK: usize = 21504 * 5376; // largest N·K (FFN up) — covers every shape
 
 fn bench(c: &mut Criterion) {
     let ctx = match GpuContext::new() {
@@ -33,8 +35,8 @@ fn bench(c: &mut Criterion) {
         return;
     }
 
-    // f16 gemm operands.
-    let weight_words = N * K / 32 * 18 / 4;
+    // f16 gemm operands (sized to the largest shape; values irrelevant to timing).
+    let weight_words = WEIGHT_NK / 32 * 18 / 4;
     let w_f16 = ctx
         .buffer_from_iter(
             (0..weight_words as u32).map(|i| i.wrapping_mul(0x9E37_79B9)),
@@ -43,31 +45,31 @@ fn bench(c: &mut Criterion) {
         .expect("w_f16");
     let x_f16 = ctx
         .buffer_from_iter(
-            (0..M * K).map(|i| half::f16::from_f32((i % 11) as f32 * 0.05).to_bits()),
+            (0..M * MAX_K).map(|i| half::f16::from_f32((i % 11) as f32 * 0.05).to_bits()),
             BufferUsage::STORAGE_BUFFER,
         )
         .expect("x_f16");
-    // int8 MMQ operands (values irrelevant to timing).
+    // int8 MMQ operands.
     let w_i8 = ctx
         .buffer_from_iter(
-            (0..N * K).map(|i| (i % 15) as i8 - 7),
+            (0..WEIGHT_NK).map(|i| (i % 15) as i8 - 7),
             BufferUsage::STORAGE_BUFFER,
         )
         .expect("w_i8");
     let x_i8 = ctx
         .buffer_from_iter(
-            (0..M * K).map(|i| (i % 31) as i8 - 15),
+            (0..M * MAX_K).map(|i| (i % 31) as i8 - 15),
             BufferUsage::STORAGE_BUFFER,
         )
         .expect("x_i8");
     let x_sc = ctx
         .buffer_from_iter(
-            (0..M * NB).map(|i| half::f16::from_f32((i % 5) as f32 * 0.02).to_bits()),
+            (0..M * MAX_K / 32).map(|i| half::f16::from_f32((i % 5) as f32 * 0.02).to_bits()),
             BufferUsage::STORAGE_BUFFER,
         )
         .expect("x_sc");
     let y = ctx
-        .new_buffer::<u16>((M * N) as u64, BufferUsage::STORAGE_BUFFER)
+        .new_buffer::<u16>((M * MAX_N) as u64, BufferUsage::STORAGE_BUFFER)
         .expect("y");
 
     // (name, descriptor writes, n_block, m_block).
@@ -89,30 +91,37 @@ fn bench(c: &mut Criterion) {
         WriteDescriptorSet::buffer(1, x_i8.clone()),
         WriteDescriptorSet::buffer(2, y.clone()),
     ];
-    // (name, descriptor writes, n_block, m_block, swizzle). `swizzle` transposes
-    // the dispatch to [M/m_block, N/n_block] for the M-fast-varying L2 lever.
-    let cases: [(&str, Vec<WriteDescriptorSet>, u32, u32, bool); 10] = [
-        ("gemm_q4_0_k5376_n21504", f16_writes.clone(), 64, 64, false), // f16, 4×4 tiles
-        ("gemm_q4_0_swz_k5376_n21504", f16_writes.clone(), 64, 64, true), // f16 4×4 + L2 swizzle
-        ("gemm_q4_0_m2_k5376_n21504", f16_writes.clone(), 64, 32, false), // f16 2×4 (occupancy lever)
-        ("gemm_q4_0_m1_k5376_n21504", f16_writes, 64, 16, false), // f16 1×4 (occupancy lever)
-        ("gemm_q4_0_i8_k5376_n21504", i8_writes.clone(), 64, 32, false), // int8 MMQ, 2×4 tiles
-        ("gemm_q4_0_i8_t22_k5376_n21504", i8_writes.clone(), 32, 32, false), // 2×2 tiles
-        ("gemm_q4_0_i8_swz_t22_k5376_n21504", i8_writes.clone(), 32, 32, true), // 2×2 + L2 swizzle
-        ("gemm_q4_0_i8_t12_k5376_n21504", i8_writes.clone(), 32, 16, false), // 1×2 tiles
-        ("gemm_q4_0_i8_t44_k5376_n21504", i8_writes, 64, 64, false), // 4×4 tiles (f16-equivalent)
-        ("gemm_q4_0_i8_raw_k5376_n21504", raw_writes, 64, 32, false), // int8 MMA ceiling, no rescale
+    // (name, writes, n_block, m_block, swizzle, k, n). `swizzle` transposes the
+    // dispatch to [M/m_block, N/n_block] for the M-fast-varying L2 lever; (k, n)
+    // give the shape so flops + grid are computed per case.
+    let cases: [(&str, Vec<WriteDescriptorSet>, u32, u32, bool, usize, usize); 14] = [
+        ("gemm_q4_0_k5376_n21504", f16_writes.clone(), 64, 64, false, 5376, 21504), // f16, 4×4 tiles
+        ("gemm_q4_0_swz_k5376_n21504", f16_writes.clone(), 64, 64, true, 5376, 21504), // f16 4×4 + L2 swizzle
+        ("gemm_q4_0_m2_k5376_n21504", f16_writes.clone(), 64, 32, false, 5376, 21504), // f16 2×4 (occupancy lever)
+        ("gemm_q4_0_m1_k5376_n21504", f16_writes, 64, 16, false, 5376, 21504), // f16 1×4 (occupancy lever)
+        ("gemm_q4_0_i8_k5376_n21504", i8_writes.clone(), 64, 32, false, 5376, 21504), // int8 MMQ, 2×4 tiles
+        ("gemm_q4_0_i8_t22_k5376_n21504", i8_writes.clone(), 32, 32, false, 5376, 21504), // 2×2 tiles
+        ("gemm_q4_0_i8_swz_t22_k5376_n21504", i8_writes.clone(), 32, 32, true, 5376, 21504), // 2×2 + L2 swizzle
+        ("gemm_q4_0_i8_t12_k5376_n21504", i8_writes.clone(), 32, 16, false, 5376, 21504), // 1×2 tiles
+        ("gemm_q4_0_i8_t44_k5376_n21504", i8_writes.clone(), 64, 64, false, 5376, 21504), // 4×4 tiles (f16-equivalent)
+        ("gemm_q4_0_i8_raw_k5376_n21504", raw_writes, 64, 32, false, 5376, 21504), // int8 MMA ceiling, no rescale
+        // O-gemm STAGE_BUFS A/B (both swizzled 2×2): single- vs double-buffer `stage`.
+        ("gemm_q4_0_i8_swz_t22_k8192_n5376", i8_writes.clone(), 32, 32, true, 8192, 5376), // O sliding, STAGE_BUFS=1
+        ("gemm_q4_0_i8_swz_s2_t22_k8192_n5376", i8_writes.clone(), 32, 32, true, 8192, 5376), // O sliding, STAGE_BUFS=2
+        ("gemm_q4_0_i8_swz_t22_k16384_n5376", i8_writes.clone(), 32, 32, true, 16384, 5376), // O global, STAGE_BUFS=1
+        ("gemm_q4_0_i8_swz_s2_t22_k16384_n5376", i8_writes, 32, 32, true, 16384, 5376), // O global, STAGE_BUFS=2
     ];
 
-    let flops = 2.0 * M as f64 * N as f64 * K as f64 * DISPATCHES as f64;
     let mut group = c.benchmark_group("mmq_vs_f16");
-    for (name, writes, n_block, m_block, swizzle) in cases {
+    for (name, writes, n_block, m_block, swizzle, k, n) in cases {
         let kernel = ctx.load_kernel(name).expect(name);
+        let flops = 2.0 * M as f64 * n as f64 * k as f64 * DISPATCHES as f64;
+        let (n, m) = (n as u32, M as u32);
         // SWIZZLE=1 kernels read m-block from wg.x, n-block from wg.y → transpose.
         let grid = if swizzle {
-            [M as u32 / m_block, N as u32 / n_block, 1]
+            [m / m_block, n / n_block, 1]
         } else {
-            [N as u32 / n_block, M as u32 / m_block, 1]
+            [n / n_block, m / m_block, 1]
         };
         let layout = kernel.layout().clone();
         let set = DescriptorSet::new(
