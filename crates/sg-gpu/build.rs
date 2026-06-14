@@ -533,6 +533,147 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Tall-thin tile sweep (cache-blocking: M_TILES sets how many M-rows share
+    // each weight DRAM/LDS load; small N_TILES keeps `wb` LDS low for occupancy).
+    // Benched against the 2×2 above on the FFN-up shape — mmq_tflops.
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 21504), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // 4×1 on the down shape (large-K → n5376), both stage-buffer settings.
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_k21504_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 21504), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_s1_k21504_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 21504), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("STAGE_BUFS", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // 4×1 attention shapes (Q/KV/O × sliding/global) for the cache-blocking
+    // deployment — default STAGE_BUFS=2 (the 4×1 tile's low LDS makes the
+    // double buffer free even on the large-K O shapes).
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_k5376_n8192", // Q sliding
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 8192), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_k5376_n16384", // Q global
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 16384), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_k5376_n4096", // KV sliding
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 4096), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_k5376_n2048", // KV global
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 2048), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_k8192_n5376", // O sliding
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 8192), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_k16384_n5376", // O global
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 16384), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // O global single-buffered: 4×1-s2 regressed on this largest-K shape; does
+    // halving the stage LDS recover occupancy?
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_s1_k16384_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 16384), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 1), ("STAGE_BUFS", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m8n1_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 21504), ("WG_X", 64),
+                ("M_TILES", 8), ("N_TILES", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n2_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 21504), ("WG_X", 64),
+                ("M_TILES", 4), ("N_TILES", 2), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_i8_swz_t22_k21504_n5376",
         src: "gemm_q4_0_i8",

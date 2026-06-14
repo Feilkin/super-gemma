@@ -451,6 +451,23 @@ sliding k8192 **14.50 vs 12.69** (+14 %), global k16384 **14.02 vs 12.70** (+10 
 analogy held, the deployed `STAGE_BUFS=1` is optimal. `mmq_tflops` is now per-case `(k, n)` so it
 benches any shape; the `swz_s2_*` double-buffered variants stay as the slower-by-proof baseline.
 
+**Cache-blocking — tall-thin 4×1 int8 tile (2026-06-14), the structural weight-reuse win.** With the
+gemms memory-bound on weight reads, the lever beyond the swizzle is **more M-rows per weight load**:
+`M_TILES` sets how many activation tiles share each weight tile, and the weight LDS (`wb`) scales with
+`N_COLS` ONLY — so a **4×1 tile (M_TILES=4, N_TILES=1)** quadruples M-reuse while *shrinking* `wb` to
+1 KB, dropping VGPR 192→108 and lifting occupancy. Swept on `mmq_tflops` (perf=high): 4×1 beats the
+deployed 2×2 on **7 of 8 int8 shapes** — the K=5376 family big (**FFN up +29 %, Q +22/27 %, KV
++32/33 %**), the n5376 family modest (down +8 %, O-sliding +4 %); **O-global (largest K) regressed −6 %
+on double-buffer but recovers to +3 % single-buffered** (s1 — its long-K stage caps occupancy),
+mirroring the down/O `STAGE_BUFS` story. 8×1 over-spends VGPR (204) and 4×2 keeps `N_COLS=32`, both
+lose to 4×1. **Deployed all 8 int8 gemm sites to `m4n1` (O-global s1); dispatch is 64-row × 16-col
+blocks (reuses the f16 `mg = m_pad/64`).** Bit-identical (per-layer nrmse 0.04016 unchanged).
+**e2e prefill A/B (perf=high): 220/156/93 → 270/179/101 tok/s @ q0 0/8K/32K, +22.6 / +14.9 / +8.3 %.**
+Cumulative prefill arc (f16 → int8-FFN-swizzle → int8-attention → cache-blocking): **~182 → 270 tok/s
+@ q0 0**. The `m8n1`/`m4n2`/`*_s1` sweep variants stay in `mmq_tflops` as proof. Next: the same tile
+sweep may lift the **f16** gemms (decode path / non-int8 build), and a higher M_TILES could help once
+`m_pad` exceeds 64 rows reliably.
+
 **THE big finding — prefill gemms are MEMORY-bound, not compute-bound (RGP, 2026-06-14).** RGP'd the
 f16 gemm (the compute-critical kernel): **memory unit 100 % busy / 99 % STALLED, VALU 4.6 %, WMMA
 idle, 25 % occupancy (4/16 waves)** — it's memory-LATENCY-bound on the Q4_0 weight reads, achieving
