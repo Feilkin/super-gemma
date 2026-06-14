@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 mod profile;
+mod rgp;
 
 #[derive(Parser)]
 #[command(version, about = "super-gemma benchmark harness (JSON results)")]
@@ -33,6 +34,11 @@ enum Cmd {
     Prefill,
     /// Per-kernel e2e profile of decode steps and prefill chunks.
     Profile,
+    /// Single-submit dispatch of one GEMM for RGP/SQTT capture (docs/rgp-capture.md).
+    Rgp {
+        /// Kernel variant to capture (e.g. gemm_q4_0_i8_t22_k21504_n5376).
+        kernel: String,
+    },
     /// Scripted coding-agent session composite (M7+).
     AgentLoop,
 }
@@ -41,6 +47,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Profile => profile::run(&args.model),
+        Cmd::Rgp { kernel } => rgp::run(&kernel),
         cmd => anyhow::bail!(
             "`{cmd:?}` is not implemented yet; see the milestone map in this binary's docs"
         ),
