@@ -363,14 +363,16 @@ impl<'a> GpuModel<'a> {
             reduce256: load("attn_reduce_d256")?,
             reduce512: load("attn_reduce_d512")?,
             logits: load("gemv_q6_k_logits")?,
-            gemm_q_sl: load("gemm_q4_0_k5376_n8192")?,
-            gemm_q_gl: load("gemm_q4_0_k5376_n16384")?,
-            gemm_kv_sl: load("gemm_q4_0_k5376_n4096")?,
-            gemm_kv_gl: load("gemm_q4_0_k5376_n2048")?,
-            gemm_o_sl: load("gemm_q4_0_k8192_n5376")?,
-            gemm_o_gl: load("gemm_q4_0_k16384_n5376")?,
-            gemm_up: load("gemm_q4_0_k5376_n21504")?,
-            gemm_down: load("gemm_q4_0_k21504_n5376")?,
+            // Swizzled (SWIZZLE=1) prefill gemms — M-blocks fast-varying for L2
+            // weight-strip reuse; their dispatches are transposed [M/tile, N/strip].
+            gemm_q_sl: load("gemm_q4_0_swz_k5376_n8192")?,
+            gemm_q_gl: load("gemm_q4_0_swz_k5376_n16384")?,
+            gemm_kv_sl: load("gemm_q4_0_swz_k5376_n4096")?,
+            gemm_kv_gl: load("gemm_q4_0_swz_k5376_n2048")?,
+            gemm_o_sl: load("gemm_q4_0_swz_k8192_n5376")?,
+            gemm_o_gl: load("gemm_q4_0_swz_k16384_n5376")?,
+            gemm_up: load("gemm_q4_0_swz_k5376_n21504")?,
+            gemm_down: load("gemm_q4_0_swz_k21504_n5376")?,
             quant_q8: load("kv_quant_q8")?,
             gemm_up_i8: load("gemm_q4_0_i8_t22_k5376_n21504")?,
             gemm_down_i8: load("gemm_q4_0_i8_t22_k21504_n5376")?,
@@ -968,7 +970,7 @@ impl<'a> GpuModel<'a> {
                 buf(2, q_raw.clone()),
             ],
             no_push,
-            [(q_dim / 64) as u32, mg, 1],
+            [mg, (q_dim / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
         )?;
         rec.dispatch(
             gemm_kv,
@@ -978,7 +980,7 @@ impl<'a> GpuModel<'a> {
                 buf(2, kp.clone()),
             ],
             no_push,
-            [(kv_dim / 64) as u32, mg, 1],
+            [mg, (kv_dim / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
         )?;
         let vp = match &lw.attn_v {
             Some(wv) => {
@@ -990,7 +992,7 @@ impl<'a> GpuModel<'a> {
                         buf(2, p.vp_sl.clone()),
                     ],
                     no_push,
-                    [(kv_dim / 64) as u32, mg, 1],
+                    [mg, (kv_dim / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
                 )?;
                 &p.vp_sl
             }
@@ -1083,7 +1085,7 @@ impl<'a> GpuModel<'a> {
                 buf(2, p.o.clone()),
             ],
             no_push,
-            [(HIDDEN / 64) as u32, mg, 1],
+            [mg, (HIDDEN / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
         )?;
         rms(
             rec,
@@ -1146,7 +1148,7 @@ impl<'a> GpuModel<'a> {
                         buf(2, (*dst).clone()),
                     ],
                     no_push,
-                    [(FFN / 64) as u32, mg, 1],
+                    [mg, (FFN / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
                 )?;
             }
         }
@@ -1195,7 +1197,7 @@ impl<'a> GpuModel<'a> {
                     buf(2, p.f.clone()),
                 ],
                 no_push,
-                [(HIDDEN / 64) as u32, mg, 1],
+                [mg, (HIDDEN / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
             )?;
         }
         rms(rec, &self.k.rms5376, &p.f, &lw.post_ffw_norm, &p.fn2, m_pad)?;

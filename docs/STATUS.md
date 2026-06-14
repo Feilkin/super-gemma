@@ -450,9 +450,14 @@ fast-varying → one N-strip's M-blocks run consecutively, reused from L2 instea
 traffic — helps f16 AND int8. **DONE & it works: the `SWIZZLE` define (transposed dispatch) takes f16
 4×4 from 10.6 → 12.35 TFLOPS, +16 %** (bench: mmq_tflops, `gemm_q4_0_swz_k5376_n21504`),
 bit-identical to plain (parity_gemm `gemm_q4_0_swizzle_matches_plain`) — a *free* win, no tile/resource
-change. **Next: deploy (SWIZZLE=1 on the f16 gemm variants + transpose the 8 graph dispatch sites,
-re-validate prefill_parity + e2e) and apply the same swizzle to the int8 gemm.** This is the real
-"fastest Gemma" lever — weight-traffic reduction, orthogonal to int8-vs-f16.
+change. **DEPLOYED to the prefill graph (2026-06-14):** the 8 f16 gemm sites load `gemm_q4_0_swz_*`
+(SWIZZLE=1) with transposed `[M-blocks, N-blocks]` dispatch; `prefill_parity` green (bit-identical,
+worst nrmse 0.00244 unchanged). **e2e: gate/up gemm 11.3 → 9.4 ms/layer (−17 %); prefill @ q0 0
+182 → 192 tok/s (+5.6 %, the clean FFN-dominated point** — higher-q0 deltas include ±4 % cross-run
+attention noise; bench: sg-bench profile). A real prefill win, diluted e2e by the attention/rms work
+the swizzle doesn't touch. **Open: apply the swizzle to the int8 gemm too (also memory-bound), and
+consider cache-blocking for *more* reuse than L2 incidentally gives.** The plain `gemm_q4_0_k*` stay
+for the bench/parity baseline; decode is unaffected (GEMV).
 
 **Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
 both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +
