@@ -419,9 +419,22 @@ the int8 gemm `coopStore`d its output straight to `y`, which is INVISIBLE to vul
 auto-sync (like coopLoad/`touch.wgsl`) → the recorded graph raced the consumer (0.24 nrmse). The gemm
 itself was proven correct in isolation (production shapes + GPU-quant, host-synced: nrmse 2e-4); fix
 is the f16 pattern — stage `yacc`→LDS→normal-store `y` (perf-neutral, 2×2 still 10.99 vs f16 10.84).
-A latent correctness bug in the committed kernel, exposed only once it was used in a graph. **Open:
-e2e prefill *timing* (the gemm edge is only ~3 % and int8 adds the quant passes — measure net), then
-extend to the attention 6 shapes.**
+A latent correctness bug in the committed kernel, exposed only once it was used in a graph.
+
+**RGP-validated kernel fix + e2e timing (2026-06-14).** First RADV SQTT/RGP capture (`sg-bench rgp`,
+`docs/rgp-capture.md`) on the FFN down-gemm: it was **vmcnt-stalled (global weight loads) with
+occupancy capped by LDS** — NOT the per-block rescale ALU I'd inferred. The 2×2's stage round-trip
+wasn't the issue; the double-buffered `stage` was eating LDS and throttling waves, so the weight-load
+latency couldn't hide. Fix: **`STAGE_BUFS` define — single-buffer `stage` on large-K shapes** (frees
+LDS → more waves), double-buffer on small-K (the two passes' coopLoad/fill overlap, which the up shape
+needs). Down-gemm **8.0 → 5.4 ms/layer** (≈ f16's 5.6), int8-ffn prefill **162 → 176 tok/s** @ q0 0,
+now **~parity with f16** (182, within the ±5 % run-noise). The double buffer was *not* a barrier
+saving (the per-pass `da_l` barrier already orders the single-buffer reuse) — it's an overlap win,
+real only on the rescale-bound small-K shapes. **Net:** even optimized, int8-ffn is ~parity, not a
+win — the ~3 % gemm edge is offset by the activation-quant passes. int8 pays off where the quant
+amortizes over many small-K gemms: **attention Q/K/V (1 quant → 3 gemms, all K=5376) is the sweet
+spot**; the FFN (esp. down: 1 quant → 1 large-K gemm) is the worst case. **Open: f16 gemm is largely
+un-RGP'd — profile it (the `rgp` harness already captures `gemm_q4_0_k*`) before more int8 work.**
 
 **Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
 both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +

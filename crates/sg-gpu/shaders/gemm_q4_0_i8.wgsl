@@ -34,8 +34,9 @@
 //      via within-wave ILP, not occupancy.
 //   3. The outer-product fill is ×4-unrolled so independent `da_l` loads
 //      pipeline instead of one load→lgkmcnt(0)→mul→store per element.
-// `stage` is DOUBLE-BUFFERED (halves 0/1 = the two unrolled blocks). The residual
-// binder is the scale's LDS round-trip, forced by coopmat1 having no
+// `stage` is double- or single-buffered per `STAGE_BUFS` (double overlaps the
+// rescale on small-K shapes; single frees LDS for occupancy on large-K). The
+// residual binder is the scale's LDS round-trip, forced by coopmat1 having no
 // fragment-element access (can't scale the accumulator in registers).
 //
 // Element layout: `coopMultiplyAdd(A=Xᵀ-loaded, B=Wᵀ)` gives `acc[i][j]` = the
@@ -63,6 +64,11 @@ const N: u32 = #{N_DIM}u;
 const WG: u32 = #{WG_X}u;
 const M_TILES: u32 = #{M_TILES}u;
 const N_TILES: u32 = #{N_TILES}u;
+// `stage` buffering: 2 = double (one pass's coopLoad overlaps the next pass's
+// fill — wins on small-K rescale-bound shapes); 1 = single (halves the LDS →
+// more waves, wins on large-K shapes that are vmcnt-stalled with LDS-capped
+// occupancy — RGP 2026-06-14). Identical barriers either way.
+const STAGE_BUFS: u32 = #{STAGE_BUFS}u;
 
 const NB: u32 = K / 32u;            // 32-blocks per row
 const ACC: u32 = M_TILES * N_TILES; // 16×16 output tiles per workgroup
@@ -78,9 +84,9 @@ var<workgroup> wb: array<i8, N_COLS * 64u>;
 var<workgroup> dwa: array<f32, N_COLS>;
 var<workgroup> dwb: array<f32, N_COLS>;
 // The block's row scales d_a, and the outer-product scale d_a[m]·d_w[n]
-// (DOUBLE-BUFFERED, halves 0/1; buffer 0 also the f32→f16 epilogue scratch).
+// (STAGE_BUFS halves; buffer 0 also the f32→f16 epilogue scratch).
 var<workgroup> da_l: array<f32, M_ROWS>;
-var<workgroup> stage: array<f32, 2u * TILE_ELEMS>;
+var<workgroup> stage: array<f32, STAGE_BUFS * TILE_ELEMS>;
 
 // Unpack one Q4_0 block (4 qs words in registers) to i8 (q−8) at wb[base..+32].
 // Low nibble of byte j → position j, high nibble → position 16+j (the
@@ -173,14 +179,19 @@ fn main(
 
         // Rescale both blocks into yacc. Each `u` is one block: load its row
         // scales `d_a`, form the outer product with the block's `d_w` (dwa/dwb)
-        // in its `stage` half, then yacc += scale · f32(dot).
+        // in its `stage` buffer (`base`), then yacc += scale · f32(dot). At
+        // STAGE_BUFS=2 the two passes use different halves (overlap); at 1 they
+        // share one (the next pass's `da_l` barrier already orders this pass's
+        // coopLoad before the overwrite, so no extra barrier either way).
         for (var u = 0u; u < 2u; u += 1u) {
             let bb = beta + u;
             for (var i = lid; i < M_ROWS; i += WG) {
                 da_l[i] = f32(x_scales[(m0 + i) * NB + bb]);
             }
-            workgroupBarrier(); // da_l written before the outer product reads it
-            let base = u * TILE_ELEMS;
+            // da_l written; at STAGE_BUFS=1 also orders the previous pass's stage
+            // coopLoad before this pass overwrites `stage`.
+            workgroupBarrier();
+            let base = (u % STAGE_BUFS) * TILE_ELEMS;
             let n = lid % N_COLS;
             let dw = select(dwb[n], dwa[n], u == 0u);
             // ×4-unrolled column walk so independent da_l loads pipeline.

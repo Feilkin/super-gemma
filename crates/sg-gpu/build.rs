@@ -478,6 +478,7 @@ const VARIANTS: &[Variant] = &[
             ("WG_X", 64),
             ("M_TILES", 1),
             ("N_TILES", 2),
+            ("STAGE_BUFS", 1), // single-buffer path parity coverage
         ],
         workgroup: [64, 1, 1],
         bindings: 4,
@@ -511,6 +512,7 @@ const VARIANTS: &[Variant] = &[
             ("WG_X", 64),
             ("M_TILES", 2),
             ("N_TILES", 2),
+            ("STAGE_BUFS", 1), // large-K: single-buffer stage (occupancy; RGP)
         ],
         workgroup: [64, 1, 1],
         bindings: 4,
@@ -906,6 +908,9 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         ] {
             substituted = substituted.replace(&format!("#{{{k}}}"), &v.to_string());
         }
+        // gemm_q4_0_i8 reads `#{STAGE_BUFS}`; default to 2 (double-buffer) unless
+        // the variant set it in `defs` above (large-K shapes use 1 — occupancy).
+        substituted = substituted.replace("#{STAGE_BUFS}", "2");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {
