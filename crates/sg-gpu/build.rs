@@ -764,6 +764,43 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Occupancy-lever experiments: lower M_TILES → fewer acc VGPRs → more waves
+    // (f16 prefill gemm is memory-latency-bound at 25 % occupancy; RGP 2026-06-14).
+    // N_TILES stays 4 (one W-row per thread = WG_X), so b_tile LDS is unchanged.
+    Variant {
+        name: "gemm_q4_0_m2_k5376_n21504",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("M_TILES", 2),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 8),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_m1_k5376_n21504",
+        src: "gemm_q4_0",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("M_TILES", 1),
+            ("N_TILES", 4),
+            ("B_TILE_LEN", 4096),
+            ("ACC_LEN", 4),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_k21504_n5376",
         src: "gemm_q4_0",

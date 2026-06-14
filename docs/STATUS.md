@@ -433,8 +433,21 @@ saving (the per-pass `da_l` barrier already orders the single-buffer reuse) — 
 real only on the rescale-bound small-K shapes. **Net:** even optimized, int8-ffn is ~parity, not a
 win — the ~3 % gemm edge is offset by the activation-quant passes. int8 pays off where the quant
 amortizes over many small-K gemms: **attention Q/K/V (1 quant → 3 gemms, all K=5376) is the sweet
-spot**; the FFN (esp. down: 1 quant → 1 large-K gemm) is the worst case. **Open: f16 gemm is largely
-un-RGP'd — profile it (the `rgp` harness already captures `gemm_q4_0_k*`) before more int8 work.**
+spot**; the FFN (esp. down: 1 quant → 1 large-K gemm) is the worst case.
+
+**THE big finding — prefill gemms are MEMORY-bound, not compute-bound (RGP, 2026-06-14).** RGP'd the
+f16 gemm (the compute-critical kernel): **memory unit 100 % busy / 99 % STALLED, VALU 4.6 %, WMMA
+idle, 25 % occupancy (4/16 waves)** — it's memory-LATENCY-bound on the Q4_0 weight reads, achieving
+**~46 GB/s of the 256 GB/s** unified LPDDR5x (the "0.5 GB VRAM" is a framebuffer carve-out of the same
+memory, not faster). GPU **L2 is only 2 MB** « the 65 MB weight matrix, so weights stream from DRAM
+and get re-read once per M-block. Occupancy is structurally capped (LDS `b_tile` pinned by N_TILES=4);
+lowering M_TILES did NOT raise it (192 VGPR / 9216 LDS unchanged) but throughput scaled **linearly
+with weight reuse** — 4×4/2×4/1×4 = **11.7 / 6.4 / 3.2 TFLOPS** (`gemm_q4_0_{,m2_,m1_}k5376_n21504`,
+bench: mmq_tflops) — textbook memory-bound. **So int8-vs-f16 was a sideshow: both leave the matrix
+unit ~6× idle, gated by weight-read traffic.** The lever is **weight reuse, not occupancy or the data
+type**: an N-strip is ~774 KB and fits in the 2 MB L2, so a **workgroup-order swizzle** (M-blocks
+fast-varying → one N-strip's M-blocks run consecutively, reused from L2 instead of re-streamed) should
+cut traffic — helps f16 AND int8. **Next: try the swizzle.**
 
 **Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
 both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +
