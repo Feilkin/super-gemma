@@ -435,6 +435,18 @@ win — the ~3 % gemm edge is offset by the activation-quant passes. int8 pays o
 amortizes over many small-K gemms: **attention Q/K/V (1 quant → 3 gemms, all K=5376) is the sweet
 spot**; the FFN (esp. down: 1 quant → 1 large-K gemm) is the worst case.
 
+**Sweet spot CONFIRMED — whole attention block on int8 (2026-06-14), behind `--features int8-ffn`.**
+Extended the int8 path from FFN-only to attention: Q8-quantize `xn` ONCE (shared by Q/K/V — `[mg2,
+N/32]` swizzled 2×2 gemms) and the attention output once (→ O gemm). 6 new swizzled int8 variants
+(Q/KV/O × sliding/global; O carries `STAGE_BUFS=1` like FFN down — same large-K→n5376 shape). **e2e
+prefill A/B (perf=high): 206/148/91 → 220/156/93 tok/s @ q0 0/8K/32K, +7.0 / +5.2 / +3.2 %** — a real
+win, unlike FFN's parity, exactly because the single `xn` quant amortizes over 3 gemms. **Quality:
+perplexity still within tolerance** (code 21.95 vs 22.33; wikitext <0.5 %) — int8 attention tracks
+llama.cpp (which also Q8-quantizes attention activations). Per-layer-vs-f16 nrmse rises to **0.040**
+(worst @ layer 57) — divergence *toward* llama.cpp, not quality loss; `prefill_parity --features
+int8-ffn` asserts on the **global worst** (not per-layer early-exit) with a 0.045 int8 bound. So the
+whole transformer block (attention QKV+O, FFN gate/up/down) now runs int8 under the feature.
+
 **THE big finding — prefill gemms are MEMORY-bound, not compute-bound (RGP, 2026-06-14).** RGP'd the
 f16 gemm (the compute-critical kernel): **memory unit 100 % busy / 99 % STALLED, VALU 4.6 %, WMMA
 idle, 25 % occupancy (4/16 waves)** — it's memory-LATENCY-bound on the Q4_0 weight reads, achieving

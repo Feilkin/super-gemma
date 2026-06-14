@@ -544,6 +544,75 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Swizzled int8 ATTENTION gemms (feature int8-ffn): Q/K/V read the shared
+    // Q8-quantized `xn` (K=5376), O reads the Q8-quantized attention output.
+    // Sliding/global differ in head count → distinct N (Q/KV) or K (O).
+    Variant {
+        name: "gemm_q4_0_i8_swz_t22_k5376_n8192", // Q sliding
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 8192), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_t22_k5376_n16384", // Q global
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 16384), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_t22_k5376_n4096", // KV sliding
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 4096), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_t22_k5376_n2048", // KV global
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 2048), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_t22_k8192_n5376", // O sliding (large-K → n5376)
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 8192), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("STAGE_BUFS", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_t22_k16384_n5376", // O global
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 16384), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("STAGE_BUFS", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_i8_t12_k5376_n21504",
         src: "gemm_q4_0_i8",
