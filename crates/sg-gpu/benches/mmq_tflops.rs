@@ -91,13 +91,14 @@ fn bench(c: &mut Criterion) {
     ];
     // (name, descriptor writes, n_block, m_block, swizzle). `swizzle` transposes
     // the dispatch to [M/m_block, N/n_block] for the M-fast-varying L2 lever.
-    let cases: [(&str, Vec<WriteDescriptorSet>, u32, u32, bool); 9] = [
+    let cases: [(&str, Vec<WriteDescriptorSet>, u32, u32, bool); 10] = [
         ("gemm_q4_0_k5376_n21504", f16_writes.clone(), 64, 64, false), // f16, 4×4 tiles
         ("gemm_q4_0_swz_k5376_n21504", f16_writes.clone(), 64, 64, true), // f16 4×4 + L2 swizzle
         ("gemm_q4_0_m2_k5376_n21504", f16_writes.clone(), 64, 32, false), // f16 2×4 (occupancy lever)
         ("gemm_q4_0_m1_k5376_n21504", f16_writes, 64, 16, false), // f16 1×4 (occupancy lever)
         ("gemm_q4_0_i8_k5376_n21504", i8_writes.clone(), 64, 32, false), // int8 MMQ, 2×4 tiles
         ("gemm_q4_0_i8_t22_k5376_n21504", i8_writes.clone(), 32, 32, false), // 2×2 tiles
+        ("gemm_q4_0_i8_swz_t22_k5376_n21504", i8_writes.clone(), 32, 32, true), // 2×2 + L2 swizzle
         ("gemm_q4_0_i8_t12_k5376_n21504", i8_writes.clone(), 32, 16, false), // 1×2 tiles
         ("gemm_q4_0_i8_t44_k5376_n21504", i8_writes, 64, 64, false), // 4×4 tiles (f16-equivalent)
         ("gemm_q4_0_i8_raw_k5376_n21504", raw_writes, 64, 32, false), // int8 MMA ceiling, no rescale

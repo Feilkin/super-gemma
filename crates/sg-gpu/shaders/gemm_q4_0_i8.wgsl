@@ -69,6 +69,10 @@ const N_TILES: u32 = #{N_TILES}u;
 // more waves, wins on large-K shapes that are vmcnt-stalled with LDS-capped
 // occupancy — RGP 2026-06-14). Identical barriers either way.
 const STAGE_BUFS: u32 = #{STAGE_BUFS}u;
+// Workgroup→tile mapping (see gemm_q4_0.wgsl): 0 = x:N, y:M; 1 = x:M, y:N so one
+// N-strip's M-blocks launch consecutively and its weight strip stays hot in L2
+// (prefill is weight-traffic-bound — RGP 2026-06-14). Dispatch transposed at 1.
+const SWIZZLE: u32 = #{SWIZZLE}u;
 
 const NB: u32 = K / 32u;            // 32-blocks per row
 const ACC: u32 = M_TILES * N_TILES; // 16×16 output tiles per workgroup
@@ -110,8 +114,10 @@ fn main(
     @builtin(local_invocation_id) lid_v: vec3<u32>,
 ) {
     let lid = lid_v.x;
-    let m0 = wg.y * M_ROWS; // output row block base
-    let n0 = wg.x * N_COLS; // output col block base
+    let m_blk = select(wg.y, wg.x, SWIZZLE == 1u);
+    let n_blk = select(wg.x, wg.y, SWIZZLE == 1u);
+    let m0 = m_blk * M_ROWS; // output row block base
+    let n0 = n_blk * N_COLS; // output col block base
 
     var zero_i: coop_mat16x16<i32, C>;
     var zero_f: coop_mat16x16<f32, C>;

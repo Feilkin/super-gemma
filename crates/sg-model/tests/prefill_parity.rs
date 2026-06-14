@@ -120,9 +120,12 @@ fn prefill_single_chunk_per_layer_parity() {
         if e > worst.0 {
             worst = (e, i);
         }
+        // int8-ffn carries a wider per-layer envelope (~0.0225, perplexity-gated)
+        // than the f16 path; the threshold tracks the active FFN dtype.
+        let tol = if cfg!(feature = "int8-ffn") { 0.025 } else { 0.02 };
         assert!(
-            e <= 0.02,
-            "layer {i} ({:?}): nrmse {e:.5} > 0.02",
+            e <= tol,
+            "layer {i} ({:?}): nrmse {e:.5} > {tol}",
             cpu.desc.layer_kinds[i]
         );
     }

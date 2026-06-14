@@ -374,8 +374,8 @@ impl<'a> GpuModel<'a> {
             gemm_up: load("gemm_q4_0_swz_k5376_n21504")?,
             gemm_down: load("gemm_q4_0_swz_k21504_n5376")?,
             quant_q8: load("kv_quant_q8")?,
-            gemm_up_i8: load("gemm_q4_0_i8_t22_k5376_n21504")?,
-            gemm_down_i8: load("gemm_q4_0_i8_t22_k21504_n5376")?,
+            gemm_up_i8: load("gemm_q4_0_i8_swz_t22_k5376_n21504")?,
+            gemm_down_i8: load("gemm_q4_0_i8_swz_t22_k21504_n5376")?,
             prefill_sl: load("attn_prefill_sliding_ring")?,
             prefill_gl: load("attn_prefill_global")?,
             touch: load("touch")?,
@@ -1135,7 +1135,7 @@ impl<'a> GpuModel<'a> {
                         buf(3, (*dst).clone()),
                     ],
                     no_push,
-                    [(FFN / 32) as u32, mg2, 1],
+                    [mg2, (FFN / 32) as u32, 1], // swizzled: [M-blocks, N-blocks]
                 )?;
             }
         } else {
@@ -1185,7 +1185,7 @@ impl<'a> GpuModel<'a> {
                     buf(3, p.f.clone()),
                 ],
                 no_push,
-                [(HIDDEN / 32) as u32, mg2, 1],
+                [mg2, (HIDDEN / 32) as u32, 1], // swizzled: [M-blocks, N-blocks]
             )?;
         } else {
             touch(rec, &p.gu)?;

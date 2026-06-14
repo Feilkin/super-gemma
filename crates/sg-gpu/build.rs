@@ -520,6 +520,30 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Swizzled int8 FFN gemms (SWIZZLE=1 → graph dispatches transposed) for the
+    // L2 weight-reuse lever; plain `t22_*` stay for bench/parity baseline.
+    Variant {
+        name: "gemm_q4_0_i8_swz_t22_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 5376), ("N_DIM", 21504), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_t22_k21504_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[("K_DIM", 21504), ("N_DIM", 5376), ("WG_X", 64),
+                ("M_TILES", 2), ("N_TILES", 2), ("STAGE_BUFS", 1), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_i8_t12_k5376_n21504",
         src: "gemm_q4_0_i8",
