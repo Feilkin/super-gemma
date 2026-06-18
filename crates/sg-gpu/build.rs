@@ -570,6 +570,20 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Max-occupancy 1×1 variant (gemm_q4_0_i8_occ): one 16×16 output block per
+    // workgroup, minimal VGPR → many waves/SIMD. The occupancy-side A/B against
+    // the deployed 4×1 on the down shape — does latency-hiding-by-occupancy beat
+    // in-register weight reuse? (mmq_variance + RGP wave count; STATUS rank #2.)
+    Variant {
+        name: "gemm_q4_0_i8_occ_k21504_n5376",
+        src: "gemm_q4_0_i8_occ",
+        defs: &[("K_DIM", 21504), ("N_DIM", 5376), ("WG_X", 64), ("SWIZZLE", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // 4×1 attention shapes (Q/KV/O × sliding/global) for the cache-blocking
     // deployment — default STAGE_BUFS=2 (the 4×1 tile's low LDS makes the
     // double buffer free even on the large-K O shapes).

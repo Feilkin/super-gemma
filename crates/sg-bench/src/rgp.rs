@@ -19,6 +19,10 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         // tiling (graph.rs); the occupancy/L2 recapture target (STATUS).
         "gemm_q4_0_i8_swz_m4n1_k21504_n5376" => (21504, 5376, 16, 64, true, true), // FFN down
         "gemm_q4_0_i8_swz_m4n1_k5376_n21504" => (5376, 21504, 16, 64, true, true), // FFN gate/up
+        // int8 max-occupancy 1×1 (N-block = M-block = 16) — the occupancy-vs-reuse
+        // A/B against the deployed 4×1 down-gemm (mmq_variance −47.8%; this trace
+        // confirms it reached high occupancy yet lost — STATUS rank #2).
+        "gemm_q4_0_i8_occ_k21504_n5376" => (21504, 5376, 16, 16, true, true), // FFN down, 1×1
         // int8 2×2 (N-block = M-block = 32) — the pre-cache-block baseline.
         "gemm_q4_0_i8_t22_k21504_n5376" => (21504, 5376, 32, 32, true, false), // FFN down
         "gemm_q4_0_i8_t22_k5376_n21504" => (5376, 21504, 32, 32, true, false), // FFN gate/up

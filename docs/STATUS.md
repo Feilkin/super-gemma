@@ -485,8 +485,20 @@ round-robin harness, since the delta is below `mmq_tflops`'s run-to-run swing); 
 271 → 287 tok/s (+5.9 %, the clean FFN-dominated point)**, 8K/32K move within the attention-noise
 band. `parity_mmq` + `prefill_parity --features int8-ffn` green. RGP after: the up-front vmcnt stall
 is gone (2412 → 898), and the residual 898-clk first-WMMA wait is raw memory latency with no more
-independent work to hide it behind at 3 waves — i.e. this kernel structure is at its practical floor;
-the remaining lever is a **max-occupancy / skip-LDS rewrite** to clear the 3→6 wave cliff (next).
+independent work to hide it behind at 3 waves — i.e. this kernel structure is at its practical floor.
+**Max-occupancy rewrite TESTED AND KILLED (2026-06-18).** `gemm_q4_0_i8_occ.wgsl` is the clean
+min-footprint mirror of the deployed kernel (1×1 tile, de-interleaved β-loop, no prefetch,
+single-buffer scale): it compiles to **60 VGPR vs 144** and RGP confirms it reached **11/16 waves vs
+the deployed 3/16** — yet it lost **8.32 vs 15.95 TFLOPS = −47.8 %** (bench: `mmq_variance`, perf=high,
+CV 0.41 %). The mechanism (RGP): despite 11 waves it pulls **LESS** memory bandwidth — **VMEM util
+4.6 % (occ) vs 8.5 % (deployed)** — because 1×1 produces only 16 M-rows per weight strip vs 64, paying
+~4× the weight unpack + L2→L1 traffic + 4× the workgroup launches; the extra waves just multiply stall
+sites (occ **5-6 sites of 600-1600 clk** vs the deployed **single 956-clk**) instead of hiding latency.
+**Occupancy ≠ memory throughput here; the lever is weight REUSE, not occupancy** — the deployed 4×1 +
+prefetch kernel extracts ~2× the VMEM with ¼ the waves and is at its real floor. The "skip-LDS B"
+idea is separately blocked (Q4_0 is 4-bit packed → must unpack to i8 before any `coopLoad`, and you
+can't coopLoad from registers). occ kernel kept as the documented dead-end baseline (`mmq_variance`
+`occ 1×1` row + `rgp` target `gemm_q4_0_i8_occ_k21504_n5376`), like the `*_s1` variant.
 Audited alongside: single-buffered scale (`STAGE_BUFS=1`) is **−2.1 %** (frees LDS but never crosses
 a wave threshold, so it just loses the buffering) and the β×2 MMA interleaving is neutral (+0.0 % vs a
 de-interleaved variant) — both confirmed on the same stable harness; the `*_s1` variant stays as the
