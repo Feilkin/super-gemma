@@ -40,6 +40,10 @@ name = "gemm_variance"
 harness = false
 
 [[bench]]
+name = "mmq_variance"
+harness = false
+
+[[bench]]
 name = "attn_us"
 harness = false
 

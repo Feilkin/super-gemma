@@ -321,15 +321,16 @@ Consequences, both landed:
 
 Measured (median of 5, this box; bench: `sg-bench profile`). The original table below was taken at
 `perf=auto`, which idles the fabric clock and reads ~30 % low (2026-06-13). **Current prefill at
-`perf=high` (2026-06-18, incl. the single-pass flash attention below): f16 default 187 / 143 / 99
-tok/s; with `--features int8-ffn` (whole block int8 + L2 swizzle + 4×1 cache-blocking) 271 / 186 / 114
-tok/s @ q0 0 / 8K / 32K** — see the per-optimization sections. Decode is unaffected (GEMV path).
+`perf=high` (2026-06-18, incl. the single-pass flash attention + deep weight prefetch below): f16
+default 187 / 143 / 99 tok/s; with `--features int8-ffn` (whole block int8 + L2 swizzle + 4×1
+cache-blocking + weight prefetch) 287 / 193 / 116 tok/s @ q0 0 / 8K / 32K** — see the per-optimization
+sections. Decode is unaffected (GEMV path).
 Targets are from plan 06.
 
 | Phase | Result (perf=auto) | Target (plan 06) |
 |---|---|---|
 | decode @ 1K / 8K / 32K | **11.7 / 11.4 / 10.3 tok/s** | ≥ 10 / 10 / 9.5 ✓ |
-| prefill 256-chunk @ q0 0 / 8K / 32K | **187 / 143 / 99** (high, f16); **271 / 186 / 114** (high, int8-ffn) | ≥ 300 ✗ |
+| prefill 256-chunk @ q0 0 / 8K / 32K | **187 / 143 / 99** (high, f16); **287 / 193 / 116** (high, int8-ffn) | ≥ 300 ✗ |
 | CPU per decode step | stage 23 µs + sampler ≤ 423 µs + overhead ~310 µs | ≪ 75 ms budget ✓ |
 
 Optimization ranking (per-layer medians from the rep-layer breakdown):
@@ -471,6 +472,25 @@ Cumulative prefill arc (f16 → int8-FFN-swizzle → int8-attention → cache-bl
 @ q0 0**. The `m8n1`/`m4n2`/`*_s1` sweep variants stay in `mmq_tflops` as proof. Next: the same tile
 sweep may lift the **f16** gemms (decode path / non-int8 build), and a higher M_TILES could help once
 `m_pad` exceeds 64 rows reliably.
+
+**Deep weight prefetch — software-pipelined the Q4_0 weight load (2026-06-18, banked).** At the 4×1
+tile's low (3-wave) occupancy the int8 down-gemm could not hide the DRAM weight-read latency by
+switching waves, so RGP showed *every* WMMA preceded by an exposed `s_waitcnt vmcnt` (the up-front
+stall was 2412 clk). Fix is in-wave ILP, not occupancy: load each block-pair's 9 weight words into a
+register double-buffer (`w_cur`/`w_next`) **one β-iteration ahead**, so the load latency hides behind
+the current iteration's MMA + rescale and the vmcnt wait lands at the next `w_cur = w_next` (by which
+time it's done). Folded into the shared `gemm_q4_0_i8.wgsl`, so **all 8 int8 gemm sites** inherit it.
+**+6.1 % kernel (15.28 → 16.20 TFLOPS, down shape, CV 0.77 %, bench: `mmq_variance` — the warm-up +
+round-robin harness, since the delta is below `mmq_tflops`'s run-to-run swing); e2e prefill @ q0 0
+271 → 287 tok/s (+5.9 %, the clean FFN-dominated point)**, 8K/32K move within the attention-noise
+band. `parity_mmq` + `prefill_parity --features int8-ffn` green. RGP after: the up-front vmcnt stall
+is gone (2412 → 898), and the residual 898-clk first-WMMA wait is raw memory latency with no more
+independent work to hide it behind at 3 waves — i.e. this kernel structure is at its practical floor;
+the remaining lever is a **max-occupancy / skip-LDS rewrite** to clear the 3→6 wave cliff (next).
+Audited alongside: single-buffered scale (`STAGE_BUFS=1`) is **−2.1 %** (frees LDS but never crosses
+a wave threshold, so it just loses the buffering) and the β×2 MMA interleaving is neutral (+0.0 % vs a
+de-interleaved variant) — both confirmed on the same stable harness; the `*_s1` variant stays as the
+standing occupancy A/B baseline, the bc/pfseq prototypes were culled.
 
 **THE big finding — prefill gemms are MEMORY-bound, not compute-bound (RGP, 2026-06-14).** RGP'd the
 f16 gemm (the compute-critical kernel): **memory unit 100 % busy / 99 % STALLED, VALU 4.6 %, WMMA

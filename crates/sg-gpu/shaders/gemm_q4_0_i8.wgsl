@@ -128,37 +128,49 @@ fn main(
         yacc[i] = zero_f;
     }
 
+    // Prefetch block-pair 0's 9 weight words into registers (the prologue of
+    // the software pipeline; each thread owns one W row's words). Loading the
+    // next pair one iteration ahead hides the DRAM weight-load latency behind
+    // the current iteration's MMA + rescale instead of stalling the WMMAs on
+    // vmcnt — the right lever at this kernel's low (3-wave) occupancy.
+    var w_next: array<u32, 9>;
+    if (lid < N_COLS) {
+        let wb0 = (n0 + lid) * ROW_WORDS;
+        for (var i = 0u; i < 9u; i += 1u) {
+            w_next[i] = weights[wb0 + i];
+        }
+    }
+
     // β-loop unrolled ×2 = one Q4_0 block PAIR (64 K) per iteration.
     for (var beta = 0u; beta < NB; beta += 2u) {
         for (var i = 0u; i < ACC; i += 1u) {
             acc[i] = zero_i;
             acc2[i] = zero_i;
         }
-        // Each thread (one W row) bulk-loads + unpacks its aligned 9-word block
-        // pair into `wb`, and writes the two block scales.
+        // Consume this pair's prefetched words, then ISSUE the next pair's load
+        // now (its DRAM latency hides behind this iteration's MMA + rescale; the
+        // vmcnt wait lands at next iteration's `w_cur = w_next`, by which time
+        // the load is done). Each thread unpacks its 9-word block pair into `wb`.
+        let w_cur = w_next;
+        if (lid < N_COLS && beta + 2u < NB) {
+            let wbn = (n0 + lid) * ROW_WORDS + ((beta + 2u) / 2u) * 9u;
+            for (var i = 0u; i < 9u; i += 1u) {
+                w_next[i] = weights[wbn + i];
+            }
+        }
         if (lid < N_COLS) {
-            let wbase = (n0 + lid) * ROW_WORDS + (beta / 2u) * 9u;
-            let w0 = weights[wbase];
-            let w1 = weights[wbase + 1u];
-            let w2 = weights[wbase + 2u];
-            let w3 = weights[wbase + 3u];
-            let w4 = weights[wbase + 4u];
-            let w5 = weights[wbase + 5u];
-            let w6 = weights[wbase + 6u];
-            let w7 = weights[wbase + 7u];
-            let w8 = weights[wbase + 8u];
-            // Block β: d in w0.lo, 16 qs bytes spanning w0.hi..w4.lo.
-            dwa[lid] = unpack2x16float(w0).x;
+            // Block β: d in w_cur[0].lo, 16 qs bytes spanning w_cur[0].hi..[4].lo.
+            dwa[lid] = unpack2x16float(w_cur[0]).x;
             unpack_block(
-                (w0 >> 16u) | (w1 << 16u),
-                (w1 >> 16u) | (w2 << 16u),
-                (w2 >> 16u) | (w3 << 16u),
-                (w3 >> 16u) | (w4 << 16u),
+                (w_cur[0] >> 16u) | (w_cur[1] << 16u),
+                (w_cur[1] >> 16u) | (w_cur[2] << 16u),
+                (w_cur[2] >> 16u) | (w_cur[3] << 16u),
+                (w_cur[3] >> 16u) | (w_cur[4] << 16u),
                 lid * 64u,
             );
-            // Block β+1: d in w4.hi, qs in w5..w8.
-            dwb[lid] = unpack2x16float(w4).y;
-            unpack_block(w5, w6, w7, w8, lid * 64u + 32u);
+            // Block β+1: d in w_cur[4].hi, qs in w_cur[5..8].
+            dwb[lid] = unpack2x16float(w_cur[4]).y;
+            unpack_block(w_cur[5], w_cur[6], w_cur[7], w_cur[8], lid * 64u + 32u);
         }
         workgroupBarrier(); // wb + dwa/dwb written before MMA / rescale read them
 
