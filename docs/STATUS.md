@@ -321,23 +321,25 @@ Consequences, both landed:
 
 Measured (median of 5, this box; bench: `sg-bench profile`). The original table below was taken at
 `perf=auto`, which idles the fabric clock and reads ~30 % low (2026-06-13). **Current prefill at
-`perf=high` (2026-06-14, the optimization arc below): f16 default ~192 tok/s @ q0 0; with
-`--features int8-ffn` (whole block int8 + L2 swizzle + 4×1 cache-blocking) 270 / 179 / 101 tok/s @
-q0 0 / 8K / 32K** — see the per-optimization sections. Decode is unaffected by that arc (GEMV path).
+`perf=high` (2026-06-18, incl. the single-pass flash attention below): f16 default 187 / 143 / 99
+tok/s; with `--features int8-ffn` (whole block int8 + L2 swizzle + 4×1 cache-blocking) 271 / 186 / 114
+tok/s @ q0 0 / 8K / 32K** — see the per-optimization sections. Decode is unaffected (GEMV path).
 Targets are from plan 06.
 
 | Phase | Result (perf=auto) | Target (plan 06) |
 |---|---|---|
 | decode @ 1K / 8K / 32K | **11.7 / 11.4 / 10.3 tok/s** | ≥ 10 / 10 / 9.5 ✓ |
-| prefill 256-chunk @ q0 0 / 8K / 32K | **179 / 128 / 83** (auto); **270 / 179 / 101** (high, int8-ffn) | ≥ 300 ✗ |
+| prefill 256-chunk @ q0 0 / 8K / 32K | **187 / 143 / 99** (high, f16); **271 / 186 / 114** (high, int8-ffn) | ≥ 300 ✗ |
 | CPU per decode step | stage 23 µs + sampler ≤ 423 µs + overhead ~310 µs | ≪ 75 ms budget ✓ |
 
 Optimization ranking (per-layer medians from the rep-layer breakdown):
 
-1. **`attn_prefill_global`: 0.42 → 35.6 → 141 ms/layer at q0 0 / 8K / 32K** — 46 % of the
-   chunk at 32K and growing linearly per chunk (quadratic per prompt). The coopmat
-   flash-attention rewrite is both the prefill-throughput fix at context and the
-   watchdog-pressure fix. Clear #1.
+1. **`attn_prefill_global`: was 0.42 → 35.6 → 141 ms/layer at q0 0 / 8K / 32K** — 46 % of the
+   chunk at 32K and growing linearly per chunk (quadratic per prompt). **ADDRESSED (2026-06-18):**
+   the single-pass coopmat flash rewrite (`attn_prefill_global_flash_sp`) is wired and drops the
+   dominant 32K layer to ~118 ms (−19 % kernel; +12–16 % e2e prefill at 32K, the watchdog-pressure
+   fix too) — see the rank-#1 flash section. Was the clear #1; remaining prefill gap to the ≥300
+   target is L2 weight traffic + attention still being O(ctx²).
 2. **Coopmat GEMM** — the FFN pair (`n21504` + `n5376`) is ~70 % of short-context prefill. **LARGELY
    ADDRESSED (2026-06-14, behind `--features int8-ffn`):** the whole transformer block runs int8-MMQ
    (Q4_0 × Q8) with the L2 swizzle and the 4×1 cache-blocked tile — see the dedicated sections below.
@@ -503,15 +505,59 @@ blocking for *more* reuse than the 2 MB L2 incidentally gives — DONE, the 4×1
 The plain `gemm_q4_0_k*` / `gemm_q4_0_i8_t22_*` stay for the bench/parity baseline; decode is
 unaffected (GEMV).
 
-**Rank #1 — coopmat flash rewrite of `attn_prefill_global`: parked (regressed twice).** Two designs
-both lost to the naive scalar kernel — (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 +
-barrier-bound rescale); (b) register-O two-pass: ~1.2× slower (0.66 / 42.6 / 168 ms-per-layer vs
-naive 0.42 / 35.6 / 141 @ q0 0/8K/32K; bench: `sg-bench profile` — measured at perf=auto, re-measure
-at high). Same root cause as int8's barrier problem: KHR coopmat1 (the box has this, not
-NV_coopmat2) has no per-element fragment access. `attn_prefill_global_flash.wgsl` + its parity case
-stay in-tree (unwired). **Revisit once the coopmat-arith ops land** — the same convert /
-component-wise ops may enable a better in-register flash rescale; the naive kernel stays in use
-meanwhile.
+**Rank #1 — coopmat flash rewrite of `attn_prefill_global`: two parked designs both lost; building a
+third.** (a) LDS-resident O: 2–3× slower (32 KB o_lds → occupancy 1 + barrier-bound rescale),
+discarded. (b) register-O two-pass (`attn_prefill_global_flash.wgsl`, in-tree + parity case): still
+loses. **Re-measured at perf=high (2026-06-18, bench: `attn_us` group `attn_flash_cmp`, naive vs
+flash µs/chunk):**
+
+| ctx | naive (deployed) | flash v2 two-pass | flash/naive |
+|---|---|---|---|
+| 256 (q0≈0) | 0.48 ms | 0.63 ms | 1.31× |
+| 8K | 33.8 ms | 40.9 ms | 1.21× |
+| 32K | 147 ms | 164 ms | 1.11× |
+
+Pinning `high` did **not** flip it — both kernels are memory/latency-bound, so the fabric clock buys
+them ~nothing (naive unchanged vs the perf=auto 0.42/35.6/141; flash 0.66/42.6/168→0.63/40.9/164).
+The gap narrows with context (1.31→1.21→1.11×) but never crosses: v2 pays for QKᵀ **twice** (two-pass,
+to avoid the per-tile rescale coopmat1 can't express in registers), and that recompute cancels the
+matrix-unit win. Root cause is the int8 barrier problem: KHR coopmat1 (this box, not NV_coopmat2) has
+no per-element fragment access.
+
+**Design (c) — single-pass flash with in-register rescale: BUILT & WINS (2026-06-18).**
+`attn_prefill_global_flash_sp.wgsl` computes QKᵀ **once**; the online-softmax rescale
+`O *= exp(m_old − m_new)` is a single component-wise coopmat multiply — build a row-broadcast `corr`
+fragment in LDS, `coopLoad` it as `coop_mat16x16<f32, C>`, `o[ot] = o[ot] * cf` (the arith-fork
+`OpFMul`; one small load per key tile, NOT v1's full C→f16→LDS roundtrip). Parity green
+(`attn_prefill_global_flash_sp_matches_reference`). **Beats the naive kernel at every context, win
+grows with ctx (bench: attn_flash_cmp, perf=high, ms/chunk = one global layer):**
+
+| ctx | naive | flash v2 | **flash_sp** | sp vs naive |
+|---|---|---|---|---|
+| 256 (q0≈0) | 0.485 | 0.617 | **0.450** | **−7 %** |
+| 8K | 34.5 | 40.6 | **29.3** | **−15 %** |
+| 32K | 146 | 164 | **118** | **−19 %** |
+
+**WIRED into the prefill graph (2026-06-18).** `graph.rs` global-prefill layers now dispatch
+`attn_prefill_global_flash_sp` (grid `[32, m_pad/16]`) with three `touch` barriers on q/kv.k/kv.v
+first — flash reads them via `coopLoad`, invisible to vulkano reflection auto-sync, so the producer
+write→read barrier needs forcing (same trap as the int8 gemm). `prefill_parity` green both builds
+(f16 per-layer nrmse 0.00254 ≈ the naive 0.00244; int8-ffn 0.03707 < 0.045; logits 20/20 vs oracle).
+The prefill-vs-decode dtol is now dtype-aware (0.25 int8 / 0.15 f16): prefill (flash) and decode
+(split-K) are different kernels — f16 agrees to Δ0.006, int8 amplifies to ~0.2 — and the f64-oracle
+check is the real gate. **e2e prefill A/B (bench: sg-bench profile, perf=high) @ q0 0/8K/32K:**
+
+| build | naive (before) | flash_sp (after) | Δ |
+|---|---|---|---|
+| f16 default | 193 / 134 / 85 | 187 / 143 / 99 | −3 % / +6 % / **+16 %** |
+| int8-ffn | 271 / 180 / 101 | 271 / 186 / 114 | −0 % / +3 % / **+12 %** |
+
+The win grows with context (the rank-#1 goal: long-context global attention is the dominant cost and
+watchdog driver). q0 0 is ~neutral — attention is ~3 % of that FFN-bound point, and the 3 touch
+barriers/global-layer cost a hair. Decode is untouched (split-K path). The two-pass v2 + naive kernels
+stay registered as `attn_flash_cmp` baselines. **Watchdog headroom also improved** (the dominant 32K
+kernel dropped 146→118 ms/layer). Follow-up: the naive kernel could be retired once a perplexity-gate
+run confirms quality (oracle parity already green); MTP/cache2 are the next milestones.
 
 **Decode** is near the bandwidth ceiling (gemv ~91 %, bench: gemv_bw); its lever is MTP (M7.5), not
 these kernels. `cache2` (M6) is the orthogonal win for the append-only workload (prefix reuse
@@ -546,8 +592,10 @@ the divergence path matches a cold run bitwise.
    f16 path is either retired or matched.
 3. **Operational:** pin `power_dpm_force_performance_level=high` on the box (the ~30 % fabric-clock
    finding) and set `amdgpu.lockup_timeout=10000` (the watchdog finding).
-4. **Revisit rank #1 flash attention** with the new coopmat-arith ops (in-register rescale may now
-   beat the naive kernel) and/or re-measure the parked variants at perf=high.
+4. **Rank #1 flash attention — IN PROGRESS (2026-06-18).** Parked variants re-measured at perf=high
+   (still 1.1–1.3× slower; pinning didn't flip — see the rank-#1 section). Now building design (c):
+   single-pass flash with an in-register rescale using the coopmat-arith ops. A/B via the `attn_us`
+   `attn_flash_cmp` group; naive kernel stays deployed until (c) beats it under parity.
 5. **M6: cache2** (NVMe radix trie, paging, tail snapshots, eviction) — the append-only-workload
    win; M5 substrate proven; plan 04. (Optimizing the inference kernels first is deliberate — see
    the top of this file and AGENTS.md.)

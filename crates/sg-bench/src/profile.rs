@@ -21,11 +21,32 @@ use std::time::Instant;
 use sg_model::{GpuModel, Sampler, SamplerParams};
 
 const DECODE_CTXS: &[u32] = &[1024, 8192, 32 * 1024];
-const PREFILL_Q0S: &[u32] = &[0, 8192, 32 * 1024 - 256];
 const REPS: usize = 5;
 const WARMUP: usize = 2;
 const GLOBAL_CAP: usize = 32 * 1024;
-const CHUNK: usize = 256;
+/// Prefill chunk (token rows / gemm M). Default 256 — the production value
+/// (`examples/run.rs`, `Session`) and the measured sweet spot. Override with
+/// `SG_PREFILL_CHUNK=<n>` to re-run the sweep; rounded up to the gemm M_BLOCK
+/// (64) here to match `GpuModel::new`.
+///
+/// Sweep finding (int8-ffn, perf=high, 2026-06-18) — chunk size is a ±7 %
+/// lever with NO single winner, so we keep 256:
+///   chunk | q0 0  | q0 8K | q0 32K   (e2e prefill tok/s)
+///     128 | 258.0 | 159.4 |  85.2    strictly worse — half the weight reuse
+///     256 | 271.0 | 180.1 | 101.2    best at short ctx (gemm-bound)
+///     512 | 255.2 | 182.5 | 108.6    best at long ctx (KV-history reuse)
+/// At q0 0 the FFN gemms dominate and 256 beats 512: the L2 swizzle already
+/// reuses each weight N-strip across a 256-chunk's 4 M-blocks, and the 774 KB
+/// strip can't survive 8 M-blocks' activation streaming through the 2 MB L2
+/// (weight reuse is L2-bounded in M, not unbounded). At long ctx the global
+/// attention amortizes its KV-history read over more query rows, so 512 pulls
+/// ahead — a context-adaptive chunk (256→512 past ~8K) is the open follow-up.
+fn prefill_chunk() -> usize {
+    std::env::var("SG_PREFILL_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
 /// Representative layers: 4 = sliding, 5 = global (the pattern repeats).
 const REP_SLIDING: usize = 4;
 const REP_GLOBAL: usize = 5;
@@ -113,8 +134,10 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
     let file = sg_gguf::GgufFile::open(model_path)?;
     let gguf = file.parse().map_err(|e| anyhow::anyhow!("parse: {e}"))?;
     let ctx = sg_gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("gpu: {e}"))?;
-    eprintln!("uploading weights …");
-    let mut model = GpuModel::new(&ctx, &gguf, GLOBAL_CAP, CHUNK)
+    // GpuModel rounds the chunk up to the gemm M_BLOCK (64); match that here.
+    let chunk = prefill_chunk().next_multiple_of(64);
+    eprintln!("uploading weights … (prefill chunk = {chunk})");
+    let mut model = GpuModel::new(&ctx, &gguf, GLOBAL_CAP, chunk)
         .map_err(|e| anyhow::anyhow!("upload: {e}"))?;
     let timer = ctx
         .new_timer(256)
@@ -176,10 +199,12 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
     }
 
     // ── Prefill chunk at several histories ───────────────────────────────
-    let chunk_tokens: Vec<u32> = (0..CHUNK as u32).map(|i| 1000 + i * 7).collect();
+    let chunk_tokens: Vec<u32> = (0..chunk as u32).map(|i| 1000 + i * 7).collect();
+    // Last history keeps q0 + chunk within the global KV cap.
+    let prefill_q0s: [u32; 3] = [0, 8192, GLOBAL_CAP as u32 - chunk as u32];
     let mut prefill = BTreeMap::new();
-    for &q0 in PREFILL_Q0S {
-        eprintln!("prefill 256-chunk @ q0 {q0} …");
+    for &q0 in &prefill_q0s {
+        eprintln!("prefill {chunk}-chunk @ q0 {q0} …");
         model.reset();
         let mut totals = Vec::new();
         let (mut sl_reps, mut gl_reps) = (Vec::new(), Vec::new());
@@ -204,7 +229,7 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
             q0,
             Phase {
                 total_ms,
-                tok_s: CHUNK as f64 / (total_ms / 1e3),
+                tok_s: chunk as f64 / (total_ms / 1e3),
                 sliding_kernels: med_by_label(&sl_reps),
                 global_kernels: med_by_label(&gl_reps),
             },
@@ -302,7 +327,7 @@ fn print_table(r: &Report) {
     for (q0, p) in &r.prefill_chunk256 {
         phase(
             &mut o,
-            format!("prefill 256-chunk @ q0 {q0}"),
+            format!("prefill chunk @ q0 {q0}"),
             p,
             " (×50 / ×10 for totals)",
         );

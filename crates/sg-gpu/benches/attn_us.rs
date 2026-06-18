@@ -44,6 +44,60 @@ fn step_buf(ctx: &GpuContext, state: StepState) -> Subbuffer<[u32]> {
     buf
 }
 
+/// Time `kernel` over `CMP_DISPATCHES` back-to-back dispatches of `grid`,
+/// reporting µs/chunk. Shared by the naive-vs-flash global comparison; the
+/// global-prefill push constant is always `GL_SCALE`. The dispatch count is
+/// kept low so a single command buffer (naive global is ~146 ms/dispatch at
+/// 32K) stays well under the 2 s amdgpu watchdog.
+fn time_prefill(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    ctx: &GpuContext,
+    kernel: &sg_gpu::Kernel,
+    set: std::sync::Arc<DescriptorSet>,
+    grid: [u32; 3],
+    name: String,
+) {
+    const CMP_DISPATCHES: usize = 4;
+    let layout = kernel.layout().clone();
+    group.bench_function(name, |b| {
+        b.iter_custom(|iters| {
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut builder = AutoCommandBufferBuilder::primary(
+                    ctx.command_buffer_allocator().clone(),
+                    ctx.queue().queue_family_index(),
+                    CommandBufferUsage::OneTimeSubmit,
+                )
+                .unwrap();
+                builder
+                    .bind_pipeline_compute(kernel.pipeline().clone())
+                    .unwrap()
+                    .bind_descriptor_sets(PipelineBindPoint::Compute, layout.clone(), 0, set.clone())
+                    .unwrap()
+                    .push_constants(layout.clone(), 0, GL_SCALE)
+                    .unwrap();
+                for _ in 0..CMP_DISPATCHES {
+                    // SAFETY: caller passes each kernel's documented grid.
+                    unsafe { builder.dispatch(grid) }.unwrap();
+                }
+                builder
+                    .build()
+                    .unwrap()
+                    .execute(ctx.queue().clone())
+                    .unwrap()
+                    .then_signal_fence_and_flush()
+                    .unwrap()
+                    .wait(None)
+                    .unwrap();
+            }
+            let elapsed = start.elapsed();
+            let us = elapsed.as_secs_f64() * 1e6 / (iters as usize * CMP_DISPATCHES) as f64;
+            eprintln!("  -> {us:.1} µs/chunk");
+            elapsed
+        })
+    });
+}
+
 fn bench(c: &mut Criterion) {
     let ctx = match GpuContext::new() {
         Ok(ctx) => ctx,
@@ -509,6 +563,113 @@ fn bench(c: &mut Criterion) {
     }
 
     group.finish();
+
+    // --- global prefill: naive scalar vs coopmat flash (v2 register-O two-
+    //     pass), at the three profile operating points (chunk at the end of a
+    //     256/8K/32K context). Re-measured at perf=high — the parked flash
+    //     numbers in STATUS (~1.2× slower) were taken at perf=auto, before the
+    //     fabric clock was pinned. m=256 matches the production chunk. ---
+    {
+        let m = 256usize;
+        let naive = ctx.load_kernel("attn_prefill_global").expect("kernel");
+        let flash = ctx.load_kernel("attn_prefill_global_flash").expect("kernel");
+        let flash_sp = ctx
+            .load_kernel("attn_prefill_global_flash_sp")
+            .expect("kernel");
+        let mut cmp = c.benchmark_group("attn_flash_cmp");
+        cmp.sample_size(10)
+            .warm_up_time(std::time::Duration::from_secs(1))
+            .measurement_time(std::time::Duration::from_secs(3));
+        for l in [256usize, 8192, 32768] {
+            let q0 = (l - m) as u32; // chunk sits at the end of an l-token context
+            let q = ctx
+                .buffer_from_iter(
+                    f16_fill(m * N_Q_HEADS * GL_DIM),
+                    BufferUsage::STORAGE_BUFFER,
+                )
+                .unwrap();
+            // l is a multiple of 64, so the flash N_K=64 tiling needs no extra
+            // KV padding (the last query's key tile ends exactly at l).
+            let kv_k = ctx
+                .buffer_from_iter(
+                    f16_fill(l * GL_KV_HEADS * GL_DIM),
+                    BufferUsage::STORAGE_BUFFER,
+                )
+                .unwrap();
+            let kv_v = ctx
+                .buffer_from_iter(
+                    f16_fill(l * GL_KV_HEADS * GL_DIM),
+                    BufferUsage::STORAGE_BUFFER,
+                )
+                .unwrap();
+            let out = ctx
+                .new_buffer::<u16>((m * N_Q_HEADS * GL_DIM) as u64, BufferUsage::STORAGE_BUFFER)
+                .unwrap();
+            let step = step_buf(
+                &ctx,
+                StepState {
+                    q0,
+                    ..Default::default()
+                },
+            );
+            let writes = || {
+                vec![
+                    WriteDescriptorSet::buffer(0, q.clone()),
+                    WriteDescriptorSet::buffer(1, kv_k.clone()),
+                    WriteDescriptorSet::buffer(2, kv_v.clone()),
+                    WriteDescriptorSet::buffer(3, out.clone()),
+                    WriteDescriptorSet::buffer(4, step.clone()),
+                ]
+            };
+            let set_naive = DescriptorSet::new(
+                ctx.descriptor_set_allocator().clone(),
+                naive.layout().set_layouts()[0].clone(),
+                writes(),
+                [],
+            )
+            .unwrap();
+            let set_flash = DescriptorSet::new(
+                ctx.descriptor_set_allocator().clone(),
+                flash.layout().set_layouts()[0].clone(),
+                writes(),
+                [],
+            )
+            .unwrap();
+            let set_flash_sp = DescriptorSet::new(
+                ctx.descriptor_set_allocator().clone(),
+                flash_sp.layout().set_layouts()[0].clone(),
+                writes(),
+                [],
+            )
+            .unwrap();
+            // naive grid [kv_heads, M]; flash grids [q_heads, M/M_Q] (M_Q=16).
+            time_prefill(
+                &mut cmp,
+                &ctx,
+                &naive,
+                set_naive,
+                [GL_KV_HEADS as u32, m as u32, 1],
+                format!("naive_ctx{l}"),
+            );
+            time_prefill(
+                &mut cmp,
+                &ctx,
+                &flash,
+                set_flash,
+                [N_Q_HEADS as u32, (m / 16) as u32, 1],
+                format!("flash_ctx{l}"),
+            );
+            time_prefill(
+                &mut cmp,
+                &ctx,
+                &flash_sp,
+                set_flash_sp,
+                [N_Q_HEADS as u32, (m / 16) as u32, 1],
+                format!("flash_sp_ctx{l}"),
+            );
+        }
+        cmp.finish();
+    }
 }
 
 criterion_group!(benches, bench);

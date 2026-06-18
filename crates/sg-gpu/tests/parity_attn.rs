@@ -594,6 +594,91 @@ fn attn_prefill_global_flash_matches_reference() {
     }
 }
 
+/// Single-pass flash (design c): online softmax + in-register `O *= corr`
+/// rescale via the coopmat-arith fork ops. Same contract/dispatch as the
+/// two-pass `attn_prefill_global_flash_matches_reference`; the rescale path is
+/// what's under test here.
+#[test]
+fn attn_prefill_global_flash_sp_matches_reference() {
+    const M_Q: usize = 16;
+    const N_K: usize = 64;
+    let Some(ctx) = ctx() else { return };
+    let kernel = ctx.load_kernel("attn_prefill_global_flash_sp").unwrap();
+    let mut rng = Rng::new(0xA7C);
+    let m = 64usize; // multiple of M_Q
+
+    for q0 in [0usize, 200] {
+        // Padded key count: the last query (row m−1) sees key q0+m−1, whose
+        // N_K-tile may extend past it.
+        let l_pad = ((q0 + m - 1) / N_K + 1) * N_K;
+        let q = through_f16(&rng.f32_vec(m * N_Q_HEADS * GL_DIM));
+        let k = through_f16(&rng.f32_vec(l_pad * GL_KV_HEADS * GL_DIM));
+        let v = through_f16(&rng.f32_vec(l_pad * GL_KV_HEADS * GL_DIM));
+
+        let q_buf = ctx
+            .buffer_from_iter(to_f16_bits(&q), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let k_buf = ctx
+            .buffer_from_iter(to_f16_bits(&k), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let v_buf = ctx
+            .buffer_from_iter(to_f16_bits(&v), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let out_buf = ctx
+            .new_buffer::<u16>((m * N_Q_HEADS * GL_DIM) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                WriteDescriptorSet::buffer(0, q_buf),
+                WriteDescriptorSet::buffer(1, k_buf),
+                WriteDescriptorSet::buffer(2, v_buf),
+                WriteDescriptorSet::buffer(3, out_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    4,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            q0: q0 as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            ],
+            Some(GL_SCALE),
+            [N_Q_HEADS as u32, (m / M_Q) as u32, 1],
+        )
+        .unwrap();
+        let got = from_f16_bits(&out_buf.read().unwrap());
+
+        for qh in [0usize, 7, 15, 31] {
+            for i in 0..m {
+                let want = attention_head(
+                    &q,
+                    &k,
+                    &v,
+                    i,
+                    qh,
+                    N_Q_HEADS,
+                    GL_KV_HEADS,
+                    GL_DIM,
+                    GL_SCALE as f64,
+                    0,
+                    q0 + i,
+                );
+                assert_close(
+                    &got[(i * N_Q_HEADS + qh) * GL_DIM..][..GL_DIM],
+                    &want,
+                    ATOL,
+                    RTOL,
+                    &format!("prefill_global_flash_sp q0={q0} i={i} qh={qh}"),
+                );
+            }
+        }
+    }
+}
+
 /// Plan 02/06: bit-identical across runs (fixed split count and order).
 #[test]
 fn attn_is_bit_deterministic() {

@@ -404,7 +404,10 @@ impl<'a> GpuModel<'a> {
             gemm_o_i8_sl: load("gemm_q4_0_i8_swz_m4n1_k8192_n5376")?,
             gemm_o_i8_gl: load("gemm_q4_0_i8_swz_m4n1_s1_k16384_n5376")?,
             prefill_sl: load("attn_prefill_sliding_ring")?,
-            prefill_gl: load("attn_prefill_global")?,
+            // Single-pass coopmat flash (profile rank #1): beats the naive
+            // scalar attn_prefill_global by 7–19 % (bench: attn_flash_cmp,
+            // perf=high). Reads q/k/v via coopLoad → needs touch barriers.
+            prefill_gl: load("attn_prefill_global_flash_sp")?,
             touch: load("touch")?,
         };
 
@@ -1150,6 +1153,13 @@ impl<'a> GpuModel<'a> {
             do_appends(rec)?;
         } else {
             do_appends(rec)?;
+            // Single-pass flash reads q/k/v via coopLoad (invisible to
+            // vulkano auto-sync) — touch the producers (rope q, appended KV)
+            // so the write→read barriers materialize (touch.wgsl). Grid is
+            // [N_Q_HEADS=32, m_pad/M_Q], M_Q=16 (vs the naive [n_kv, m_pad]).
+            touch(rec, q)?;
+            touch(rec, &kv.k)?;
+            touch(rec, &kv.v)?;
             rec.dispatch(
                 &self.k.prefill_gl,
                 vec![
@@ -1160,7 +1170,7 @@ impl<'a> GpuModel<'a> {
                     buf(4, self.step.clone()),
                 ],
                 Some(1.0f32),
-                [n_kv as u32, m_pad as u32, 1],
+                [32, (m_pad / 16) as u32, 1],
             )?;
         }
 

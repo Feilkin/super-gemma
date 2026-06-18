@@ -903,6 +903,27 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Coopmat global-prefill rewrite (profile rank #1), single-pass flash with
+    // an in-register rescale (supersedes the two-pass above). S_STAGE_LEN =
+    // M_Q·N_K; corr_stage/o_stage are M_Q·16 = 256.
+    Variant {
+        name: "attn_prefill_global_flash_sp",
+        src: "attn_prefill_global_flash_sp",
+        defs: &[
+            ("HEAD_DIM", 512),
+            ("N_KV_HEADS", 4),
+            ("Q_PER_KV", 8),
+            ("M_Q", 16),
+            ("N_K", 64),
+            ("WG_X", 64),
+            ("S_STAGE_LEN", 1024),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 5,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: true,
+    },
     // Coopmat Q4_0 GEMM (prefill), one variant per (K, N) site.
     Variant {
         name: "gemm_q4_0_k5376_n8192",

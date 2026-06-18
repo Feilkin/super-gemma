@@ -173,5 +173,13 @@ fn chunked_prefill_matches_oracle_and_decode() {
     let gpu_decode = gpu
         .decode_step(&decode_graph, tail[0])
         .expect("decode step");
-    assert_logit_agreement(&gpu_prefill, &gpu_decode, 19, 0.15, "prefill vs decode");
+    // Prefill (single-pass coopmat flash) and decode (split-K) are DIFFERENT
+    // global-attention kernels, so the two paths aren't bit-identical: f16
+    // agrees to Δ~0.006, but int8-ffn activation-quant amplifies that tiny gap
+    // (one near-top logit drifts ~0.2). Argmax/top-overlap still hold; the
+    // f64-oracle check above is the real correctness gate — this dtol only
+    // bounds the cross-path drift, so it widens under int8 like the per-layer
+    // nrmse tol does.
+    let decode_dtol = if cfg!(feature = "int8-ffn") { 0.25 } else { 0.15 };
+    assert_logit_agreement(&gpu_prefill, &gpu_decode, 19, decode_dtol, "prefill vs decode");
 }
