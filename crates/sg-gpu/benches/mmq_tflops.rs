@@ -94,7 +94,16 @@ fn bench(c: &mut Criterion) {
     // (name, writes, n_block, m_block, swizzle, k, n). `swizzle` transposes the
     // dispatch to [M/m_block, N/n_block] for the M-fast-varying L2 lever; (k, n)
     // give the shape so flops + grid are computed per case.
-    let cases: Vec<(&str, Vec<WriteDescriptorSet>, u32, u32, bool, usize, usize)> = vec![
+    type Case = (
+        &'static str,
+        Vec<WriteDescriptorSet>,
+        u32,
+        u32,
+        bool,
+        usize,
+        usize,
+    );
+    let cases: Vec<Case> = vec![
         (
             "gemm_q4_0_k5376_n21504",
             f16_writes.clone(),
