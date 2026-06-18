@@ -24,7 +24,7 @@ MESA_VK_TRACE=rgp \
 MESA_VK_TRACE_PER_SUBMIT=true \
 RADV_THREAD_TRACE_BUFFER_SIZE=268435456 \
 RADV_THREAD_TRACE_INSTRUCTION_TIMING=true \
-  ./target/release/sg-bench rgp gemm_q4_0_i8_t22_k21504_n5376
+  ./target/release/sg-bench rgp gemm_q4_0_i8_swz_m4n1_k21504_n5376
 ```
 
 - Output: `/tmp/sg-bench_<timestamp>_submitN.rgp`, one per submit (0..7). **Take
@@ -41,12 +41,16 @@ RADV_THREAD_TRACE_INSTRUCTION_TIMING=true \
 
 | kernel | what | tiling |
 |---|---|---|
-| `gemm_q4_0_i8_t22_k21504_n5376` | int8 FFN **down** (the regressor) | 2×2 |
-| `gemm_q4_0_i8_t22_k5376_n21504` | int8 FFN **gate/up** | 2×2 |
+| `gemm_q4_0_i8_swz_m4n1_k21504_n5376` | int8 FFN **down**, **DEPLOYED** | 4×1 swz |
+| `gemm_q4_0_i8_swz_m4n1_k5376_n21504` | int8 FFN **gate/up**, **DEPLOYED** | 4×1 swz |
+| `gemm_q4_0_i8_t22_k21504_n5376` | int8 FFN down (pre-cache-block baseline) | 2×2 |
+| `gemm_q4_0_i8_t22_k5376_n21504` | int8 FFN gate/up (baseline) | 2×2 |
 | `gemm_q4_0_k21504_n5376` | f16 FFN down (A/B) | 4×4 |
 | `gemm_q4_0_k5376_n21504` | f16 FFN gate/up (A/B) | 4×4 |
 
-All at M=256 (the prefill chunk). Add more in `crates/sg-bench/src/rgp.rs::shape`.
+The `swz_m4n1` variants are the production prefill tiling (graph.rs) and take a
+transposed `[M-blocks, N-blocks]` grid; the harness handles that. All at M=256
+(the prefill chunk). Add more in `crates/sg-bench/src/rgp.rs::shape`.
 
 ## Capture the real prefill graph (optional, advanced)
 
