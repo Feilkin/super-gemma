@@ -117,7 +117,12 @@ fn main() {
         .unwrap();
         b.bind_pipeline_compute(k.pipeline().clone())
             .unwrap()
-            .bind_descriptor_sets(PipelineBindPoint::Compute, k.layout().clone(), 0, set.clone())
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                k.layout().clone(),
+                0,
+                set.clone(),
+            )
             .unwrap();
         for _ in 0..DISPATCHES {
             // SAFETY: swizzled [M-blocks, N-blocks] grid, the kernel's contract.

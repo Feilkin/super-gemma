@@ -72,7 +72,12 @@ fn time_prefill(
                 builder
                     .bind_pipeline_compute(kernel.pipeline().clone())
                     .unwrap()
-                    .bind_descriptor_sets(PipelineBindPoint::Compute, layout.clone(), 0, set.clone())
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        layout.clone(),
+                        0,
+                        set.clone(),
+                    )
                     .unwrap()
                     .push_constants(layout.clone(), 0, GL_SCALE)
                     .unwrap();
@@ -572,7 +577,9 @@ fn bench(c: &mut Criterion) {
     {
         let m = 256usize;
         let naive = ctx.load_kernel("attn_prefill_global").expect("kernel");
-        let flash = ctx.load_kernel("attn_prefill_global_flash").expect("kernel");
+        let flash = ctx
+            .load_kernel("attn_prefill_global_flash")
+            .expect("kernel");
         let flash_sp = ctx
             .load_kernel("attn_prefill_global_flash_sp")
             .expect("kernel");

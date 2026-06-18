@@ -51,7 +51,9 @@ pub fn run(kernel: &str) -> anyhow::Result<()> {
     })?;
 
     let ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("gpu: {e}"))?;
-    let kern = ctx.load_kernel(kernel).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let kern = ctx
+        .load_kernel(kernel)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let u = BufferUsage::STORAGE_BUFFER;
     let nb_err = |e: sg_gpu::GpuError| anyhow::anyhow!("{e}");
 
@@ -62,8 +64,12 @@ pub fn run(kernel: &str) -> anyhow::Result<()> {
     let y = ctx.new_buffer::<u16>((M * n) as u64, u).map_err(nb_err)?;
     // int8 path: x = Q8 quants (u32-packed = i8 bytes), x_scales = f16. f16 path:
     // x = f16 activations.
-    let x_i8 = ctx.new_buffer::<u32>((M * k / 4) as u64, u).map_err(nb_err)?;
-    let xs = ctx.new_buffer::<u16>((M * k / 32) as u64, u).map_err(nb_err)?;
+    let x_i8 = ctx
+        .new_buffer::<u32>((M * k / 4) as u64, u)
+        .map_err(nb_err)?;
+    let xs = ctx
+        .new_buffer::<u16>((M * k / 32) as u64, u)
+        .map_err(nb_err)?;
     let x_f16 = ctx.new_buffer::<u16>((M * k) as u64, u).map_err(nb_err)?;
 
     // Swizzled kernels expect [M-blocks, N-blocks]; the rest [N-blocks, M-blocks].

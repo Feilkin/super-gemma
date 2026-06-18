@@ -1005,7 +1005,12 @@ impl<'a> GpuModel<'a> {
                 no_push,
                 self.k.quant_q8.groups_for((m_pad * HIDDEN / 32) as u64),
             )?;
-            rec.dispatch(&self.k.touch, vec![buf(0, p.xn_i8.clone())], no_push, [1, 1, 1])?;
+            rec.dispatch(
+                &self.k.touch,
+                vec![buf(0, p.xn_i8.clone())],
+                no_push,
+                [1, 1, 1],
+            )?;
             let (gq, gkv) = if sliding {
                 (&self.k.gemm_q_i8_sl, &self.k.gemm_kv_i8_sl)
             } else {
@@ -1187,8 +1192,17 @@ impl<'a> GpuModel<'a> {
                 no_push,
                 self.k.quant_q8.groups_for((m_pad * q_dim / 32) as u64),
             )?;
-            rec.dispatch(&self.k.touch, vec![buf(0, p.ao_i8.clone())], no_push, [1, 1, 1])?;
-            let go = if sliding { &self.k.gemm_o_i8_sl } else { &self.k.gemm_o_i8_gl };
+            rec.dispatch(
+                &self.k.touch,
+                vec![buf(0, p.ao_i8.clone())],
+                no_push,
+                [1, 1, 1],
+            )?;
+            let go = if sliding {
+                &self.k.gemm_o_i8_sl
+            } else {
+                &self.k.gemm_o_i8_gl
+            };
             let mg2 = (m_pad / 64) as u32; // int8 4×1 (64-row M-blocks)
             rec.dispatch(
                 go,
@@ -1250,7 +1264,12 @@ impl<'a> GpuModel<'a> {
                 self.k.quant_q8.groups_for((m_pad * HIDDEN / 32) as u64),
             )?;
             // The int8 gemm coopLoads its quants → invisible to auto-sync.
-            rec.dispatch(&self.k.touch, vec![buf(0, p.fin_i8.clone())], no_push, [1, 1, 1])?;
+            rec.dispatch(
+                &self.k.touch,
+                vec![buf(0, p.fin_i8.clone())],
+                no_push,
+                [1, 1, 1],
+            )?;
             let mg2 = (m_pad / 64) as u32; // int8 4×1 M-block count (64 rows)
             for (w, dst) in [(&lw.ffn_gate, &p.g), (&lw.ffn_up, &p.u)] {
                 rec.dispatch(
@@ -1301,7 +1320,12 @@ impl<'a> GpuModel<'a> {
                 no_push,
                 self.k.quant_q8.groups_for((m_pad * FFN / 32) as u64),
             )?;
-            rec.dispatch(&self.k.touch, vec![buf(0, p.gu_i8.clone())], no_push, [1, 1, 1])?;
+            rec.dispatch(
+                &self.k.touch,
+                vec![buf(0, p.gu_i8.clone())],
+                no_push,
+                [1, 1, 1],
+            )?;
             let mg2 = (m_pad / 64) as u32; // int8 4×1 (64-row M-blocks)
             rec.dispatch(
                 &self.k.gemm_down_i8,

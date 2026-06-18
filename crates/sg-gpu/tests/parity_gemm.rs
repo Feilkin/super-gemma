@@ -185,8 +185,14 @@ fn gemm_q4_0_swizzle_matches_plain() {
     };
 
     // Plain: dispatch [N/strip, M/tile]. Swizzled: transposed [M/tile, N/strip].
-    let plain = run("gemm_q4_0_k5376_n21504", [(n / 64) as u32, (m / 64) as u32, 1]);
-    let swz = run("gemm_q4_0_swz_k5376_n21504", [(m / 64) as u32, (n / 64) as u32, 1]);
+    let plain = run(
+        "gemm_q4_0_k5376_n21504",
+        [(n / 64) as u32, (m / 64) as u32, 1],
+    );
+    let swz = run(
+        "gemm_q4_0_swz_k5376_n21504",
+        [(m / 64) as u32, (n / 64) as u32, 1],
+    );
     assert_eq!(plain, swz, "swizzled gemm output differs from plain");
 }
 

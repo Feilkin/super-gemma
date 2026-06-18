@@ -95,41 +95,289 @@ fn bench(c: &mut Criterion) {
     // dispatch to [M/m_block, N/n_block] for the M-fast-varying L2 lever; (k, n)
     // give the shape so flops + grid are computed per case.
     let cases: Vec<(&str, Vec<WriteDescriptorSet>, u32, u32, bool, usize, usize)> = vec![
-        ("gemm_q4_0_k5376_n21504", f16_writes.clone(), 64, 64, false, 5376, 21504), // f16, 4×4 tiles
-        ("gemm_q4_0_swz_k5376_n21504", f16_writes.clone(), 64, 64, true, 5376, 21504), // f16 4×4 + L2 swizzle
-        ("gemm_q4_0_m2_k5376_n21504", f16_writes.clone(), 64, 32, false, 5376, 21504), // f16 2×4 (occupancy lever)
-        ("gemm_q4_0_m1_k5376_n21504", f16_writes, 64, 16, false, 5376, 21504), // f16 1×4 (occupancy lever)
-        ("gemm_q4_0_i8_k5376_n21504", i8_writes.clone(), 64, 32, false, 5376, 21504), // int8 MMQ, 2×4 tiles
-        ("gemm_q4_0_i8_t22_k5376_n21504", i8_writes.clone(), 32, 32, false, 5376, 21504), // 2×2 tiles
-        ("gemm_q4_0_i8_swz_t22_k5376_n21504", i8_writes.clone(), 32, 32, true, 5376, 21504), // 2×2 + L2 swizzle
+        (
+            "gemm_q4_0_k5376_n21504",
+            f16_writes.clone(),
+            64,
+            64,
+            false,
+            5376,
+            21504,
+        ), // f16, 4×4 tiles
+        (
+            "gemm_q4_0_swz_k5376_n21504",
+            f16_writes.clone(),
+            64,
+            64,
+            true,
+            5376,
+            21504,
+        ), // f16 4×4 + L2 swizzle
+        (
+            "gemm_q4_0_m2_k5376_n21504",
+            f16_writes.clone(),
+            64,
+            32,
+            false,
+            5376,
+            21504,
+        ), // f16 2×4 (occupancy lever)
+        (
+            "gemm_q4_0_m1_k5376_n21504",
+            f16_writes,
+            64,
+            16,
+            false,
+            5376,
+            21504,
+        ), // f16 1×4 (occupancy lever)
+        (
+            "gemm_q4_0_i8_k5376_n21504",
+            i8_writes.clone(),
+            64,
+            32,
+            false,
+            5376,
+            21504,
+        ), // int8 MMQ, 2×4 tiles
+        (
+            "gemm_q4_0_i8_t22_k5376_n21504",
+            i8_writes.clone(),
+            32,
+            32,
+            false,
+            5376,
+            21504,
+        ), // 2×2 tiles
+        (
+            "gemm_q4_0_i8_swz_t22_k5376_n21504",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            5376,
+            21504,
+        ), // 2×2 + L2 swizzle
         // tall-thin tile sweep (cache-blocking: more M-rows per weight load)
-        ("gemm_q4_0_i8_swz_m4n1_k5376_n21504", i8_writes.clone(), 16, 64, true, 5376, 21504), // 4×1
-        ("gemm_q4_0_i8_swz_m8n1_k5376_n21504", i8_writes.clone(), 16, 128, true, 5376, 21504), // 8×1
-        ("gemm_q4_0_i8_swz_m4n2_k5376_n21504", i8_writes.clone(), 32, 64, true, 5376, 21504), // 4×2
+        (
+            "gemm_q4_0_i8_swz_m4n1_k5376_n21504",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            5376,
+            21504,
+        ), // 4×1
+        (
+            "gemm_q4_0_i8_swz_m8n1_k5376_n21504",
+            i8_writes.clone(),
+            16,
+            128,
+            true,
+            5376,
+            21504,
+        ), // 8×1
+        (
+            "gemm_q4_0_i8_swz_m4n2_k5376_n21504",
+            i8_writes.clone(),
+            32,
+            64,
+            true,
+            5376,
+            21504,
+        ), // 4×2
         // down shape (large-K): current 2×2-s1 baseline vs 4×1 (both stage settings)
-        ("gemm_q4_0_i8_swz_t22_k21504_n5376", i8_writes.clone(), 32, 32, true, 21504, 5376), // down 2×2 s1 (deployed)
-        ("gemm_q4_0_i8_swz_m4n1_k21504_n5376", i8_writes.clone(), 16, 64, true, 21504, 5376), // down 4×1 s2
-        ("gemm_q4_0_i8_swz_m4n1_s1_k21504_n5376", i8_writes.clone(), 16, 64, true, 21504, 5376), // down 4×1 s1
-        ("gemm_q4_0_i8_t12_k5376_n21504", i8_writes.clone(), 32, 16, false, 5376, 21504), // 1×2 tiles
-        ("gemm_q4_0_i8_t44_k5376_n21504", i8_writes.clone(), 64, 64, false, 5376, 21504), // 4×4 tiles (f16-equivalent)
-        ("gemm_q4_0_i8_raw_k5376_n21504", raw_writes, 64, 32, false, 5376, 21504), // int8 MMA ceiling, no rescale
+        (
+            "gemm_q4_0_i8_swz_t22_k21504_n5376",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            21504,
+            5376,
+        ), // down 2×2 s1 (deployed)
+        (
+            "gemm_q4_0_i8_swz_m4n1_k21504_n5376",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            21504,
+            5376,
+        ), // down 4×1 s2
+        (
+            "gemm_q4_0_i8_swz_m4n1_s1_k21504_n5376",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            21504,
+            5376,
+        ), // down 4×1 s1
+        (
+            "gemm_q4_0_i8_t12_k5376_n21504",
+            i8_writes.clone(),
+            32,
+            16,
+            false,
+            5376,
+            21504,
+        ), // 1×2 tiles
+        (
+            "gemm_q4_0_i8_t44_k5376_n21504",
+            i8_writes.clone(),
+            64,
+            64,
+            false,
+            5376,
+            21504,
+        ), // 4×4 tiles (f16-equivalent)
+        (
+            "gemm_q4_0_i8_raw_k5376_n21504",
+            raw_writes,
+            64,
+            32,
+            false,
+            5376,
+            21504,
+        ), // int8 MMA ceiling, no rescale
         // O-gemm STAGE_BUFS A/B (both swizzled 2×2): single- vs double-buffer `stage`.
-        ("gemm_q4_0_i8_swz_t22_k8192_n5376", i8_writes.clone(), 32, 32, true, 8192, 5376), // O sliding, STAGE_BUFS=1
-        ("gemm_q4_0_i8_swz_s2_t22_k8192_n5376", i8_writes.clone(), 32, 32, true, 8192, 5376), // O sliding, STAGE_BUFS=2
-        ("gemm_q4_0_i8_swz_t22_k16384_n5376", i8_writes.clone(), 32, 32, true, 16384, 5376), // O global, STAGE_BUFS=1
-        ("gemm_q4_0_i8_swz_s2_t22_k16384_n5376", i8_writes.clone(), 32, 32, true, 16384, 5376), // O global, STAGE_BUFS=2
+        (
+            "gemm_q4_0_i8_swz_t22_k8192_n5376",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            8192,
+            5376,
+        ), // O sliding, STAGE_BUFS=1
+        (
+            "gemm_q4_0_i8_swz_s2_t22_k8192_n5376",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            8192,
+            5376,
+        ), // O sliding, STAGE_BUFS=2
+        (
+            "gemm_q4_0_i8_swz_t22_k16384_n5376",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            16384,
+            5376,
+        ), // O global, STAGE_BUFS=1
+        (
+            "gemm_q4_0_i8_swz_s2_t22_k16384_n5376",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            16384,
+            5376,
+        ), // O global, STAGE_BUFS=2
         // attention 4×1 cache-blocking A/B vs deployed 2×2 (Q/KV/O × sliding/global).
-        ("gemm_q4_0_i8_swz_t22_k5376_n8192", i8_writes.clone(), 32, 32, true, 5376, 8192), // Q sl 2×2
-        ("gemm_q4_0_i8_swz_m4n1_k5376_n8192", i8_writes.clone(), 16, 64, true, 5376, 8192), // Q sl 4×1
-        ("gemm_q4_0_i8_swz_t22_k5376_n16384", i8_writes.clone(), 32, 32, true, 5376, 16384), // Q gl 2×2
-        ("gemm_q4_0_i8_swz_m4n1_k5376_n16384", i8_writes.clone(), 16, 64, true, 5376, 16384), // Q gl 4×1
-        ("gemm_q4_0_i8_swz_t22_k5376_n4096", i8_writes.clone(), 32, 32, true, 5376, 4096), // KV sl 2×2
-        ("gemm_q4_0_i8_swz_m4n1_k5376_n4096", i8_writes.clone(), 16, 64, true, 5376, 4096), // KV sl 4×1
-        ("gemm_q4_0_i8_swz_t22_k5376_n2048", i8_writes.clone(), 32, 32, true, 5376, 2048), // KV gl 2×2
-        ("gemm_q4_0_i8_swz_m4n1_k5376_n2048", i8_writes.clone(), 16, 64, true, 5376, 2048), // KV gl 4×1
-        ("gemm_q4_0_i8_swz_m4n1_k8192_n5376", i8_writes.clone(), 16, 64, true, 8192, 5376), // O sl 4×1
-        ("gemm_q4_0_i8_swz_m4n1_k16384_n5376", i8_writes.clone(), 16, 64, true, 16384, 5376), // O gl 4×1 s2
-        ("gemm_q4_0_i8_swz_m4n1_s1_k16384_n5376", i8_writes, 16, 64, true, 16384, 5376), // O gl 4×1 s1
+        (
+            "gemm_q4_0_i8_swz_t22_k5376_n8192",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            5376,
+            8192,
+        ), // Q sl 2×2
+        (
+            "gemm_q4_0_i8_swz_m4n1_k5376_n8192",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            5376,
+            8192,
+        ), // Q sl 4×1
+        (
+            "gemm_q4_0_i8_swz_t22_k5376_n16384",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            5376,
+            16384,
+        ), // Q gl 2×2
+        (
+            "gemm_q4_0_i8_swz_m4n1_k5376_n16384",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            5376,
+            16384,
+        ), // Q gl 4×1
+        (
+            "gemm_q4_0_i8_swz_t22_k5376_n4096",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            5376,
+            4096,
+        ), // KV sl 2×2
+        (
+            "gemm_q4_0_i8_swz_m4n1_k5376_n4096",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            5376,
+            4096,
+        ), // KV sl 4×1
+        (
+            "gemm_q4_0_i8_swz_t22_k5376_n2048",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            5376,
+            2048,
+        ), // KV gl 2×2
+        (
+            "gemm_q4_0_i8_swz_m4n1_k5376_n2048",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            5376,
+            2048,
+        ), // KV gl 4×1
+        (
+            "gemm_q4_0_i8_swz_m4n1_k8192_n5376",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            8192,
+            5376,
+        ), // O sl 4×1
+        (
+            "gemm_q4_0_i8_swz_m4n1_k16384_n5376",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            16384,
+            5376,
+        ), // O gl 4×1 s2
+        (
+            "gemm_q4_0_i8_swz_m4n1_s1_k16384_n5376",
+            i8_writes,
+            16,
+            64,
+            true,
+            16384,
+            5376,
+        ), // O gl 4×1 s1
     ];
 
     let mut group = c.benchmark_group("mmq_vs_f16");

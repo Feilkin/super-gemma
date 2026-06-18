@@ -12,7 +12,9 @@
 
 mod reference;
 
-use reference::{Rng, assert_close, from_f16_bits, mmq_q4_0_q8, quant_q8_0, through_f16, to_f16_bits};
+use reference::{
+    Rng, assert_close, from_f16_bits, mmq_q4_0_q8, quant_q8_0, through_f16, to_f16_bits,
+};
 use sg_gguf::q4_0::{BLOCK_Q4_0_SIZE, QK4_0, blocks_from_bytes};
 use sg_gpu::GpuContext;
 use vulkano::buffer::BufferUsage;
@@ -116,7 +118,12 @@ fn gemm_q4_0_i8_ffn_shapes_with_gpu_quant() {
     let mut rng = Rng::new(0x5E);
     // (variant, m, k, n) at 2×2 (m_rows = n_cols = 32).
     let cases = [
-        ("gemm_q4_0_i8_t22_k5376_n21504", 64usize, 5376usize, 21504usize),
+        (
+            "gemm_q4_0_i8_t22_k5376_n21504",
+            64usize,
+            5376usize,
+            21504usize,
+        ),
         ("gemm_q4_0_i8_t22_k21504_n5376", 64, 21504, 5376),
     ];
     for (variant, m, k, n) in cases {

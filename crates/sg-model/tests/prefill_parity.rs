@@ -126,7 +126,11 @@ fn prefill_single_chunk_per_layer_parity() {
     // llama.cpp (which also int8-quantizes activations), not quality loss: the
     // perplexity gate passes (code 21.95 vs 22.33, wikitext <0.5%). Asserted on
     // the global worst (not per-layer early-exit) so the bound is the real max.
-    let tol = if cfg!(feature = "int8-ffn") { 0.045 } else { 0.02 };
+    let tol = if cfg!(feature = "int8-ffn") {
+        0.045
+    } else {
+        0.02
+    };
     assert!(
         worst.0 <= tol,
         "worst layer {} ({:?}): nrmse {:.5} > {tol}",
@@ -180,6 +184,16 @@ fn chunked_prefill_matches_oracle_and_decode() {
     // f64-oracle check above is the real correctness gate — this dtol only
     // bounds the cross-path drift, so it widens under int8 like the per-layer
     // nrmse tol does.
-    let decode_dtol = if cfg!(feature = "int8-ffn") { 0.25 } else { 0.15 };
-    assert_logit_agreement(&gpu_prefill, &gpu_decode, 19, decode_dtol, "prefill vs decode");
+    let decode_dtol = if cfg!(feature = "int8-ffn") {
+        0.25
+    } else {
+        0.15
+    };
+    assert_logit_agreement(
+        &gpu_prefill,
+        &gpu_decode,
+        19,
+        decode_dtol,
+        "prefill vs decode",
+    );
 }
