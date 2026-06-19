@@ -345,6 +345,19 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Global decode against the Q8 K cache (Piece A): K binding split into
+    // i8 quants + f16 scales (6 bindings); V/Q stay f16. Same shape/defs as
+    // attn_decode_global.
+    Variant {
+        name: "attn_decode_global_q8k",
+        src: "attn_decode_global_q8k",
+        defs: &[("HEAD_DIM", 512), ("N_KV_HEADS", 4), ("Q_PER_KV", 8)],
+        workgroup: [64, 1, 1],
+        bindings: 6,
+        push_bytes: 8,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "attn_reduce_d256",
         src: "attn_reduce",

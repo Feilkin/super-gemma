@@ -105,8 +105,15 @@ pub struct GpuModel<'a> {
     pub pos: u32,
 }
 
+/// Per-layer KV cache. Sliding layers keep f16 K in a ring (`k`); global
+/// layers store K as a Q8_0 cache (`k_quants` i8-packed + `k_scales` f16) to
+/// halve the dominant long-context K-streaming traffic (Piece A). V is f16
+/// on both kinds (its quant axis ≠ the PV contraction — see
+/// docs/q8-kv-flash-impl.md §6).
 struct KvStore {
-    k: Subbuffer<[u16]>,
+    k: Option<Subbuffer<[u16]>>,
+    k_quants: Option<Subbuffer<[u32]>>,
+    k_scales: Option<Subbuffer<[u16]>>,
     v: Subbuffer<[u16]>,
 }
 
@@ -126,8 +133,13 @@ struct Kernels {
     add: Kernel,
     append_sl: Kernel,
     append_gl: Kernel,
+    /// Quantize-and-append for the Q8 global K cache (Piece A).
+    append_gl_q8: Kernel,
     attn_sl: Kernel,
-    attn_gl: Kernel,
+    /// Global decode reading the Q8 K cache (i8 quants + f16 scales). The f16
+    /// global decode kernel is retired from the graph — global K is Q8-only
+    /// (Piece A); the f16 variant stays in build.rs as a bench/parity baseline.
+    attn_gl_q8: Kernel,
     reduce256: Kernel,
     reduce512: Kernel,
     logits: Kernel,
@@ -145,7 +157,12 @@ struct Kernels {
     gemm_o_i8_sl: Kernel,
     gemm_o_i8_gl: Kernel,
     prefill_sl: Kernel,
-    prefill_gl: Kernel,
+    /// int8-QKᵀ flash for global prefill against the Q8 K cache (Piece A):
+    /// pre-quantized i8 Q + i8 K, per-block rescale; f16 PV. Reads q/k/v via
+    /// coopLoad → needs touch barriers. Replaces the f16 single-pass flash in
+    /// the graph (global K is Q8-only); the f16 kernel stays in build.rs as a
+    /// bench baseline.
+    prefill_gl_iq: Kernel,
     /// Sync shim: the gemm kernels read `x` only via coopmat loads, which
     /// vulkano's auto-sync cannot see — touch the buffer first so the
     /// producer's write→read barrier is emitted (touch.wgsl).
@@ -230,6 +247,11 @@ struct PrefillBufs {
     xn_scales: Subbuffer<[u16]>,
     ao_i8: Subbuffer<[u32]>,
     ao_scales: Subbuffer<[u16]>,
+    /// int8-QKᵀ flash Q-quant scratch (Piece A): the roped global Q
+    /// (`q_gl`, q_dim_gl) quantized to Q8 once per chunk, shared by the
+    /// flash kernel's per-head QKᵀ. Global only (sliding stays f16).
+    q_i8_gl: Subbuffer<[u32]>,
+    q_scales_gl: Subbuffer<[u16]>,
     /// Per-chunk rope tables: `[max_chunk × live_pairs × 2]` f32.
     cs_sl: Subbuffer<[f32]>,
     cs_gl: Subbuffer<[f32]>,
@@ -331,6 +353,8 @@ impl<'a> GpuModel<'a> {
             xn_scales: f16buf(m * HIDDEN / 32)?,
             ao_i8: ctx.new_buffer::<u32>((m * q_dim_gl / 4) as u64, usage)?,
             ao_scales: f16buf(m * q_dim_gl / 32)?,
+            q_i8_gl: ctx.new_buffer::<u32>((m * q_dim_gl / 4) as u64, usage)?,
+            q_scales_gl: f16buf(m * q_dim_gl / 32)?,
             cs_sl: ctx.new_buffer::<f32>((m * desc.sliding.head_dim / 2 * 2) as u64, usage)?,
             cs_gl: ctx.new_buffer::<f32>((m * desc.global.head_dim / 8 * 2) as u64, usage)?,
         };
@@ -339,13 +363,27 @@ impl<'a> GpuModel<'a> {
             .layer_kinds
             .iter()
             .map(|kind| {
-                let slots = match kind {
-                    LayerKind::Sliding => desc.sliding_window * kv_dim_sl,
-                    LayerKind::Global => global_cap * kv_dim_gl,
-                };
-                Ok(KvStore {
-                    k: f16buf(slots)?,
-                    v: f16buf(slots)?,
+                Ok(match kind {
+                    LayerKind::Sliding => {
+                        let slots = desc.sliding_window * kv_dim_sl;
+                        KvStore {
+                            k: Some(f16buf(slots)?),
+                            k_quants: None,
+                            k_scales: None,
+                            v: f16buf(slots)?,
+                        }
+                    }
+                    // Global K is Q8: quants i8 (4/u32) + one f16 scale per
+                    // 32-block. Saves ~67 MB/global-layer vs an f16 K store.
+                    LayerKind::Global => {
+                        let slots = global_cap * kv_dim_gl;
+                        KvStore {
+                            k: None,
+                            k_quants: Some(ctx.new_buffer::<u32>((slots / 4) as u64, usage)?),
+                            k_scales: Some(f16buf(slots / 32)?),
+                            v: f16buf(slots)?,
+                        }
+                    }
                 })
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
@@ -367,8 +405,9 @@ impl<'a> GpuModel<'a> {
             add: load("add_scaled")?,
             append_sl: load("kv_append_sliding")?,
             append_gl: load("kv_append_global")?,
+            append_gl_q8: load("kv_append_global_q8")?,
             attn_sl: load("attn_decode_sliding")?,
-            attn_gl: load("attn_decode_global")?,
+            attn_gl_q8: load("attn_decode_global_q8k")?,
             reduce256: load("attn_reduce_d256")?,
             reduce512: load("attn_reduce_d512")?,
             logits: load("gemv_q6_k_logits")?,
@@ -385,10 +424,10 @@ impl<'a> GpuModel<'a> {
             gemm_o_i8_sl: load("gemm_q4_0_i8_swz_m4n1_k8192_n5376")?,
             gemm_o_i8_gl: load("gemm_q4_0_i8_swz_m4n1_s1_k16384_n5376")?,
             prefill_sl: load("attn_prefill_sliding_ring")?,
-            // Single-pass coopmat flash (profile rank #1): beats the naive
-            // scalar attn_prefill_global by 7–19 % (bench: attn_flash_cmp,
-            // perf=high). Reads q/k/v via coopLoad → needs touch barriers.
-            prefill_gl: load("attn_prefill_global_flash_sp")?,
+            // int8-QKᵀ single-pass flash against the Q8 K cache (Piece A): K
+            // streams i8 from the cache, Q pre-quantized, per-block rescale;
+            // f16 PV. Reads q/k/v via coopLoad → needs touch barriers.
+            prefill_gl_iq: load("attn_prefill_global_flash_sp_iq")?,
             touch: load("touch")?,
         };
 
@@ -530,54 +569,81 @@ impl<'a> GpuModel<'a> {
             no_push,
             rope_k.groups_for(rope_pairs(n_kv)),
         )?;
-        let append = if sliding {
-            &self.k.append_sl
+        // KV append: V is f16 on both kinds; K is f16 (ring) on sliding,
+        // Q8 (quantize-and-append) on global (Piece A).
+        if sliding {
+            let dst_k = kv.k.as_ref().expect("sliding K is f16");
+            for (src, dst) in [(k, dst_k), (v, &kv.v)] {
+                rec.dispatch(
+                    &self.k.append_sl,
+                    vec![
+                        buf(0, src.clone()),
+                        buf(1, dst.clone()),
+                        buf(2, self.step.clone()),
+                    ],
+                    no_push,
+                    self.k.append_sl.groups_for(kv_dim as u64),
+                )?;
+            }
         } else {
-            &self.k.append_gl
-        };
-        for (src, dst) in [(k, &kv.k), (v, &kv.v)] {
             rec.dispatch(
-                append,
+                &self.k.append_gl_q8,
                 vec![
-                    buf(0, src.clone()),
-                    buf(1, dst.clone()),
+                    buf(0, k.clone()),
+                    buf(1, kv.k_scales.as_ref().unwrap().clone()),
+                    buf(2, kv.k_quants.as_ref().unwrap().clone()),
+                    buf(3, self.step.clone()),
+                ],
+                no_push,
+                self.k.append_gl_q8.groups_for((kv_dim / 32) as u64),
+            )?;
+            rec.dispatch(
+                &self.k.append_gl,
+                vec![
+                    buf(0, v.clone()),
+                    buf(1, kv.v.clone()),
                     buf(2, self.step.clone()),
                 ],
                 no_push,
-                append.groups_for(kv_dim as u64),
+                self.k.append_gl.groups_for(kv_dim as u64),
             )?;
         }
-        let (attn_k, red_k, part, attn_out, n_splits) = if sliding {
-            (
-                &self.k.attn_sl,
-                &self.k.reduce256,
-                &b.part_sl,
-                &b.attn_sl,
-                SPLITS_SLIDING,
-            )
+        let (red_k, part, attn_out, n_splits) = if sliding {
+            (&self.k.reduce256, &b.part_sl, &b.attn_sl, SPLITS_SLIDING)
         } else {
-            (
-                &self.k.attn_gl,
-                &self.k.reduce512,
-                &b.part_gl,
-                &b.attn_gl,
-                SPLITS_GLOBAL,
-            )
+            (&self.k.reduce512, &b.part_gl, &b.attn_gl, SPLITS_GLOBAL)
         };
         // Push = { n_splits: u32, scale: f32 }, as two words (scale 1.0 —
-        // QK-norm replaces 1/√d, pinned).
-        rec.dispatch(
-            attn_k,
-            vec![
-                buf(0, q.clone()),
-                buf(1, kv.k.clone()),
-                buf(2, kv.v.clone()),
-                buf(3, part.clone()),
-                buf(4, self.step.clone()),
-            ],
-            Some([n_splits, 1.0f32.to_bits()]),
-            [n_kv as u32, n_splits, 1],
-        )?;
+        // QK-norm replaces 1/√d, pinned). Sliding reads f16 K (5 bindings);
+        // global dequants the Q8 K cache (k_quants + k_scales, 6 bindings).
+        if sliding {
+            rec.dispatch(
+                &self.k.attn_sl,
+                vec![
+                    buf(0, q.clone()),
+                    buf(1, kv.k.as_ref().unwrap().clone()),
+                    buf(2, kv.v.clone()),
+                    buf(3, part.clone()),
+                    buf(4, self.step.clone()),
+                ],
+                Some([n_splits, 1.0f32.to_bits()]),
+                [n_kv as u32, n_splits, 1],
+            )?;
+        } else {
+            rec.dispatch(
+                &self.k.attn_gl_q8,
+                vec![
+                    buf(0, q.clone()),
+                    buf(1, kv.k_quants.as_ref().unwrap().clone()),
+                    buf(2, kv.k_scales.as_ref().unwrap().clone()),
+                    buf(3, kv.v.clone()),
+                    buf(4, part.clone()),
+                    buf(5, self.step.clone()),
+                ],
+                Some([n_splits, 1.0f32.to_bits()]),
+                [n_kv as u32, n_splits, 1],
+            )?;
+        }
         rec.dispatch(
             red_k,
             vec![buf(0, part.clone()), buf(1, attn_out.clone())],
@@ -1055,35 +1121,62 @@ impl<'a> GpuModel<'a> {
         // queries); sliding attends from ring + chunk FIRST, then appends
         // (plan 03 §prefill — appending first would overwrite early
         // queries' windows).
-        let append = if sliding {
-            &self.k.append_sl
-        } else {
-            &self.k.append_gl
-        };
         let real = (n_real * kv_dim) as u64;
         let do_appends = |rec: &mut GraphRecorder<'_>| -> Result<(), GpuError> {
-            for (src, dst) in [(k, &kv.k), (v, &kv.v)] {
+            if sliding {
+                let dst_k = kv.k.as_ref().expect("sliding K is f16");
+                for (src, dst) in [(k, dst_k), (v, &kv.v)] {
+                    rec.dispatch(
+                        &self.k.append_sl,
+                        vec![
+                            buf(0, src.clone().slice(0..real)),
+                            buf(1, dst.clone()),
+                            buf(2, self.step.clone()),
+                        ],
+                        None::<u32>,
+                        self.k.append_sl.groups_for(real),
+                    )?;
+                }
+            } else {
+                // Global K → Q8 quantize-and-append (Piece A); V stays f16.
                 rec.dispatch(
-                    append,
+                    &self.k.append_gl_q8,
                     vec![
-                        buf(0, src.clone().slice(0..real)),
-                        buf(1, dst.clone()),
+                        buf(0, k.clone().slice(0..real)),
+                        buf(1, kv.k_scales.as_ref().unwrap().clone()),
+                        buf(2, kv.k_quants.as_ref().unwrap().clone()),
+                        buf(3, self.step.clone()),
+                    ],
+                    None::<u32>,
+                    self.k.append_gl_q8.groups_for(real / 32),
+                )?;
+                rec.dispatch(
+                    &self.k.append_gl,
+                    vec![
+                        buf(0, v.clone().slice(0..real)),
+                        buf(1, kv.v.clone()),
                         buf(2, self.step.clone()),
                     ],
                     None::<u32>,
-                    append.groups_for(real),
+                    self.k.append_gl.groups_for(real),
                 )?;
             }
             Ok(())
         };
 
         let attn_out = if sliding { &p.attn_sl } else { &p.attn_gl };
+        // Touch a u32 (i8-packed) coopLoad-only producer so vulkano emits its
+        // write→read barrier (the `touch` closure only types f16 buffers).
+        let touch_u32 = |rec: &mut GraphRecorder<'_>, b: &Subbuffer<[u32]>| -> Result<(), GpuError> {
+            rec.dispatch(&self.k.touch, vec![buf(0, b.clone())], None::<u32>, [1, 1, 1])
+                .map(|_| ())
+        };
         if sliding {
             rec.dispatch(
                 &self.k.prefill_sl,
                 vec![
                     buf(0, q.clone()),
-                    buf(1, kv.k.clone()),
+                    buf(1, kv.k.as_ref().unwrap().clone()),
                     buf(2, kv.v.clone()),
                     buf(3, k.clone()),
                     buf(4, v.clone()),
@@ -1096,21 +1189,37 @@ impl<'a> GpuModel<'a> {
             do_appends(rec)?;
         } else {
             do_appends(rec)?;
-            // Single-pass flash reads q/k/v via coopLoad (invisible to
-            // vulkano auto-sync) — touch the producers (rope q, appended KV)
-            // so the write→read barriers materialize (touch.wgsl). Grid is
-            // [N_Q_HEADS=32, m_pad/M_Q], M_Q=16 (vs the naive [n_kv, m_pad]).
-            touch(rec, q)?;
-            touch(rec, &kv.k)?;
-            touch(rec, &kv.v)?;
+            // Q-quant the roped global Q to Q8 once (shared across the per-head
+            // QKᵀ), matching the K cache format so int8-QKᵀ reads both operands
+            // as i8 (Piece A). quant_q8 bindings: (src, scales, quants).
             rec.dispatch(
-                &self.k.prefill_gl,
+                &self.k.quant_q8,
                 vec![
                     buf(0, q.clone()),
-                    buf(1, kv.k.clone()),
-                    buf(2, kv.v.clone()),
-                    buf(3, attn_out.clone()),
-                    buf(4, self.step.clone()),
+                    buf(1, p.q_scales_gl.clone()),
+                    buf(2, p.q_i8_gl.clone()),
+                ],
+                no_push,
+                self.k.quant_q8.groups_for((m_pad * q_dim / 32) as u64),
+            )?;
+            // The int8 flash reads q_i8/k_quants/v via coopLoad (invisible to
+            // vulkano auto-sync) — touch every producer so the write→read
+            // barriers materialize (touch.wgsl). k_scales is plain-indexed but
+            // touched too (cheap). Grid [N_Q_HEADS=32, m_pad/M_Q], M_Q=16.
+            touch_u32(rec, &p.q_i8_gl)?;
+            touch_u32(rec, kv.k_quants.as_ref().unwrap())?;
+            touch(rec, kv.k_scales.as_ref().unwrap())?;
+            touch(rec, &kv.v)?;
+            rec.dispatch(
+                &self.k.prefill_gl_iq,
+                vec![
+                    buf(0, p.q_i8_gl.clone()),
+                    buf(1, p.q_scales_gl.clone()),
+                    buf(2, kv.k_quants.as_ref().unwrap().clone()),
+                    buf(3, kv.k_scales.as_ref().unwrap().clone()),
+                    buf(4, kv.v.clone()),
+                    buf(5, attn_out.clone()),
+                    buf(6, self.step.clone()),
                 ],
                 Some(1.0f32),
                 [32, (m_pad / 16) as u32, 1],

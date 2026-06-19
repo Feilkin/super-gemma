@@ -778,6 +778,108 @@ fn attn_prefill_global_flash_sp_iq_matches_reference() {
     }
 }
 
+/// Global decode against the Q8 K cache (Piece A): K is dequanted from i8 +
+/// f16 scales in-kernel; the reference uses the same dequanted K. V/Q f16.
+#[test]
+fn attn_decode_global_q8k_matches_reference() {
+    let Some(ctx) = ctx() else { return };
+    let part_k = ctx.load_kernel("attn_decode_global_q8k").unwrap();
+    let red_k = ctx.load_kernel("attn_reduce_d512").unwrap();
+    let mut rng = Rng::new(0xA79);
+
+    for (kv_len, n_splits) in [(333usize, 1u32), (333, 5), (3, 8), (4096, 4)] {
+        let q = through_f16(&rng.f32_vec(N_Q_HEADS * GL_DIM));
+        let k = through_f16(&rng.f32_vec(kv_len * GL_KV_HEADS * GL_DIM));
+        let v = through_f16(&rng.f32_vec(kv_len * GL_KV_HEADS * GL_DIM));
+        // Q8-quantize K per 32-block along head-dim (one (token,head) row =
+        // HD_BLOCKS=16 contiguous blocks); the reference uses k_deq.
+        let (k_quants, k_scales, k_deq) = q8_quant(&k);
+
+        let q_buf = ctx
+            .buffer_from_iter(to_f16_bits(&q), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let kq_buf = ctx
+            .buffer_from_iter(k_quants, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let ks_buf = ctx
+            .buffer_from_iter(k_scales, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let v_buf = ctx
+            .buffer_from_iter(to_f16_bits(&v), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let part_buf = ctx
+            .new_buffer::<f32>(
+                (N_Q_HEADS * n_splits as usize * GL_PART_STRIDE) as u64,
+                BufferUsage::STORAGE_BUFFER,
+            )
+            .unwrap();
+        let out_buf = ctx
+            .new_buffer::<u16>((N_Q_HEADS * GL_DIM) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+
+        ctx.dispatch_blocking(
+            &part_k,
+            vec![
+                WriteDescriptorSet::buffer(0, q_buf),
+                WriteDescriptorSet::buffer(1, kq_buf),
+                WriteDescriptorSet::buffer(2, ks_buf),
+                WriteDescriptorSet::buffer(3, v_buf),
+                WriteDescriptorSet::buffer(4, part_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    5,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            kv_len_global: kv_len as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            ],
+            Some(PushSplitScale {
+                n_splits,
+                scale: GL_SCALE,
+            }),
+            [GL_KV_HEADS as u32, n_splits, 1],
+        )
+        .unwrap();
+        ctx.dispatch_blocking(
+            &red_k,
+            vec![
+                WriteDescriptorSet::buffer(0, part_buf),
+                WriteDescriptorSet::buffer(1, out_buf.clone()),
+            ],
+            Some(n_splits),
+            [N_Q_HEADS as u32, 1, 1],
+        )
+        .unwrap();
+        let got = from_f16_bits(&out_buf.read().unwrap());
+
+        for qh in 0..N_Q_HEADS {
+            let want = attention_head(
+                &q,
+                &k_deq,
+                &v,
+                0,
+                qh,
+                N_Q_HEADS,
+                GL_KV_HEADS,
+                GL_DIM,
+                GL_SCALE as f64,
+                0,
+                kv_len - 1,
+            );
+            assert_close(
+                &got[qh * GL_DIM..][..GL_DIM],
+                &want,
+                ATOL,
+                RTOL,
+                &format!("decode_global_q8k kv_len={kv_len} splits={n_splits} qh={qh}"),
+            );
+        }
+    }
+}
+
 /// Plan 02/06: bit-identical across runs (fixed split count and order).
 #[test]
 fn attn_is_bit_deterministic() {
