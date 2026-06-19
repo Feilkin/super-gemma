@@ -7,10 +7,15 @@
 //! tap, so a layer-type-specific bug (rope variant, K≠V, window mask)
 //! localizes to its first layer immediately.
 //!
-//! Thresholds (initial calibration 2026-06-12): the GPU runs f16
-//! activations against the oracle's f32/f64, so per-layer normalized RMS
-//! error ≤ 0.02 and final-logit agreement is rank-based (argmax equal,
-//! top-20 overlap ≥ 18, |Δ| ≤ 0.25 on logits with |cpu| > 1).
+//! Thresholds (initial calibration 2026-06-12; Q8-K update 2026-06-19): the
+//! GPU runs f16 activations against the oracle's f32/f64. Decode's global
+//! attention now reads the Q8 K cache (Piece A), so the residual stream
+//! carries the int8/Q8 divergence-toward-llama.cpp envelope — the same one
+//! `prefill_parity` bounds at 0.045 on the GLOBAL worst (not a per-layer
+//! early-exit, since the error accumulates down the stack). Final-logit
+//! agreement stays rank-based (argmax equal, top-20 overlap ≥ 18,
+//! |Δ| ≤ 0.25 on logits with |cpu| > 1) — the real correctness gate, with
+//! the f64 oracle, alongside perplexity and the kernel parity tests.
 
 use std::path::PathBuf;
 
@@ -90,11 +95,6 @@ fn gpu_graph_matches_cpu_reference_per_layer_and_logits() {
             if e > worst.0 {
                 worst = (e, t, i);
             }
-            assert!(
-                e <= 0.02,
-                "token {t} layer {i} ({:?}): nrmse {e:.5} > 0.02",
-                cpu.desc.layer_kinds[i]
-            );
         }
         gpu.submit(&logits_graph).expect("submit logits");
         let gpu_logits = gpu.read_logits().expect("read logits");
@@ -126,6 +126,23 @@ fn gpu_graph_matches_cpu_reference_per_layer_and_logits() {
             worst.0, worst.1, worst.2
         );
     }
+
+    // Per-layer envelope, asserted on the GLOBAL worst (the Q8-K decode
+    // divergence accumulates down the stack — see the header). The f64-oracle
+    // logit checks above are the real correctness gate.
+    let tol = 0.045;
+    assert!(
+        worst.0 <= tol,
+        "worst layer {} token {} ({:?}): nrmse {:.5} > {tol}",
+        worst.2,
+        worst.1,
+        cpu.desc.layer_kinds[worst.2],
+        worst.0,
+    );
+    eprintln!(
+        "per-layer decode ok (worst nrmse {:.5} @ token {} layer {})",
+        worst.0, worst.1, worst.2
+    );
 
     // The same tokens through ONE pre-recorded full graph (the production
     // decode graph, driven only by step-buffer/embedding rewrites) must
