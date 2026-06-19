@@ -293,6 +293,19 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: false,
     },
+    // Quantize-and-append for the int8 V of the global cache (Piece B): V is
+    // blocked along the KEY axis (32-key blocks) so the PV per-block scale
+    // factors out of the i8 dot. One thread per (32-key block, head, 4-col).
+    Variant {
+        name: "kv_append_global_v_q8",
+        src: "kv_append_global_v_q8",
+        defs: &[("N_KV_HEADS", 4), ("HEAD_DIM", 512), ("WG_X", 64)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: false,
+    },
     Variant {
         name: "kv_dequant_q8",
         src: "kv_dequant_q8",
@@ -1042,6 +1055,29 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // 0-stride coopLoad broadcast smoke test: build a 16×16 outer product from
+    // 16+16 elements without an LDS matrix. Not production.
+    Variant {
+        name: "coop_bcast_smoke",
+        src: "coop_bcast_smoke",
+        defs: &[],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Same, but the 0-stride loads read from WORKGROUP (LDS) memory.
+    Variant {
+        name: "coop_bcast_lds_smoke",
+        src: "coop_bcast_lds_smoke",
+        defs: &[],
+        workgroup: [64, 1, 1],
+        bindings: 3,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // int8-coopmat toolchain smoke test (docs/naga-int8-coopmat-patch.md):
     // proves the naga fork emits signed-int8 coopmat SPIR-V. Not production.
     Variant {
@@ -1156,6 +1192,27 @@ const VARIANTS: &[Variant] = &[
     Variant {
         name: "attn_prefill_global_flash_sp_ipv",
         src: "attn_prefill_global_flash_sp_ipv",
+        defs: &[
+            ("HEAD_DIM", 512),
+            ("N_KV_HEADS", 4),
+            ("Q_PER_KV", 8),
+            ("M_Q", 16),
+            ("N_K", 64),
+            ("WG_X", 64),
+            ("S_STAGE_LEN", 1024),
+            ("P_SCALES_LEN", 32),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 8,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // PROTOTYPE: _ipv with both rescales' [16×16] scale built by 0-stride coopLoad
+    // broadcasts (no LDS sc_stage, one fewer barrier per rescale). Same 8 bindings.
+    Variant {
+        name: "attn_prefill_global_flash_sp_ipv_bcast",
+        src: "attn_prefill_global_flash_sp_ipv_bcast",
         defs: &[
             ("HEAD_DIM", 512),
             ("N_KV_HEADS", 4),

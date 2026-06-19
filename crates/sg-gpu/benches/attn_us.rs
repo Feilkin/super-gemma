@@ -591,6 +591,14 @@ fn bench(c: &mut Criterion) {
         let flash_sp_iq = ctx
             .load_kernel("attn_prefill_global_flash_sp_iq")
             .expect("kernel");
+        // int8 QKᵀ AND int8 PV (Piece B): V also streams i8 from the cache.
+        let flash_sp_ipv = ctx
+            .load_kernel("attn_prefill_global_flash_sp_ipv")
+            .expect("kernel");
+        // _ipv with both rescales built by 0-stride coopLoad broadcasts.
+        let flash_sp_ipv_bcast = ctx
+            .load_kernel("attn_prefill_global_flash_sp_ipv_bcast")
+            .expect("kernel");
         let mut cmp = c.benchmark_group("attn_flash_cmp");
         cmp.sample_size(10)
             .warm_up_time(std::time::Duration::from_secs(1))
@@ -699,6 +707,38 @@ fn bench(c: &mut Criterion) {
                 [],
             )
             .unwrap();
+            let set_flash_sp_ipv = DescriptorSet::new(
+                ctx.descriptor_set_allocator().clone(),
+                flash_sp_ipv.layout().set_layouts()[0].clone(),
+                vec![
+                    WriteDescriptorSet::buffer(0, q_i8.clone()),
+                    WriteDescriptorSet::buffer(1, q_sc.clone()),
+                    WriteDescriptorSet::buffer(2, kq.clone()),
+                    WriteDescriptorSet::buffer(3, ks.clone()),
+                    WriteDescriptorSet::buffer(4, vq.clone()),
+                    WriteDescriptorSet::buffer(5, vs.clone()),
+                    WriteDescriptorSet::buffer(6, out.clone()),
+                    WriteDescriptorSet::buffer(7, step.clone()),
+                ],
+                [],
+            )
+            .unwrap();
+            let set_flash_sp_ipv_bcast = DescriptorSet::new(
+                ctx.descriptor_set_allocator().clone(),
+                flash_sp_ipv_bcast.layout().set_layouts()[0].clone(),
+                vec![
+                    WriteDescriptorSet::buffer(0, q_i8.clone()),
+                    WriteDescriptorSet::buffer(1, q_sc.clone()),
+                    WriteDescriptorSet::buffer(2, kq.clone()),
+                    WriteDescriptorSet::buffer(3, ks.clone()),
+                    WriteDescriptorSet::buffer(4, vq.clone()),
+                    WriteDescriptorSet::buffer(5, vs.clone()),
+                    WriteDescriptorSet::buffer(6, out.clone()),
+                    WriteDescriptorSet::buffer(7, step.clone()),
+                ],
+                [],
+            )
+            .unwrap();
             let set_flash_sp_q8 = DescriptorSet::new(
                 ctx.descriptor_set_allocator().clone(),
                 flash_sp_q8.layout().set_layouts()[0].clone(),
@@ -754,6 +794,22 @@ fn bench(c: &mut Criterion) {
                 set_flash_sp_iq,
                 [N_Q_HEADS as u32, (m / 16) as u32, 1],
                 format!("flash_sp_iq_ctx{l}"),
+            );
+            time_prefill(
+                &mut cmp,
+                &ctx,
+                &flash_sp_ipv,
+                set_flash_sp_ipv,
+                [N_Q_HEADS as u32, (m / 16) as u32, 1],
+                format!("flash_sp_ipv_ctx{l}"),
+            );
+            time_prefill(
+                &mut cmp,
+                &ctx,
+                &flash_sp_ipv_bcast,
+                set_flash_sp_ipv_bcast,
+                [N_Q_HEADS as u32, (m / 16) as u32, 1],
+                format!("flash_sp_ipv_bcast_ctx{l}"),
             );
         }
         cmp.finish();

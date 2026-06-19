@@ -1,3 +1,8 @@
+// PROTOTYPE: _ipv with the per-block rescale's [16×16] scale built by 0-stride
+// coopLoad broadcasts instead of a 256-element scalar LDS build (both the QKᵀ
+// and PV rescales). Removes the sc_stage LDS array, the scalar outer-product
+// loop, and one barrier per rescale. See the rescale doc in the QKᵀ loop.
+//
 // int8-matmul QKᵀ AND PV flash (Piece B). Extends attn_prefill_global_flash_sp_iq
 // (int8 QKᵀ, f16 PV) by also running PV in signed int8 — halving V DRAM traffic
 // on top of K. Both matmuls are i8×i8→i32 coopmat products with a per-32-block
@@ -63,11 +68,11 @@ var<workgroup> corr_stage: array<f32, 256>;
 var<workgroup> o_stage: array<f32, 256>;
 var<workgroup> m_row: array<f32, #{M_Q}>;
 var<workgroup> l_row: array<f32, #{M_Q}>;
-// Per-block rescale staging, shared by QKᵀ (q⊗k) and PV (p⊗v): the 16+16 row/col
-// scales and their [16 × 16] outer product.
+// Per-block rescale row/col scale vectors (16 each). The [16×16] outer product
+// is built from these by 0-stride coopLoads (see the rescale doc in the QKᵀ
+// loop) — no LDS matrix, unlike the f16 PV baseline / the scalar build.
 var<workgroup> qs_l: array<f32, 16>;
 var<workgroup> ks_l: array<f32, 16>;
-var<workgroup> sc_stage: array<f32, 256>;
 
 @compute @workgroup_size(#{WG_X})
 fn main(
@@ -113,19 +118,32 @@ fn main(
                         &k_quants[(key0 * N_KV_HEADS + kvh) * HEAD_DIM + d], KV_ROW_STRIDE);
                     acc = coopMultiplyAdd(a, b, acc);
                 }
-                // Build this block's [16 q × 16 key] scale outer product in LDS.
+                // --- Per-block rescale -------------------------------------
+                // `acc` holds the i32 dot Σ Q_i8·K_i8 for this 32-elem block.
+                // The true score is acc[q][key] · q_scale[q] · k_scale[key]
+                // (each operand was quantized with its own per-32-block scale),
+                // so we must multiply `acc` by the rank-1 outer product
+                // qs[q] ⊗ ks[key]. A coopmat has no per-element register access,
+                // so the scale has to enter as its OWN [16×16] fragment `scf`
+                // applied with the whole-fragment op `scf * f32(acc)`.
+                //
+                // We build `scf` from the two 16-element scale vectors with
+                // 0-STRIDE coopLoads (broadcast a vector across the fragment —
+                // verified by coop_bcast_lds_smoke), so the element-wise product
+                // is the outer product, with NO 16×16 LDS materialization. One
+                // load is transposed (coopLoadT) so the two broadcasts run on
+                // opposite axes; which vector gets the T is pinned by parity
+                // (it must land in the same fragment layout as `acc`, which the
+                // scalar-`sc_stage` baseline reached via coopLoadT(.,16)).
                 if (lid < 16u) {
                     qs_l[lid] = f32(q_scales[(m0 + lid) * QS_STRIDE + qh * HD_BLOCKS + blk]);
                     ks_l[lid] = f32(k_scales[(key0 + lid) * KS_STRIDE + kvh * HD_BLOCKS + blk]);
                 }
-                workgroupBarrier();
-                for (var i = lid; i < 256u; i += WG) {
-                    sc_stage[i] = qs_l[i / 16u] * ks_l[i % 16u];
-                }
-                workgroupBarrier();
-                let scf = coopLoadT<coop_mat16x16<f32, C>>(&sc_stage[0], 16u);
+                workgroupBarrier(); // qs_l/ks_l written before the 0-stride loads
+                let scf = coopLoad<coop_mat16x16<f32, C>>(&qs_l[0], 0u)
+                    * coopLoadT<coop_mat16x16<f32, C>>(&ks_l[0], 0u);
                 cs = cs + scf * f32(acc); // arith fork: cs += scale ⊙ f32(i8 dot)
-                workgroupBarrier(); // before next blk overwrites qs_l/ks_l/sc_stage
+                workgroupBarrier(); // before next blk overwrites qs_l/ks_l
             }
             coopStoreT(cs, &s_stage[nt * 16u], N_K);
         }
@@ -198,19 +216,18 @@ fn main(
                     let bv = coopLoadT<coop_mat16x16<i8, B>>(&v_quants[v_key0 + ot * 16u], KV_ROW_STRIDE);
                     acc = coopMultiplyAdd(ap, bv, acc);
                 }
-                // [16 q × 16 c] rescale = p_scale[q,kb] ⊗ v_scale[kb, ot-tile col].
+                // Per-block PV rescale (same construction as the QKᵀ rescale
+                // above): scale the i32 PV dot by p_scale[q,kb] ⊗ v_scale[kb,c],
+                // the row/col scales built into a fragment by 0-stride coopLoads.
                 if (lid < 16u) {
                     qs_l[lid] = p_scales[lid * KB + kb];
                     ks_l[lid] = f32(v_scales[((vkb0 + kb) * N_KV_HEADS + kvh) * HEAD_DIM + ot * 16u + lid]);
                 }
-                workgroupBarrier();
-                for (var i = lid; i < 256u; i += WG) {
-                    sc_stage[i] = qs_l[i / 16u] * ks_l[i % 16u];
-                }
-                workgroupBarrier();
-                let scf = coopLoadT<coop_mat16x16<f32, C>>(&sc_stage[0], 16u);
+                workgroupBarrier(); // qs_l/ks_l written before the 0-stride loads
+                let scf = coopLoad<coop_mat16x16<f32, C>>(&qs_l[0], 0u)
+                    * coopLoadT<coop_mat16x16<f32, C>>(&ks_l[0], 0u);
                 o[ot] = o[ot] + scf * f32(acc);
-                workgroupBarrier(); // before next (ot,kb) overwrites qs_l/ks_l/sc_stage
+                workgroupBarrier(); // before next (ot,kb) overwrites qs_l/ks_l
             }
         }
         workgroupBarrier();
