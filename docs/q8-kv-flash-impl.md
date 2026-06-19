@@ -1,33 +1,60 @@
-# Q8 global KV cache — implementation plan (Piece A) + B starting point
+# Q8 KV cache — Piece A SHIPPED (reference) + Piece B plan (int8 V/PV)
 
-Goal: bank the validated int8-QKᵀ Q8-K flash win (−25–30% long-context prefill,
-commit `e99307a`) end-to-end. The kernels are committed and parity-green; this is
-the graph plumbing + quality gate. **Read this whole doc before editing — the
-layout-consistency in §2 is the one non-obvious trap.**
+**Piece A (Q8 global K cache) is done and merged to `main` (2026-06-19).** This
+doc is now (a) the as-landed reference for what exists, and (b) the starting
+point for **Piece B — int8 V/PV**, which is intended for a clean context. Read
+§1–§2 (the Q8_0 format + layout reasoning, still load-bearing) and the "Piece A
+as-landed" map before starting B.
 
-Status of the pieces (all committed, bench/parity-green, NOT wired into the graph):
-- `attn_prefill_global_flash_sp_iq.wgsl` — int8 QKᵀ (Q8 K + pre-quantized i8 Q,
-  per-block rescale), f16 PV. 7 bindings: `q_i8, q_scales, k_quants, k_scales, v,
-  out, step`.
-- `kv_append_global_q8.wgsl` — f16→Q8 quantize-and-append for the global K cache
-  (linear slot = pos+token). 4 bindings: `src(f16), scales(f16,rw), quants(u32,rw),
-  step`.
-- `kv_quant_q8` / `kv_dequant_q8` — generic Q8_0 codecs (reuse `kv_quant_q8` for the
-  Q-quant; `kv_dequant_q8`'s dequant math is the template for the decode kernel).
-- `attn_prefill_global_flash_sp_q8.wgsl` — the f16-convert DEAD END (7× slower),
-  kept only as the labeled `attn_flash_cmp` baseline. Do not wire it.
-- Usage references: the `attn_flash_cmp` bench (`benches/attn_us.rs`) and the
-  parity test `attn_prefill_global_flash_sp_iq_matches_reference`
-  (`tests/parity_attn.rs`) show buffer setup + the dequanted-value reference; the
-  CPU `q8_quant` helper is in `tests/reference/mod.rs`.
+## Status
 
-Scope: **global layers only** (global KV grows with context = the bottleneck;
-sliding is window-capped at 1024 → stays f16). **K → Q8, V → f16** (V's int8 is
-blocked — see §6/B).
+- **Piece A — DONE, quality-green, e2e win banked.** Commits `d9a7d30` (code),
+  `c57d06e` / `47e2bca` / `46104c5` (docs + tests) on `main`. Global K is Q8
+  (i8 quants + f16 per-32-block scales); **V stays f16**, sliding stays f16.
+  - Gates: kernel parity (`attn_prefill_global_flash_sp_iq_matches_reference`,
+    `attn_decode_global_q8k_matches_reference`); `prefill_parity` per-layer
+    nrmse 0.039; `gpu_parity` decode worst 0.025 (logits 20/20); **perplexity
+    wikitext 0.10 % / code 1.11 %** within tolerance.
+  - e2e (sg-bench profile, perf=high): prefill **287/191/115 → 286/209/141
+    tok/s @ q0 0/8K/32K** (+0 % / +9.4 % / +22.6 %); global attention layer
+    118 → 79 ms at 32K. Decode unchanged. ~67 MB/global-layer saved.
+- **Piece B — NOT started.** int8 V/PV, to halve V traffic too (likely another
+  similar long-context increment). The harder kernel problem (§B). V's quant
+  axis ≠ the PV contraction — that's the whole difficulty.
 
----
+## Piece A as-landed — the map B extends
 
-## 1. The Q8_0 SoA format (one definition, used everywhere)
+Kernels (sg-gpu `shaders/` + `build.rs`):
+- `attn_prefill_global_flash_sp_iq.wgsl` — global prefill: int8 QKᵀ (Q8 K +
+  pre-quant i8 Q, per-block rescale), **f16 PV** (bindings: `q_i8, q_scales,
+  k_quants, k_scales, v, out, step`). PV is the f16 block at lines ~156–165.
+- `attn_decode_global_q8k.wgsl` — global decode: scalar-dequant K (i8+f16) +
+  subgroupAdd, **f16 V** (bindings: `q, k_quants, k_scales, v, part, step`).
+- `kv_append_global_q8.wgsl` — f16→Q8 quantize-and-append for global K.
+- Retired from the graph (kept in build.rs as bench/parity baselines, NOT in
+  `Kernels`): `attn_decode_global`, `attn_prefill_global_flash_sp`,
+  `attn_prefill_global_flash_sp_q8` (the 7×-slow f16-convert dead end).
+
+Graph (`crates/sg-model/src/graph.rs`, anchors as of `46104c5`):
+- `KvStore` (struct ~113): sliding `k: Some([u16])`; global `k_quants:
+  Some([u32])` + `k_scales: Some([u16])`; **`v: [u16]` f16 on both kinds**.
+  Alloc ~365–386 (sliding vs global branch).
+- Prefill global (`record_prefill_layer`): append `do_appends` ~1126 (global K
+  → `kv_append_global_q8` ~1145, **V → `kv_append_global` ~1154 f16**);
+  Q-quant ~1196 (`kv_quant_q8` on `q` → `p.q_i8_gl`/`p.q_scales_gl`, fields
+  ~253, alloc ~356); touches ~1209–1212; `prefill_gl_iq` dispatch ~1214
+  (**V bound at buf(4) ~1220**).
+- Decode global (`record_layer`): append ~590 (global K → q8 ~591, **V →
+  `kv_append_global` ~601 f16**); `attn_gl_q8` dispatch ~634 (**V bound at
+  buf(3) ~639**).
+- `p.q_i8_gl`/`p.q_scales_gl` are the per-chunk Q-quant scratch (mirror
+  `xn_i8`/`xn_scales`); reuse the same pattern if B needs V-side scratch.
+
+**So every place V is touched today is plain f16** — that's exactly the set
+Piece B must change (KvStore.v, both global appends, the prefill PV read, the
+decode V read), plus a new reference + parity.
+
+## 1. The Q8_0 SoA format (one definition, used by K and Q; template for V)
 
 Blocks of **32** elements along the contiguous array. Per block: one f16 scale
 `d = amax·(1/127)` and 32 i8 quants `round_ties_even(x/d)` packed 4-per-u32
@@ -39,125 +66,93 @@ Blocks of **32** elements along the contiguous array. Per block: one f16 scale
 `d` uses a reciprocal multiply (GPU FDiv is 2.5 ULP), the scale stores through
 `f16()` (RTNE; `pack2x16float` truncates on RADV), `round` is round-half-even.
 The GPU is the authoritative producer; ±1 quant at exact boundaries is fine.
+CPU mirror: `q8_quant` in `crates/sg-gpu/tests/reference/mod.rs`.
 
-## 2. Layout consistency — VERIFIED, do not deviate
+## 2. Layout consistency (why K/Q agree for free — and why V is HARD)
 
-The whole point: `kv_quant_q8` (Q-quant), `kv_append_global_q8` (K append) and
-`_iq` (reader) all agree **for free** because they share the §1 format over these
-shapes. Proven by index algebra (HD_BLOCKS = HEAD_DIM/32 = 16, N_KV_HEADS = 4,
-N_Q_HEADS = 32):
+K and Q share the §1 format over their shapes, so `kv_quant_q8` (Q),
+`kv_append_global_q8` (K) and `_iq` (reader) agree by index algebra (verified;
+HD_BLOCKS = HEAD_DIM/32 = 16, N_KV_HEADS = 4, N_Q_HEADS = 32). The crux: **K is
+quantized along head-dim, which IS the QKᵀ contraction axis**, so each 32-block's
+scale factors out of the i8 dot. That is the only reason int8 QKᵀ works.
 
-- **Global K cache:** quants `[L × N_KV_HEADS × HEAD_DIM]` i8, scales
-  `[L × N_KV_HEADS × HD_BLOCKS]` f16. `kv_append_global_q8` (ROW_LEN=2048) writes
-  key `slot`'s block `(kvh, blk)` to `scales[slot·64 + kvh·16 + blk]` and i8 element
-  `(kvh,hd)` to flat index `slot·2048 + kvh·512 + hd`. `_iq` reads exactly those
-  (`k_scales[(key·N_KV_HEADS + kvh)·HD_BLOCKS + blk]`, `k_quants[(key·N_KV_HEADS +
-  kvh)·HEAD_DIM + hd]`). ✓
-- **Q:** run `kv_quant_q8` on the roped global `q_gl` `[m × N_Q_HEADS × HEAD_DIM]`
-  f16 → `q_i8` `[m × N_Q_HEADS × HEAD_DIM]` i8 + `q_scales`
-  `[m × N_Q_HEADS × HD_BLOCKS]` f16. `_iq` reads
-  `q_scales[(query·N_Q_HEADS + qh)·HD_BLOCKS + blk]` and `q_i8[(query·N_Q_HEADS +
-  qh)·HEAD_DIM + hd]` — exactly the flat 32-block layout `kv_quant_q8` produces. ✓
+**V does not have this property** (the entire Piece B problem). PV computes
+`O[q][d] = Σ_key P[q][key]·V[key][d]`, contracting over **keys**. V is currently
+stored quantized-able along **head-dim** (per-vector, compact) — which does NOT
+align with the key contraction, so a per-block V scale sits *inside* the key-sum
+and cannot be pulled out of an int8 dot. Hence f16 PV in Piece A.
 
-So **do not invent a new layout** — quantize Q with the existing `kv_quant_q8`,
-append K with `kv_append_global_q8`, and the reader just works. The `_iq` parity
-test already exercises this format end-to-end on the CPU side (`q8_quant`).
+## 3. Validation gates (same as Piece A used)
 
-## 3. `KvStore` → Q8 K (graph.rs:108 + alloc ~340)
+Run in cheap→expensive order:
+- `cargo build --release --workspace --tests --benches` + `clippy -D warnings`.
+- **Kernel parity** (fast, no model): `parity_attn` — add a V/PV parity case
+  mirroring the `_iq` test, quantizing V in whatever layout B chooses; reference
+  uses the dequanted V (`q8_quant`-style).
+- **Prefill quality proxy** (~70 s): `prefill_parity` — per-layer nrmse (Q8-K
+  alone landed 0.039; adding Q8-V should stay ≤ ~0.045, re-check the bound) +
+  chunked-vs-oracle/decode.
+- **Decode correctness**: `gpu_parity` (global-worst nrmse ≤ 0.045; logits the
+  real gate).
+- **Perplexity** (minutes): wikitext < 0.5 %, code within the calibrated band.
+- **e2e win**: `sg-bench profile`, compare prefill @ q0 8K/32K.
 
-Make the global K buffers Q8; keep V f16 and the sliding path f16 (don't allocate
-a full f16 global K — that's the memory the Q8 saves). Option fields keep the
-`sliding` branch unchanged:
-
-```rust
-struct KvStore {
-    k: Option<Subbuffer<[u16]>>,        // sliding: f16 K
-    k_quants: Option<Subbuffer<[u32]>>, // global: Q8 K quants  (kv_dim_gl·slots/4 u32)
-    k_scales: Option<Subbuffer<[u16]>>, // global: Q8 K scales  (kv_dim_gl·slots/32 f16)
-    v: Subbuffer<[u16]>,                // f16 V (both)
-}
-```
-Alloc per kind: Sliding → `k: Some(f16buf(sliding_window·kv_dim_sl))`, quants/scales
-None. Global → `k: None`, `k_quants: u32buf(global_cap·kv_dim_gl/4)`,
-`k_scales: f16buf(global_cap·kv_dim_gl/32)`, `v: f16buf(global_cap·kv_dim_gl)`
-(kv_dim_gl = 2048). Saves ~67 MB/global-layer.
-
-## 4. Prefill global path (record_prefill_layer, the `prefill_gl` dispatch ~1107)
-
-Currently: `touch(q); touch(kv.k); touch(kv.v); dispatch(prefill_gl = flash_sp, {q,
-kv.k, kv.v, attn_gl, step})`. Change the **global** branch (sliding untouched) to:
-
-1. **Append**: the `do_appends` loop is symmetric f16 today. Split it for global:
-   K via `kv_append_global_q8` (src = roped `k`, → `kv.k_quants`/`kv.k_scales`,
-   grid = `(n_real·kv_dim_gl/32)` blocks); V via the existing `kv_append_global`
-   (→ `kv.v`). Sliding stays the symmetric f16 loop.
-2. **Q-quant**: after rope, dispatch `kv_quant_q8` on `q_gl` (n_real·q_dim_gl
-   elements; q_dim_gl = 16384) → new scratch `p.q_i8_gl` (u32, m·q_dim_gl/4) +
-   `p.q_scales_gl` (f16, m·q_dim_gl/32). Add those two fields to the prefill `Bufs`
-   (mirror `xn_i8`/`xn_scales`, graph.rs:330).
-3. **Dispatch `_iq`** instead of flash_sp: load `prefill_gl_iq =
-   "attn_prefill_global_flash_sp_iq"`. Bindings `{q_i8_gl, q_scales_gl, kv.k_quants,
-   kv.k_scales, kv.v, attn_gl, step}`, grid `[N_Q_HEADS, m_pad/16, 1]`, push = scale.
-4. **Touch barriers** (coopmat reads are invisible to auto-sync): touch
-   `q_i8_gl`, `kv.k_quants`, `kv.k_scales`, `kv.v` before the dispatch (replaces the
-   current 3 touches). `k_scales` is read by normal indexing in-kernel, not coopLoad
-   — but touch it too unless you confirm reflection sees it.
-
-## 5. Decode global path (record_layer, the `attn_gl` dispatch ~560) + new kernel
-
-Decode reads the SAME Q8 K cache, so it needs Q8 K too. `attn_decode_global` is
-GEMV-like (scalar `kk[d] = f32(k[...])` + `subgroupAdd`), so this is cheap — no
-coopmat. Write `attn_decode_global_q8k.wgsl`: copy `attn_decode_global.wgsl`,
-replace the K binding (f16) with `k_quants: array<i8>` + `k_scales: array<f16>`,
-and change `kk[d] = f32(k[kv_base + d])` to dequant per element using
-`kv_dequant_q8`'s math: block = `(t·N_KV_HEADS + kvh)·HD_BLOCKS + (d_within_head)/32`,
-`kk[d] = f32(k_scales[block]) · f32(sign_extend_i8(k_quants[...]))`. Decode Q stays
-f16 (no Q-quant on the decode side). The decode global K append also switches to
-`kv_append_global_q8` (one token). Register the variant (5→6 bindings) and load it
-as a new `attn_gl_q8` kernel; dispatch it for global decode layers.
-
-## 6. Validation (in order; the expensive runs are last)
-
-- `cargo build --release --workspace --tests --benches` + `cargo clippy ... -D warnings`.
-- **Kernel parity** (fast, no model): `parity_attn` — the `_iq` test is already
-  green; add a `attn_decode_global_q8k` parity test (mirror `attn_decode_global`,
-  Q8-quantize K).
-- **Prefill quality proxy** (≈70 s, model upload): `prefill_parity` — per-layer
-  nrmse (expect ≤ ~0.05, Q8-K should be mild) and chunked-vs-oracle/decode. This is
-  the fast read on Q8-K quality before the full perplexity run.
-- **Decode correctness**: `gpu_parity` (decode path).
-- **Perplexity gate** (minutes): the M4 methodology (STATUS) — wikitext < 0.5 %,
-  code within the calibrated band.
-- **e2e win**: `sg-bench profile` (perf=high), compare prefill @ q0 8K/32K.
-
-**Test-running gotchas (recorded the hard way):**
-- `SG_MODEL_GGUF` must be an **absolute** path — nextest runs tests from the crate
-  dir, so a relative `models/...` resolves wrong and the test "skips/NotFound".
-- Model-heavy GPU tests are serialized via the `gpu-model` nextest group
-  (`.config/nextest.toml`); each uploads ~17.5 GB. Filter by test name, e.g.
-  `-E 'test(/prefill_single_chunk|chunked_prefill/)'`.
-- Pin `perf=high` before any bench (`power_dpm_force_performance_level`).
+**Test-running + operational gotchas (recorded the hard way):**
+- `SG_MODEL_GGUF` must be an **absolute** path (nextest runs from the crate dir;
+  the model is `models/gemma-4-31B_q4_0-it.gguf`).
+- Model-heavy GPU tests serialize via the `gpu-model` nextest group
+  (`.config/nextest.toml`); ~17.5 GB each. Filter by `binary(...)`.
+- **Pin `perf=high` for benches; run sustained correctness gates (perplexity) at
+  `perf=auto`.** The first Piece-A perplexity run hard-power-cut the box — a
+  thermal trip under sustained perf=high load with a warm room/intake (traceless
+  in the journal; NOT a code/GPU fault — the GPU watchdog recovers gracefully).
+  Re-ran green at auto. Check ambient/fans before any long sustained run.
+- coopLoad-only buffers are invisible to vulkano auto-sync → `touch` every such
+  producer before the consuming dispatch (touch.wgsl). Any new int8-V kernel
+  reading V via coopLoad needs the same treatment.
 
 ---
 
-## B starting point — int8 V/PV (the bigger follow-up)
+## Piece B — int8 V/PV (the clean-context task)
 
-**The constraint (well-defined):** PV computes `O[q][d] = Σ_key P[q][key]·V[key][d]`,
-contracting over **keys**. For an int8 PV the quantization blocks must align with
-the contraction (keys) so the per-block scale factors out of the i32 dot — exactly
-why int8 QKᵀ works (K is quantized along head-dim = the QKᵀ contraction). But V is
-stored quantized along **head-dim** (per-vector, compact), which does NOT align with
-the keys contraction, so the V scale sits inside the key-sum and cannot be pulled
-out. That's why this kernel leaves V/PV in f16.
+**Goal:** halve V DRAM traffic too (V is currently the other half of the
+long-context global KV stream). Expected ~another similar long-context
+increment on top of Piece A's +9 %/+23 %.
+
+**The constraint (restate §2):** for an int8 PV the quantization blocks must
+align with the **key** contraction so the per-block scale factors out of the i32
+dot. V's natural (compact, per-vector) quant is along head-dim — wrong axis.
 
 **Design directions (open — this is the research part):**
-- Quantize V **along keys** (per 32-key block, per head-dim) — aligns with the PV
-  contraction, but it's an awkward storage layout (scale per (key-block, head-dim))
-  and the append would quantize across keys, not within a vector.
-- Or fold a single per-key V scale into P (`P' = P·v_scale[key]`) and do `P'(f16) ×
-  V_q(i8)` — but that's a mixed-type matmul, not int8.
-- Or transpose the PV problem. All need a fresh design + parity + an `attn_flash_cmp`
-  A/B. Halving V traffic too should be worth ~another similar increment.
+1. **Quantize V along keys** (per 32-*key* block, per head-dim) — aligns with
+   the PV contraction. Awkward storage (scale per (key-block, head-dim)) and the
+   append quantizes *across* keys, not within a vector, so `kv_append_global_q8`
+   does NOT transfer — V needs its own append/quant kernel and its own §2-style
+   layout-consistency proof against the PV reader. Probably the cleanest int8 PV.
+2. **Fold a per-key V scale into P** (`P' = P·v_scale[key]`, then `P'(f16) ×
+   V_q(i8)`) — a mixed-type matmul, not pure int8; check whether the fork's
+   coopmat supports f16×i8, else convert.
+3. **Transpose the PV problem.** Any of these needs a fresh design + parity +
+   an `attn_flash_cmp` A/B.
 
-Likely worth doing **before** wiring, so the graph is wired once for full Q8 KV —
-but it's the harder kernel problem, hence a fresh-context task.
+**Concrete hook points (all currently f16, from the as-landed map above):**
+- `KvStore.v` (graph.rs ~117) + its alloc (~378/385) — add `v_quants`/`v_scales`
+  (mirror the K fields) or a new layout; keep sliding V f16.
+- Global V append: graph.rs ~601 (decode) and ~1154 (prefill) — currently
+  `kv_append_global`. Replace with a V-specific quantize-and-append in B's
+  chosen layout.
+- Prefill PV: `attn_prefill_global_flash_sp_iq.wgsl` ~156–165 (the `coopLoadT<…
+  f16, B>(&v…)` + `coopMultiplyAdd(ap, bv, …)`). This is where int8 PV lands;
+  `ap` (the P fragment) is f16 today.
+- Decode V: `attn_decode_global_q8k.wgsl` (binding 3 `v`, the `vv[d] =
+  f32(v[…])` read) + dispatch graph.rs ~639. Decode PV is scalar (GEMV-like) so
+  it's a straightforward dequant-on-read, like the K side already is.
+- Reference + parity: `q8_quant` (head-dim) is the template, but B's V layout
+  (likely per-key) needs its own quantizer in `tests/reference/mod.rs` and a new
+  parity case.
+
+**Sequencing note:** Piece A deliberately wired the graph for Q8 K only and left
+V f16 (banked the validated win without blocking on the hard kernel). B touches
+the global KV path a second time for V — that's expected and additive; the K
+plumbing (KvStore Option split, touch barriers, append/quant pattern) is the
+reusable template.
