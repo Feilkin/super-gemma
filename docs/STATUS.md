@@ -603,11 +603,12 @@ can't factor out of an int8 dot (open follow-up: a per-key V layout, likely wort
 recorded:** the f16-convert dequant-on-load variant (`_q8`) is **7× SLOWER** — kept as the labeled
 "wrong approach" `attn_flash_cmp` baseline. (Process note: that 7× was first over-extrapolated to "B
 is dead"; the int8-matmul variant is the right approach and wins.)
-**e2e plumbing OPEN (milestone-sized — the global KV cache is shared by prefill+decode):** Q8 global
-K `KvStore` (V f16, sliding f16), `kv_append_global_q8` for K append (built), Q-quant after rope (reuse
+**e2e plumbing OPEN (milestone-sized — the global KV cache is shared by prefill+decode).** Full
+step-by-step plan (layouts, wiring anchors, the kv_quant_q8↔iq layout-consistency proof, validation +
+gotchas, and the B/int8-V starting point) in **`docs/q8-kv-flash-impl.md`**. Summary: Q8 global K
+`KvStore` (V f16, sliding f16), `kv_append_global_q8` for K append (built), Q-quant after rope (reuse
 `kv_quant_q8`), wire `_iq` into global prefill + a scalar-dequant `attn_decode_global_q8k` (decode is
-GEMV-like, cheap), then the perplexity gate (Q8 K is a quality question — should be mild, the int8 gemm
-already Q8s activations within tolerance).
+GEMV-like, cheap), then the perplexity gate.
 
 **Decode** is near the bandwidth ceiling (gemv ~91 %, bench: gemv_bw); its lever is MTP (M7.5), not
 these kernels. `cache2` (M6) is the orthogonal win for the append-only workload (prefix reuse
