@@ -324,13 +324,14 @@ Measured (median of 5, this box; bench: `sg-bench profile`). The original table 
 DEFAULT and ONLY prefill path (2026-06-19) — the f16 prefill GEMMs were removed from the graph (kept
 only as `mmq_tflops`/`gemm_variance` bench baselines), the `int8-ffn` feature flag is gone.** Current
 prefill at `perf=high` (whole block int8 + L2 swizzle + 4×1 cache-blocking + weight prefetch + the
-single-pass flash attention): **287 / 191 / 115 tok/s @ q0 0 / 8K / 32K** (bench: `sg-bench profile`).
-Decode is unaffected (GEMV path). Targets are from plan 06.
+single-pass flash attention + the **Q8 global K cache**, 2026-06-19): **286 / 209 / 141 tok/s @ q0 0 /
+8K / 32K** (bench: `sg-bench profile`; was 287/191/115 with f16-K flash — Q8-K is +9 %/+23 % at 8K/32K,
+neutral at q0 0). Decode is unaffected (GEMV path). Targets are from plan 06.
 
 | Phase | Result (perf=auto) | Target (plan 06) |
 |---|---|---|
 | decode @ 1K / 8K / 32K | **11.7 / 11.4 / 10.3 tok/s** | ≥ 10 / 10 / 9.5 ✓ |
-| prefill 256-chunk @ q0 0 / 8K / 32K | **287 / 191 / 115** (high, int8 default) | ≥ 300 ✗ |
+| prefill 256-chunk @ q0 0 / 8K / 32K | **286 / 209 / 141** (high, int8 + Q8-K) | ≥ 300 ✗ |
 | CPU per decode step | stage 23 µs + sampler ≤ 423 µs + overhead ~310 µs | ≪ 75 ms budget ✓ |
 
 Optimization ranking (per-layer medians from the rep-layer breakdown):
@@ -613,10 +614,14 @@ kernels share the §1 Q8_0 SoA format — see `docs/q8-kv-flash-impl.md`). **Qua
 parity (`attn_decode_global_q8k_matches_reference` + the existing `_iq`); `prefill_parity` per-layer
 nrmse **0.03916** (≤0.045), prefill-vs-oracle/decode 19/20; **perplexity within tolerance** — wikitext
 1118.23 vs llama.cpp 1119.35 (rel 0.10 %), code 22.08 vs 22.33 (rel 1.11 %), i.e. Q8-K adds no
-meaningful quality loss vs the prior int8 default. **Still OPEN:** the e2e profile to measure the
-long-context win (the kernel A/B showed −25–30 % K-streaming; `sg-bench profile` @ perf=high pending),
-and `gpu_parity` decode-correctness as a standing check. **Piece B (int8 V/PV)** remains the harder
-follow-up (V's quant axis ≠ the PV contraction — design directions in `docs/q8-kv-flash-impl.md` §B).
+meaningful quality loss vs the prior int8 default. **e2e win MEASURED (sg-bench profile, perf=high) —
+prefill @ q0 0 / 8K / 32K: 287/191/115 → 286/209/141 tok/s, +0 % / +9.4 % / +22.6 %**; the win grows
+with context (the rank-#1 goal), diluted e2e by the unchanged FFN + sliding work. The global-attention
+layer itself dropped **118 → 79 ms/layer at 32K (−33 %)**, matching the −25–30 % K-streaming kernel
+A/B. Decode unchanged (11.72 / 11.39 / 10.27 @ ctx 1K/8K/32K — Q8-K halves a ~12 %-of-step traffic but
+adds in-kernel dequant, net neutral). **Still OPEN:** `gpu_parity` decode-correctness as a standing
+check. **Piece B (int8 V/PV)** remains the harder follow-up (V's quant axis ≠ the PV contraction —
+design directions in `docs/q8-kv-flash-impl.md` §B).
 
 (Operational note: the first perplexity run hard-power-cut the box — a thermal trip under sustained
 perf=high load with a hot room/warm intake, NOT a code/GPU fault. Re-ran green at perf=auto; run
