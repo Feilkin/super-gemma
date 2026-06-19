@@ -591,6 +591,24 @@ stay registered as `attn_flash_cmp` baselines. **Watchdog headroom also improved
 kernel dropped 146→118 ms/layer). Follow-up: the naive kernel could be retired once a perplexity-gate
 run confirms quality (oracle parity already green); MTP/cache2 are the next milestones.
 
+**int8-QKᵀ Q8-K flash — KERNEL DONE & WINS, not yet wired (2026-06-19, commit e99307a).** Piece B
+(Q8 KV cache to halve long-context K/V streaming). The flash kernel reads K as i8 STRAIGHT from a Q8
+cache into a SIGNED int8 coopmat (no LDS staging, no convert — Q8 quants are already i8, unlike Q4_0
+nibbles), Q pre-quantized to i8, per-32-block `q_scale ⊗ k_scale` rescale via the coopmat-arith fork
+— exactly the `gemm_q4_0_i8` pattern. `attn_prefill_global_flash_sp_iq`: **0.94 / 0.70 / 0.75× vs f16
+flash @ ctx 256/8K/32K (bench: attn_flash_cmp, perf=high) — −25–30% at long context**, parity-green
+(`attn_prefill_global_flash_sp_iq_matches_reference`, vs the dequanted-value ref). Only halves K
+traffic; **V/PV stays f16** — PV contracts over keys but V is quantized along head-dim, so the V scale
+can't factor out of an int8 dot (open follow-up: a per-key V layout, likely worth more). **DEAD END
+recorded:** the f16-convert dequant-on-load variant (`_q8`) is **7× SLOWER** — kept as the labeled
+"wrong approach" `attn_flash_cmp` baseline. (Process note: that 7× was first over-extrapolated to "B
+is dead"; the int8-matmul variant is the right approach and wins.)
+**e2e plumbing OPEN (milestone-sized — the global KV cache is shared by prefill+decode):** Q8 global
+K `KvStore` (V f16, sliding f16), `kv_append_global_q8` for K append (built), Q-quant after rope (reuse
+`kv_quant_q8`), wire `_iq` into global prefill + a scalar-dequant `attn_decode_global_q8k` (decode is
+GEMV-like, cheap), then the perplexity gate (Q8 K is a quality question — should be mild, the int8 gemm
+already Q8s activations within tolerance).
+
 **Decode** is near the bandwidth ceiling (gemv ~91 %, bench: gemv_bw); its lever is MTP (M7.5), not
 these kernels. `cache2` (M6) is the orthogonal win for the append-only workload (prefix reuse
 avoids cold long-context prefill).
