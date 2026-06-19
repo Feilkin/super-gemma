@@ -281,6 +281,18 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: false,
     },
+    // Quantize-and-append for the Q8 global KV cache (Piece B): f16→Q8_0 with
+    // linear slot placement (ROW_LEN = kv_dim_gl = 2048). One thread per block.
+    Variant {
+        name: "kv_append_global_q8",
+        src: "kv_append_global_q8",
+        defs: &[("ROW_LEN", 2048)],
+        workgroup: [256, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: false,
+    },
     Variant {
         name: "kv_dequant_q8",
         src: "kv_dequant_q8",
@@ -1078,6 +1090,48 @@ const VARIANTS: &[Variant] = &[
         ],
         workgroup: [64, 1, 1],
         bindings: 5,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Q8-KV flash (Piece B), f16-convert dead end (7× slow — kept as the labeled
+    // "wrong approach" A/B baseline): dequant K/V → f16 in LDS, then f16 matmul.
+    Variant {
+        name: "attn_prefill_global_flash_sp_q8",
+        src: "attn_prefill_global_flash_sp_q8",
+        defs: &[
+            ("HEAD_DIM", 512),
+            ("N_KV_HEADS", 4),
+            ("Q_PER_KV", 8),
+            ("M_Q", 16),
+            ("N_K", 64),
+            ("WG_X", 64),
+            ("S_STAGE_LEN", 1024),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 7,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Q8-KV flash (Piece B), the RIGHT approach: int8 QKᵀ (K i8 straight from the
+    // Q8 cache + pre-quantized Q i8, per-block rescale like gemm_q4_0_i8), f16 PV
+    // (V's quant axis ≠ the PV contraction). 7 bindings (q_i8, q_s, k_q, k_s, v,
+    // out, step).
+    Variant {
+        name: "attn_prefill_global_flash_sp_iq",
+        src: "attn_prefill_global_flash_sp_iq",
+        defs: &[
+            ("HEAD_DIM", 512),
+            ("N_KV_HEADS", 4),
+            ("Q_PER_KV", 8),
+            ("M_Q", 16),
+            ("N_K", 64),
+            ("WG_X", 64),
+            ("S_STAGE_LEN", 1024),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 7,
         push_bytes: 4,
         subgroup_size: 0,
         raw: true,

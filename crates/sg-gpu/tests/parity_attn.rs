@@ -10,7 +10,9 @@
 
 mod reference;
 
-use reference::{Rng, assert_close, attention_head, from_f16_bits, through_f16, to_f16_bits};
+use reference::{
+    Rng, assert_close, attention_head, from_f16_bits, q8_quant, through_f16, to_f16_bits,
+};
 use sg_gpu::{GpuContext, StepState};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::WriteDescriptorSet;
@@ -673,6 +675,103 @@ fn attn_prefill_global_flash_sp_matches_reference() {
                     ATOL,
                     RTOL,
                     &format!("prefill_global_flash_sp q0={q0} i={i} qh={qh}"),
+                );
+            }
+        }
+    }
+}
+
+/// int8-matmul QKᵀ flash (Piece B): Q and K stream as Q8 (i8 + f16 scale), QKᵀ
+/// is an int8 coopmat product with per-block rescale; V/PV stay f16. Checked
+/// against the dequanted-value reference (the int8 dot is exact, so it matches
+/// f16 attention on the Q8-roundtripped Q/K).
+#[test]
+fn attn_prefill_global_flash_sp_iq_matches_reference() {
+    const M_Q: usize = 16;
+    const N_K: usize = 64;
+    let Some(ctx) = ctx() else { return };
+    let kernel = ctx
+        .load_kernel("attn_prefill_global_flash_sp_iq")
+        .unwrap();
+    let mut rng = Rng::new(0xA7C);
+    let m = 64usize;
+
+    for q0 in [0usize, 200] {
+        let l_pad = ((q0 + m - 1) / N_K + 1) * N_K;
+        let q = through_f16(&rng.f32_vec(m * N_Q_HEADS * GL_DIM));
+        let k = through_f16(&rng.f32_vec(l_pad * GL_KV_HEADS * GL_DIM));
+        let v = through_f16(&rng.f32_vec(l_pad * GL_KV_HEADS * GL_DIM));
+        // Q8-quantize Q and K per 32-block along head-dim (the QKᵀ contraction);
+        // the reference uses the dequanted values the kernel multiplies.
+        let (q_quants, q_scales, q_deq) = q8_quant(&q);
+        let (k_quants, k_scales, k_deq) = q8_quant(&k);
+
+        let q_buf = ctx
+            .buffer_from_iter(q_quants, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let qs_buf = ctx
+            .buffer_from_iter(q_scales, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let k_buf = ctx
+            .buffer_from_iter(k_quants, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let ks_buf = ctx
+            .buffer_from_iter(k_scales, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let v_buf = ctx
+            .buffer_from_iter(to_f16_bits(&v), BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let out_buf = ctx
+            .new_buffer::<u16>((m * N_Q_HEADS * GL_DIM) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                WriteDescriptorSet::buffer(0, q_buf),
+                WriteDescriptorSet::buffer(1, qs_buf),
+                WriteDescriptorSet::buffer(2, k_buf),
+                WriteDescriptorSet::buffer(3, ks_buf),
+                WriteDescriptorSet::buffer(4, v_buf),
+                WriteDescriptorSet::buffer(5, out_buf.clone()),
+                WriteDescriptorSet::buffer(
+                    6,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            q0: q0 as u32,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            ],
+            Some(GL_SCALE),
+            [N_Q_HEADS as u32, (m / M_Q) as u32, 1],
+        )
+        .unwrap();
+        let got = from_f16_bits(&out_buf.read().unwrap());
+
+        for qh in [0usize, 7, 15, 31] {
+            for i in 0..m {
+                let want = attention_head(
+                    &q_deq,
+                    &k_deq,
+                    &v,
+                    i,
+                    qh,
+                    N_Q_HEADS,
+                    GL_KV_HEADS,
+                    GL_DIM,
+                    GL_SCALE as f64,
+                    0,
+                    q0 + i,
+                );
+                assert_close(
+                    &got[(i * N_Q_HEADS + qh) * GL_DIM..][..GL_DIM],
+                    &want,
+                    ATOL,
+                    RTOL,
+                    &format!("flash_sp_iq q0={q0} i={i} qh={qh}"),
                 );
             }
         }

@@ -51,6 +51,33 @@ pub fn from_f16_bits(xs: &[u16]) -> Vec<f32> {
         .collect()
 }
 
+/// Q8_0 quantize f32 in 32-blocks (matches `kv_quant_q8`): returns the i8 quants
+/// packed 4 per u32, the f16 scale bits (one per 32-block), and the dequant f32
+/// using the f16-rounded scale (the values the int8 kernel actually multiplies).
+/// `vals.len()` must be a multiple of 32.
+pub fn q8_quant(vals: &[f32]) -> (Vec<u32>, Vec<u16>, Vec<f32>) {
+    assert!(vals.len().is_multiple_of(32));
+    let nblk = vals.len() / 32;
+    let mut quants = vec![0u32; vals.len() / 4];
+    let mut scales = vec![0u16; nblk];
+    let mut deq = vec![0f32; vals.len()];
+    for b in 0..nblk {
+        let s = b * 32;
+        let amax = vals[s..s + 32].iter().fold(0f32, |a, &x| a.max(x.abs()));
+        let d = amax / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let d16 = half::f16::from_f32(d);
+        scales[b] = d16.to_bits();
+        let dd = d16.to_f32();
+        for i in 0..32 {
+            let qi = ((vals[s + i] * id).round_ties_even() as i32).clamp(-128, 127) as i8;
+            quants[(s + i) / 4] |= ((qi as u8 as u32) & 0xFF) << (((s + i) % 4) * 8);
+            deq[s + i] = dd * qi as f32;
+        }
+    }
+    (quants, scales, deq)
+}
+
 /// Max combined error: |got−want| ≤ atol + rtol·|want|, reported with index.
 pub fn assert_close(got: &[f32], want: &[f32], atol: f32, rtol: f32, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");

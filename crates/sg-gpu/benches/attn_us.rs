@@ -583,6 +583,14 @@ fn bench(c: &mut Criterion) {
         let flash_sp = ctx
             .load_kernel("attn_prefill_global_flash_sp")
             .expect("kernel");
+        // Q8-KV flash (Piece B): K/V from the Q8 cache, dequant-on-load (the
+        // f16-convert dead end) vs int8 QKᵀ (the right approach, _iq).
+        let flash_sp_q8 = ctx
+            .load_kernel("attn_prefill_global_flash_sp_q8")
+            .expect("kernel");
+        let flash_sp_iq = ctx
+            .load_kernel("attn_prefill_global_flash_sp_iq")
+            .expect("kernel");
         let mut cmp = c.benchmark_group("attn_flash_cmp");
         cmp.sample_size(10)
             .warm_up_time(std::time::Duration::from_secs(1))
@@ -649,6 +657,63 @@ fn bench(c: &mut Criterion) {
                 [],
             )
             .unwrap();
+            // Q8 KV buffers (dummy: timing is data-independent). Blocks of 32
+            // over the [l × GL_KV_HEADS × GL_DIM] cache → l·64 blocks each.
+            let blocks = l * GL_KV_HEADS * GL_DIM / 32;
+            let q8buf = || {
+                let qn = ctx
+                    .buffer_from_iter((0..blocks * 8).map(|i| i as u32), BufferUsage::STORAGE_BUFFER)
+                    .unwrap();
+                let sc = ctx
+                    .buffer_from_iter(f16_fill(blocks), BufferUsage::STORAGE_BUFFER)
+                    .unwrap();
+                (qn, sc)
+            };
+            let (kq, ks) = q8buf();
+            let (vq, vs) = q8buf();
+            // Pre-quantized Q (i8 + f16 scales) for the int8-QKᵀ variant.
+            let q_i8 = ctx
+                .buffer_from_iter(
+                    (0..m * N_Q_HEADS * GL_DIM / 4).map(|i| i as u32),
+                    BufferUsage::STORAGE_BUFFER,
+                )
+                .unwrap();
+            let q_sc = ctx
+                .buffer_from_iter(
+                    f16_fill(m * N_Q_HEADS * GL_DIM / 32),
+                    BufferUsage::STORAGE_BUFFER,
+                )
+                .unwrap();
+            let set_flash_sp_iq = DescriptorSet::new(
+                ctx.descriptor_set_allocator().clone(),
+                flash_sp_iq.layout().set_layouts()[0].clone(),
+                vec![
+                    WriteDescriptorSet::buffer(0, q_i8.clone()),
+                    WriteDescriptorSet::buffer(1, q_sc.clone()),
+                    WriteDescriptorSet::buffer(2, kq.clone()),
+                    WriteDescriptorSet::buffer(3, ks.clone()),
+                    WriteDescriptorSet::buffer(4, kv_v.clone()),
+                    WriteDescriptorSet::buffer(5, out.clone()),
+                    WriteDescriptorSet::buffer(6, step.clone()),
+                ],
+                [],
+            )
+            .unwrap();
+            let set_flash_sp_q8 = DescriptorSet::new(
+                ctx.descriptor_set_allocator().clone(),
+                flash_sp_q8.layout().set_layouts()[0].clone(),
+                vec![
+                    WriteDescriptorSet::buffer(0, q.clone()),
+                    WriteDescriptorSet::buffer(1, kq.clone()),
+                    WriteDescriptorSet::buffer(2, ks.clone()),
+                    WriteDescriptorSet::buffer(3, vq.clone()),
+                    WriteDescriptorSet::buffer(4, vs.clone()),
+                    WriteDescriptorSet::buffer(5, out.clone()),
+                    WriteDescriptorSet::buffer(6, step.clone()),
+                ],
+                [],
+            )
+            .unwrap();
             // naive grid [kv_heads, M]; flash grids [q_heads, M/M_Q] (M_Q=16).
             time_prefill(
                 &mut cmp,
@@ -673,6 +738,22 @@ fn bench(c: &mut Criterion) {
                 set_flash_sp,
                 [N_Q_HEADS as u32, (m / 16) as u32, 1],
                 format!("flash_sp_ctx{l}"),
+            );
+            time_prefill(
+                &mut cmp,
+                &ctx,
+                &flash_sp_q8,
+                set_flash_sp_q8,
+                [N_Q_HEADS as u32, (m / 16) as u32, 1],
+                format!("flash_sp_q8_ctx{l}"),
+            );
+            time_prefill(
+                &mut cmp,
+                &ctx,
+                &flash_sp_iq,
+                set_flash_sp_iq,
+                [N_Q_HEADS as u32, (m / 16) as u32, 1],
+                format!("flash_sp_iq_ctx{l}"),
             );
         }
         cmp.finish();
