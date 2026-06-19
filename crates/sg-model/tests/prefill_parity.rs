@@ -121,16 +121,12 @@ fn prefill_single_chunk_per_layer_parity() {
             worst = (e, i);
         }
     }
-    // int8-ffn carries a wider per-layer envelope than the f16 path (the whole
-    // attention block + FFN on int8 → worst ~0.04) — this is divergence *toward*
-    // llama.cpp (which also int8-quantizes activations), not quality loss: the
-    // perplexity gate passes (code 21.95 vs 22.33, wikitext <0.5%). Asserted on
-    // the global worst (not per-layer early-exit) so the bound is the real max.
-    let tol = if cfg!(feature = "int8-ffn") {
-        0.045
-    } else {
-        0.02
-    };
+    // The int8-MMQ block (whole attention + FFN on int8) carries a ~0.04
+    // per-layer envelope — divergence *toward* llama.cpp (which also
+    // int8-quantizes activations), not quality loss: the perplexity gate passes
+    // (code 21.95 vs 22.33, wikitext <0.5%). Asserted on the global worst (not
+    // per-layer early-exit) so the bound is the real max.
+    let tol = 0.045;
     assert!(
         worst.0 <= tol,
         "worst layer {} ({:?}): nrmse {:.5} > {tol}",
@@ -178,17 +174,12 @@ fn chunked_prefill_matches_oracle_and_decode() {
         .decode_step(&decode_graph, tail[0])
         .expect("decode step");
     // Prefill (single-pass coopmat flash) and decode (split-K) are DIFFERENT
-    // global-attention kernels, so the two paths aren't bit-identical: f16
-    // agrees to Δ~0.006, but int8-ffn activation-quant amplifies that tiny gap
-    // (one near-top logit drifts ~0.2). Argmax/top-overlap still hold; the
-    // f64-oracle check above is the real correctness gate — this dtol only
-    // bounds the cross-path drift, so it widens under int8 like the per-layer
-    // nrmse tol does.
-    let decode_dtol = if cfg!(feature = "int8-ffn") {
-        0.25
-    } else {
-        0.15
-    };
+    // global-attention kernels, so the two paths aren't bit-identical: the f16
+    // matmuls agree to Δ~0.006, but the int8 activation-quant amplifies that
+    // tiny gap (one near-top logit drifts ~0.2). Argmax/top-overlap still hold;
+    // the f64-oracle check above is the real correctness gate — this dtol only
+    // bounds the cross-path drift.
+    let decode_dtol = 0.25;
     assert_logit_agreement(
         &gpu_prefill,
         &gpu_decode,

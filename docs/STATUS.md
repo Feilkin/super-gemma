@@ -1,6 +1,6 @@
 # STATUS — read this first
 
-Last updated: **2026-06-13** (kernel-optimization + benchmark-baselining session), working on the
+Last updated: **2026-06-19** (int8 made the default prefill path; f16 GEMMs removed), working on the
 Framework Desktop target box. The conversation history that produced this repo is gone; everything
 needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
 
@@ -320,17 +320,17 @@ Consequences, both landed:
   flash-attention rewrite only lowers, never removes, long-context submission times.
 
 Measured (median of 5, this box; bench: `sg-bench profile`). The original table below was taken at
-`perf=auto`, which idles the fabric clock and reads ~30 % low (2026-06-13). **Current prefill at
-`perf=high` (2026-06-18, incl. the single-pass flash attention + deep weight prefetch below): f16
-default 187 / 143 / 99 tok/s; with `--features int8-ffn` (whole block int8 + L2 swizzle + 4×1
-cache-blocking + weight prefetch) 287 / 193 / 116 tok/s @ q0 0 / 8K / 32K** — see the per-optimization
-sections. Decode is unaffected (GEMV path).
-Targets are from plan 06.
+`perf=auto`, which idles the fabric clock and reads ~30 % low (2026-06-13). **int8-MMQ is now the
+DEFAULT and ONLY prefill path (2026-06-19) — the f16 prefill GEMMs were removed from the graph (kept
+only as `mmq_tflops`/`gemm_variance` bench baselines), the `int8-ffn` feature flag is gone.** Current
+prefill at `perf=high` (whole block int8 + L2 swizzle + 4×1 cache-blocking + weight prefetch + the
+single-pass flash attention): **287 / 191 / 115 tok/s @ q0 0 / 8K / 32K** (bench: `sg-bench profile`).
+Decode is unaffected (GEMV path). Targets are from plan 06.
 
 | Phase | Result (perf=auto) | Target (plan 06) |
 |---|---|---|
 | decode @ 1K / 8K / 32K | **11.7 / 11.4 / 10.3 tok/s** | ≥ 10 / 10 / 9.5 ✓ |
-| prefill 256-chunk @ q0 0 / 8K / 32K | **187 / 143 / 99** (high, f16); **287 / 193 / 116** (high, int8-ffn) | ≥ 300 ✗ |
+| prefill 256-chunk @ q0 0 / 8K / 32K | **287 / 191 / 115** (high, int8 default) | ≥ 300 ✗ |
 | CPU per decode step | stage 23 µs + sampler ≤ 423 µs + overhead ~310 µs | ≪ 75 ms budget ✓ |
 
 Optimization ranking (per-layer medians from the rep-layer breakdown):
@@ -619,9 +619,15 @@ the divergence path matches a cold run bitwise.
    transformer block (attention QKV+O, FFN gate/up/down) runs int8 with the L2 swizzle and the 4×1
    cache-blocked tile (per-shape variants + `kv_quant_q8` activation passes, 4 bindings/site in
    `sg-model/src/graph.rs`); perplexity-gated, +48 % prefill arc. See the dedicated sections above.
-   **Open follow-ups:** apply the 4×1 tile sweep to the *f16* gemms (default build / decode path),
-   RGP-recapture to confirm the new occupancy/L2 picture, and make `int8-ffn` the default once the
-   f16 path is either retired or matched.
+   **int8 is now the DEFAULT (2026-06-19):** the `int8-ffn` feature flag and the f16 prefill GEMM
+   path were removed from the graph (un-gated the 4 cfg sites + deleted the f16 `else` branches and
+   the `gemm_q/kv/o/up/down` kernel fields); the f16 `gemm_q4_0*` variants stay in `build.rs` only as
+   `mmq_tflops`/`gemm_variance` bench baselines. Default prefill 287 / 191 / 115 @ q0 0/8K/32K;
+   prefill_parity green (worst nrmse 0.03707). **Open follow-up:** int8 (Q8) KV cache — the flash A/B
+   (2026-06-19) proved long-context is K/V-streaming-bound, so a Q8 KV cache halves that traffic (the
+   next long-context lever; aligns with cache2's Q8 pages). The head-dim-split flash experiment was a
+   measured dead end (hs2 +25 % / hs4 +113 %: recompute + 2–4× K traffic swamps the spill it saves —
+   the 157-VGPR register spill is NOT the flash bottleneck).
 3. **Operational:** pin `power_dpm_force_performance_level=high` on the box (the ~30 % fabric-clock
    finding) and set `amdgpu.lockup_timeout=10000` (the watchdog finding).
 4. **Rank #1 flash attention — IN PROGRESS (2026-06-18).** Parked variants re-measured at perf=high

@@ -9,12 +9,6 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-# Use the int8-MMQ GEMM for the FFN up/down projections in prefill (Q8 activation
-# quant + Q4_0-reading int8 gemm). Off by default — the f16 gemm path. Gate for
-# A/B + the perplexity check of activation-Q8 accuracy (STATUS rank #2).
-int8-ffn = []
-
 [dependencies]
 half = "2.7.1"
 rayon = "1.12.0"

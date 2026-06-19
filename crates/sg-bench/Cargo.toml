@@ -9,10 +9,6 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-# Drive the int8 FFN gemm path in the e2e profile.
-int8-ffn = ["sg-model/int8-ffn"]
-
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }

@@ -131,22 +131,13 @@ struct Kernels {
     reduce256: Kernel,
     reduce512: Kernel,
     logits: Kernel,
-    // Prefill (chunked, coopmat gemm path).
-    gemm_q_sl: Kernel,
-    gemm_q_gl: Kernel,
-    gemm_kv_sl: Kernel,
-    gemm_kv_gl: Kernel,
-    gemm_o_sl: Kernel,
-    gemm_o_gl: Kernel,
-    gemm_up: Kernel,
-    gemm_down: Kernel,
-    // int8-MMQ FFN (feature int8-ffn): Q8 activation quant + Q4_0-reading int8
-    // gemm at 2×2. Loaded unconditionally; the dispatch path is cfg-gated.
+    // Prefill (chunked, coopmat int8-MMQ gemm path): Q8 activation quant +
+    // Q4_0-reading int8 gemm at the 4×1 swizzled tile.
     quant_q8: Kernel,
     gemm_up_i8: Kernel,
     gemm_down_i8: Kernel,
-    // int8-MMQ attention (feature int8-ffn): Q/K/V share one `xn` quant, O
-    // quantizes the attention output. Sliding/global differ in head count.
+    // int8-MMQ attention: Q/K/V share one `xn` quant, O quantizes the attention
+    // output. Sliding/global differ in head count.
     gemm_q_i8_sl: Kernel,
     gemm_q_i8_gl: Kernel,
     gemm_kv_i8_sl: Kernel,
@@ -381,16 +372,6 @@ impl<'a> GpuModel<'a> {
             reduce256: load("attn_reduce_d256")?,
             reduce512: load("attn_reduce_d512")?,
             logits: load("gemv_q6_k_logits")?,
-            // Swizzled (SWIZZLE=1) prefill gemms — M-blocks fast-varying for L2
-            // weight-strip reuse; their dispatches are transposed [M/tile, N/strip].
-            gemm_q_sl: load("gemm_q4_0_swz_k5376_n8192")?,
-            gemm_q_gl: load("gemm_q4_0_swz_k5376_n16384")?,
-            gemm_kv_sl: load("gemm_q4_0_swz_k5376_n4096")?,
-            gemm_kv_gl: load("gemm_q4_0_swz_k5376_n2048")?,
-            gemm_o_sl: load("gemm_q4_0_swz_k8192_n5376")?,
-            gemm_o_gl: load("gemm_q4_0_swz_k16384_n5376")?,
-            gemm_up: load("gemm_q4_0_swz_k5376_n21504")?,
-            gemm_down: load("gemm_q4_0_swz_k21504_n5376")?,
             quant_q8: load("kv_quant_q8")?,
             // int8 cache-blocked 4×1 tiles (M_TILES=4, N_TILES=1) — more M-rows
             // per weight load; O global single-buffers (s1) as its largest-K
@@ -948,7 +929,6 @@ impl<'a> GpuModel<'a> {
         };
         let q_dim = 32 * hd;
         let kv_dim = n_kv * hd;
-        let mg = (m_pad / 64) as u32; // gemm M-block count
         let (q_raw, q, kp, k, v) = if sliding {
             (&p.q_raw_sl, &p.q_sl, &p.kp_sl, &p.k_sl, &p.v_sl)
         } else {
@@ -969,11 +949,6 @@ impl<'a> GpuModel<'a> {
                 &p.cs_gl,
             )
         };
-        let (gemm_q, gemm_kv, gemm_o) = if sliding {
-            (&self.k.gemm_q_sl, &self.k.gemm_kv_sl, &self.k.gemm_o_sl)
-        } else {
-            (&self.k.gemm_q_gl, &self.k.gemm_kv_gl, &self.k.gemm_o_gl)
-        };
         let no_push = None::<u32>;
 
         // The gemms read their activation input only via coopmat loads,
@@ -992,9 +967,9 @@ impl<'a> GpuModel<'a> {
         // ── Attention block ──────────────────────────────────────────────
         rms(rec, &self.k.rms5376, &p.x, &lw.attn_norm, &p.xn, m_pad)?;
         touch(rec, &p.xn)?;
-        // Q, K, V: f16 gemm, or (feature int8-ffn) Q8-quantize `xn` ONCE — shared
-        // by all three projections (the int8 sweet spot) — then int8 gemm at 2×2.
-        let vp = if cfg!(feature = "int8-ffn") {
+        // Q, K, V: Q8-quantize `xn` ONCE — shared by all three projections (the
+        // int8 sweet spot) — then int8 gemm at 4×1.
+        let vp = {
             rec.dispatch(
                 &self.k.quant_q8,
                 vec![
@@ -1051,43 +1026,6 @@ impl<'a> GpuModel<'a> {
                         ],
                         no_push,
                         [mg2, (kv_dim / 16) as u32, 1], // swizzled: [M-blocks, N-blocks]
-                    )?;
-                    &p.vp_sl
-                }
-                None => kp,
-            }
-        } else {
-            rec.dispatch(
-                gemm_q,
-                vec![
-                    buf(0, lw.attn_q.clone()),
-                    buf(1, p.xn.clone()),
-                    buf(2, q_raw.clone()),
-                ],
-                no_push,
-                [mg, (q_dim / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
-            )?;
-            rec.dispatch(
-                gemm_kv,
-                vec![
-                    buf(0, lw.attn_k.clone()),
-                    buf(1, p.xn.clone()),
-                    buf(2, kp.clone()),
-                ],
-                no_push,
-                [mg, (kv_dim / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
-            )?;
-            match &lw.attn_v {
-                Some(wv) => {
-                    rec.dispatch(
-                        gemm_kv,
-                        vec![
-                            buf(0, wv.clone()),
-                            buf(1, p.xn.clone()),
-                            buf(2, p.vp_sl.clone()),
-                        ],
-                        no_push,
-                        [mg, (kv_dim / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
                     )?;
                     &p.vp_sl
                 }
@@ -1179,9 +1117,8 @@ impl<'a> GpuModel<'a> {
             )?;
         }
 
-        // O projection: f16 gemm, or (feature int8-ffn) Q8-quantize the attention
-        // output (K=q_dim) and run the int8 gemm at 2×2.
-        if cfg!(feature = "int8-ffn") {
+        // O projection: Q8-quantize the attention output (K=q_dim), int8 gemm at 4×1.
+        {
             rec.dispatch(
                 &self.k.quant_q8,
                 vec![
@@ -1215,18 +1152,6 @@ impl<'a> GpuModel<'a> {
                 no_push,
                 [mg2, (HIDDEN / 16) as u32, 1], // swizzled: [M-blocks, N-blocks]
             )?;
-        } else {
-            touch(rec, attn_out)?;
-            rec.dispatch(
-                gemm_o,
-                vec![
-                    buf(0, lw.attn_output.clone()),
-                    buf(1, attn_out.clone()),
-                    buf(2, p.o.clone()),
-                ],
-                no_push,
-                [mg, (HIDDEN / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
-            )?;
         }
         rms(
             rec,
@@ -1250,9 +1175,9 @@ impl<'a> GpuModel<'a> {
         // ── FFN block ────────────────────────────────────────────────────
         rms(rec, &self.k.rms5376, &p.x2, &lw.ffn_norm, &p.fin, m_pad)?;
         touch(rec, &p.fin)?;
-        // FFN gate+up: f16 gemm, or (feature int8-ffn) Q8-quantize `fin` once
-        // (shared by gate and up) and run the Q4_0-reading int8 gemm at 2×2.
-        if cfg!(feature = "int8-ffn") {
+        // FFN gate+up: Q8-quantize `fin` once (shared by gate and up), then the
+        // Q4_0-reading int8 gemm at 4×1.
+        {
             rec.dispatch(
                 &self.k.quant_q8,
                 vec![
@@ -1284,19 +1209,6 @@ impl<'a> GpuModel<'a> {
                     [mg2, (FFN / 16) as u32, 1], // swizzled: [M-blocks, N-blocks]
                 )?;
             }
-        } else {
-            for (w, dst) in [(&lw.ffn_gate, &p.g), (&lw.ffn_up, &p.u)] {
-                rec.dispatch(
-                    &self.k.gemm_up,
-                    vec![
-                        buf(0, w.clone()),
-                        buf(1, p.fin.clone()),
-                        buf(2, (*dst).clone()),
-                    ],
-                    no_push,
-                    [mg, (FFN / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
-                )?;
-            }
         }
         rec.dispatch(
             &self.k.geglu,
@@ -1308,8 +1220,8 @@ impl<'a> GpuModel<'a> {
             no_push,
             self.k.geglu.groups_for(p.gu.len()),
         )?;
-        // FFN down: f16 gemm, or (feature int8-ffn) Q8-quantize `gu` and int8 gemm.
-        if cfg!(feature = "int8-ffn") {
+        // FFN down: Q8-quantize `gu`, then the int8 gemm at 4×1.
+        {
             rec.dispatch(
                 &self.k.quant_q8,
                 vec![
@@ -1337,18 +1249,6 @@ impl<'a> GpuModel<'a> {
                 ],
                 no_push,
                 [mg2, (HIDDEN / 16) as u32, 1], // swizzled: [M-blocks, N-blocks]
-            )?;
-        } else {
-            touch(rec, &p.gu)?;
-            rec.dispatch(
-                &self.k.gemm_down,
-                vec![
-                    buf(0, lw.ffn_down.clone()),
-                    buf(1, p.gu.clone()),
-                    buf(2, p.f.clone()),
-                ],
-                no_push,
-                [mg, (HIDDEN / 64) as u32, 1], // swizzled: [M-blocks, N-blocks]
             )?;
         }
         rms(rec, &self.k.rms5376, &p.f, &lw.post_ffw_norm, &p.fn2, m_pad)?;
