@@ -603,12 +603,24 @@ can't factor out of an int8 dot (open follow-up: a per-key V layout, likely wort
 recorded:** the f16-convert dequant-on-load variant (`_q8`) is **7× SLOWER** — kept as the labeled
 "wrong approach" `attn_flash_cmp` baseline. (Process note: that 7× was first over-extrapolated to "B
 is dead"; the int8-matmul variant is the right approach and wins.)
-**e2e plumbing OPEN (milestone-sized — the global KV cache is shared by prefill+decode).** Full
-step-by-step plan (layouts, wiring anchors, the kv_quant_q8↔iq layout-consistency proof, validation +
-gotchas, and the B/int8-V starting point) in **`docs/q8-kv-flash-impl.md`**. Summary: Q8 global K
-`KvStore` (V f16, sliding f16), `kv_append_global_q8` for K append (built), Q-quant after rope (reuse
-`kv_quant_q8`), wire `_iq` into global prefill + a scalar-dequant `attn_decode_global_q8k` (decode is
-GEMV-like, cheap), then the perplexity gate.
+**Q8 global KV cache — WIRED & QUALITY-GREEN (2026-06-19, commit d9a7d30).** Piece A landed: global K
+is now stored Q8 (i8 quants + f16 per-32-block scales; V f16, sliding f16), saving ~67 MB/global-layer.
+Prefill global attention runs `attn_prefill_global_flash_sp_iq` against the cache (Q quantized once per
+chunk via `kv_quant_q8`); decode runs the new scalar-dequant `attn_decode_global_q8k` (GEMV-like,
+cheap); K append via `kv_append_global_q8`. The f16 global decode/flash kernels are dropped from the
+graph (kept in build.rs as bench/parity baselines). Layout-consistency held for free (the three
+kernels share the §1 Q8_0 SoA format — see `docs/q8-kv-flash-impl.md`). **Quality green:** kernel
+parity (`attn_decode_global_q8k_matches_reference` + the existing `_iq`); `prefill_parity` per-layer
+nrmse **0.03916** (≤0.045), prefill-vs-oracle/decode 19/20; **perplexity within tolerance** — wikitext
+1118.23 vs llama.cpp 1119.35 (rel 0.10 %), code 22.08 vs 22.33 (rel 1.11 %), i.e. Q8-K adds no
+meaningful quality loss vs the prior int8 default. **Still OPEN:** the e2e profile to measure the
+long-context win (the kernel A/B showed −25–30 % K-streaming; `sg-bench profile` @ perf=high pending),
+and `gpu_parity` decode-correctness as a standing check. **Piece B (int8 V/PV)** remains the harder
+follow-up (V's quant axis ≠ the PV contraction — design directions in `docs/q8-kv-flash-impl.md` §B).
+
+(Operational note: the first perplexity run hard-power-cut the box — a thermal trip under sustained
+perf=high load with a hot room/warm intake, NOT a code/GPU fault. Re-ran green at perf=auto; run
+sustained correctness gates at auto, reserve high for short benches. See the memory.)
 
 **Decode** is near the bandwidth ceiling (gemv ~91 %, bench: gemv_bw); its lever is MTP (M7.5), not
 these kernels. `cache2` (M6) is the orthogonal win for the append-only workload (prefix reuse
@@ -642,9 +654,11 @@ the divergence path matches a cold run bitwise.
    path were removed from the graph (un-gated the 4 cfg sites + deleted the f16 `else` branches and
    the `gemm_q/kv/o/up/down` kernel fields); the f16 `gemm_q4_0*` variants stay in `build.rs` only as
    `mmq_tflops`/`gemm_variance` bench baselines. Default prefill 287 / 191 / 115 @ q0 0/8K/32K;
-   prefill_parity green (worst nrmse 0.03707). **Open follow-up:** int8 (Q8) KV cache — the flash A/B
-   (2026-06-19) proved long-context is K/V-streaming-bound, so a Q8 KV cache halves that traffic (the
-   next long-context lever; aligns with cache2's Q8 pages). The head-dim-split flash experiment was a
+   prefill_parity green (worst nrmse 0.03707). **Q8 K KV cache DONE & quality-green (2026-06-19, commit
+   d9a7d30):** the long-context K-streaming lever — global K is now Q8, wired into prefill (`_iq` flash)
+   and decode (`attn_decode_global_q8k`), perplexity within tolerance (see the Q8-KV section above);
+   e2e win measurement (`sg-bench profile`) + int8 V/PV (Piece B) still open. The head-dim-split flash
+   experiment was a
    measured dead end (hs2 +25 % / hs4 +113 %: recompute + 2–4× K traffic swamps the spill it saves —
    the 157-VGPR register spill is NOT the flash bottleneck).
 3. **Operational:** pin `power_dpm_force_performance_level=high` on the box (the ~30 % fabric-clock
