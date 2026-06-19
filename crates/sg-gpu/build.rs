@@ -1149,6 +1149,29 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Q8-KV flash (Piece B) extended: int8 QKᵀ AND int8 PV. V streams i8 from the
+    // cache (key-blocked scales, q8_quant_v) and P is quantized i8 in-kernel per
+    // 32-key block; both matmuls i8×i8→i32 with per-block rescale. 8 bindings
+    // (q_i8, q_s, k_q, k_s, v_q, v_s, out, step). P_SCALES_LEN = M_Q·(N_K/32).
+    Variant {
+        name: "attn_prefill_global_flash_sp_ipv",
+        src: "attn_prefill_global_flash_sp_ipv",
+        defs: &[
+            ("HEAD_DIM", 512),
+            ("N_KV_HEADS", 4),
+            ("Q_PER_KV", 8),
+            ("M_Q", 16),
+            ("N_K", 64),
+            ("WG_X", 64),
+            ("S_STAGE_LEN", 1024),
+            ("P_SCALES_LEN", 32),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 8,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: true,
+    },
     // Coopmat Q4_0 GEMM (prefill), one variant per (K, N) site.
     Variant {
         name: "gemm_q4_0_k5376_n8192",
