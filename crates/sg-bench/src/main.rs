@@ -39,6 +39,13 @@ enum Cmd {
         /// Kernel variant to capture (e.g. gemm_q4_0_i8_t22_k21504_n5376).
         kernel: String,
     },
+    /// One full prefill chunk (all 60 layers, real recorded graph) for RGP/SQTT
+    /// capture, submitted as the production 6-layer segments (docs/rgp-capture.md).
+    RgpPrefill {
+        /// History length q0: 0 = FFN-bound short ctx, 32512 = attention-bound.
+        #[arg(long, default_value_t = 0)]
+        q0: u32,
+    },
     /// Scripted coding-agent session composite (M7+).
     AgentLoop,
 }
@@ -48,6 +55,7 @@ fn main() -> anyhow::Result<()> {
     match args.cmd {
         Cmd::Profile => profile::run(&args.model),
         Cmd::Rgp { kernel } => rgp::run(&kernel),
+        Cmd::RgpPrefill { q0 } => rgp::run_prefill(&args.model, q0),
         cmd => anyhow::bail!(
             "`{cmd:?}` is not implemented yet; see the milestone map in this binary's docs"
         ),

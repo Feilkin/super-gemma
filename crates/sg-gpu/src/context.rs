@@ -11,7 +11,7 @@ use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
 };
-use vulkano::instance::{Instance, InstanceCreateInfo};
+use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 
 use crate::GpuError;
@@ -45,6 +45,9 @@ pub struct GpuContext {
     /// Whether `VK_KHR_cooperative_matrix` was enabled (true on target;
     /// coopmat GEMM variants require it).
     pub cooperative_matrix: bool,
+    /// Whether `VK_EXT_debug_utils` was enabled — gates per-dispatch label
+    /// regions (kernel names in RGP/SQTT captures).
+    pub debug_utils: bool,
 }
 
 impl GpuContext {
@@ -53,8 +56,22 @@ impl GpuContext {
     /// tests can skip gracefully.
     pub fn new() -> Result<Self, GpuError> {
         let library = VulkanLibrary::new()?;
-        let instance =
-            Instance::new(library, InstanceCreateInfo::default()).map_err(GpuError::validated)?;
+        // `ext_debug_utils` lets us name each dispatch with a command-buffer
+        // label region (`GraphRecorder::dispatch`); RADV emits those as SQTT
+        // markers so RGP captures show which kernel each event is. Optional —
+        // absence just means unlabelled traces, never a failure.
+        let debug_utils = library.supported_extensions().ext_debug_utils;
+        let instance = Instance::new(
+            library,
+            InstanceCreateInfo {
+                enabled_extensions: InstanceExtensions {
+                    ext_debug_utils: debug_utils,
+                    ..InstanceExtensions::empty()
+                },
+                ..Default::default()
+            },
+        )
+        .map_err(GpuError::validated)?;
 
         let required = required_features();
         let mut candidates: Vec<Arc<PhysicalDevice>> = instance
@@ -121,6 +138,7 @@ impl GpuContext {
             queue,
             subgroup_size,
             cooperative_matrix: supports_coopmat,
+            debug_utils,
         })
     }
 

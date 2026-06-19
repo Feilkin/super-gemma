@@ -19,6 +19,7 @@ use vulkano::command_buffer::{
     PrimaryCommandBufferAbstract,
 };
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::instance::debug::DebugUtilsLabel;
 use vulkano::pipeline::PipelineBindPoint;
 use vulkano::query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType};
 use vulkano::sync::{GpuFuture, PipelineStage};
@@ -118,9 +119,28 @@ impl GraphRecorder<'_> {
                 .push_constants(layout, 0, push)
                 .map_err(|e| GpuError::Pipeline(e.to_string()))?;
         }
+        // Name the dispatch for RGP/SQTT: RADV records the label region as a
+        // marker so each event in a capture shows its kernel (else the timeline
+        // is anonymous WMMA/ALU blocks). Inert on the GPU; only present when
+        // `ext_debug_utils` was enabled (always on RADV). SAFETY of the close:
+        // begin/end are balanced around this one dispatch.
+        let labelled = self.ctx.debug_utils;
+        if labelled {
+            self.builder
+                .begin_debug_utils_label(DebugUtilsLabel {
+                    label_name: kernel.name.to_owned(),
+                    ..Default::default()
+                })
+                .map_err(|e| GpuError::Pipeline(e.to_string()))?;
+        }
         // SAFETY: dispatch bounds are the caller's contract with the kernel;
         // all our kernels bounds-check against arrayLength or baked sizes.
         unsafe { self.builder.dispatch(groups) }.map_err(|e| GpuError::Pipeline(e.to_string()))?;
+        if labelled {
+            // SAFETY: closes the region begun immediately above (balanced).
+            unsafe { self.builder.end_debug_utils_label() }
+                .map_err(|e| GpuError::Pipeline(e.to_string()))?;
+        }
 
         if self.prof.as_ref().is_some_and(|p| p.auto) {
             let name = kernel.name;

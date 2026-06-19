@@ -52,25 +52,48 @@ The `swz_m4n1` variants are the production prefill tiling (graph.rs) and take a
 transposed `[M-blocks, N-blocks]` grid; the harness handles that. All at M=256
 (the prefill chunk). Add more in `crates/sg-bench/src/rgp.rs::shape`.
 
-## Capture the real prefill graph (optional, advanced)
+## Capture a full prefill layer (the real graph) — `rgp-prefill`
 
-To trace the *actual* recorded prefill graph (all kernels in flight, real
-overlap) instead of one isolated GEMM, use the **trigger file** with the e2e
-profile and capture a single in-app window:
+`sg-bench rgp-prefill` traces the *actual* recorded prefill graph (every kernel
+of a layer in flight, real overlap) instead of one isolated GEMM: the QKV gemms,
+flash attention, the O gemm, FFN gate/up/down gemms, rmsnorm, rope, residual
+joins. It submits **one layer at a time** (`record_prefill_layers(i..i+1)`), so
+under per-submit capture each layer is its own `.rgp`.
+
+**Per-layer, not per-chunk, by necessity.** SQTT records a continuous token
+stream whose buffer fills on GPU *duration*, not dispatch count. A single gemm
+fits; a 60-layer chunk — even one 6-layer watchdog segment — runs far too long to
+hold (tested: overflows 1 GB). A layer is the repeating unit; layer 4 samples a
+sliding layer and layer 5 a global one (`layer % 6 == 5`), so the two `.rgp`
+together cover every prefill kernel.
 
 ```sh
+echo high | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_level
 MESA_VK_TRACE=rgp \
-MESA_VK_TRACE_TRIGGER=/tmp/rgp_trigger \
-RADV_THREAD_TRACE_BUFFER_SIZE=536870912 \
-  ./target/release/sg-bench profile &
-# when it prints "prefill 256-chunk @ q0 0 …", trigger one capture:
-touch /tmp/rgp_trigger
+MESA_VK_TRACE_PER_SUBMIT=true \
+RADV_THREAD_TRACE_BUFFER_SIZE=2147483648 \
+  ./target/release/sg-bench rgp-prefill --q0 0
 ```
 
-(Or `--features sg-model/int8-ffn` on the build to trace the int8 FFN path.) The
-SQTT buffer caps how much fits — a full 60-layer prefill won't; the trigger grabs
-the work around the trigger event. Prefer the focused per-kernel capture for
-clean single-kernel analysis.
+- `--q0 0` is the FFN-gemm-bound short-context regime (cheap attention);
+  `--q0 32512` would be the global-attention-bound long-context regime.
+- 3 passes × 2 layers → 6 `.rgp` (`submit0..5`). **Take the LAST two**: `submit4`
+  = warm sliding L4, `submit5` = warm global L5. (Weight uploads and warm-up
+  passes don't pollute the file list — only the per-layer submits emit captures.)
+- Build with `--features sg-model/int8-ffn` to trace the deployed int8 path.
+
+**Two RADV gotchas this surfaced:**
+
+- `RADV_THREAD_TRACE_INSTRUCTION_TIMING` **defaults to `true`** — omitting it does
+  NOT disable it. Set `=false` explicitly to shrink the trace (drops per-op
+  timing, keeps the occupancy/event/cache timeline).
+- **Long-context capture trips the 2 s watchdog.** Instruction-timing capture
+  overhead pushes the ~118 ms q0=32K global flash kernel past `lockup_timeout`
+  → gfx ring reset (and the reset knocks `power_dpm_force_performance_level` back
+  to `auto` — re-pin `high` after). Even without instruction timing the q0=32K
+  global trace overflows a 2 GB buffer (256 queries × 32K keys is a huge wave
+  stream); bump the buffer and/or raise `amdgpu.lockup_timeout` for that regime.
+  The q0=0 layers capture cleanly with instruction timing on.
 
 ## Move it to your machine + open
 

@@ -40,6 +40,70 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
     })
 }
 
+/// Capture the real recorded prefill graph (not an isolated GEMM): one PER-LAYER
+/// `.rgp` showing the full cross-kernel mix of a prefill layer — QKV gemms, flash
+/// attention, the O gemm, FFN gate/up/down gemms, rmsnorm, rope, residual joins —
+/// with their real overlap, at the production chunk size M=256.
+///
+/// Per-layer, not per-chunk, because SQTT records a continuous token stream whose
+/// buffer fills on GPU *duration*: a single gemm fits (the `rgp <kernel>` harness),
+/// but a 60-layer chunk — even one 6-layer watchdog segment — runs far too long to
+/// hold (tested: overflows 1 GB). A layer is the repeating unit; layer 4 samples a
+/// sliding layer and layer 5 the global one (`layer % 6 == 5`), so the two traces
+/// together cover every prefill kernel. Drive `q0` for the operating point: 0 is
+/// FFN-gemm-bound short context, 32512 is global-attention-bound long context.
+///
+/// Each layer is submitted on its own (`record_prefill_layers(i..i+1)`), so under
+/// `MESA_VK_TRACE_PER_SUBMIT=true` each is one `.rgp`. We submit `PASSES` warm-up
+/// rounds first (env is process-wide, so uploads + warm-ups also emit captures) —
+/// **take the LAST two** `.rgp`: sliding layer 4 then global layer 5 of the warm
+/// pass. Bump `RADV_THREAD_TRACE_BUFFER_SIZE` if a layer still overflows; drop
+/// `RADV_THREAD_TRACE_INSTRUCTION_TIMING` to shrink it further (loses per-op timing
+/// but keeps the occupancy/event/cache timeline).
+pub fn run_prefill(model_path: &std::path::Path, q0: u32) -> anyhow::Result<()> {
+    const CHUNK: usize = 256; // production prefill chunk (profile.rs sweet spot)
+    const GLOBAL_CAP: usize = 32 * 1024;
+    const PASSES: usize = 3; // warm-ups + final; take the LAST 2 .rgp (layers 4,5)
+    const REP_LAYERS: [usize; 2] = [4, 5]; // a sliding then a global layer
+
+    let file = sg_gguf::GgufFile::open(model_path)?;
+    let gguf = file.parse().map_err(|e| anyhow::anyhow!("parse: {e}"))?;
+    let ctx = sg_gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("gpu: {e}"))?;
+    eprintln!("uploading weights …");
+    let mut model = sg_model::GpuModel::new(&ctx, &gguf, GLOBAL_CAP, CHUNK)
+        .map_err(|e| anyhow::anyhow!("upload: {e}"))?;
+    // One single-layer graph per representative layer (sliding 4, global 5).
+    let layer_graphs: Vec<(usize, sg_gpu::CommandGraph)> = REP_LAYERS
+        .iter()
+        .map(|&i| {
+            model
+                .record_prefill_layers(i..i + 1, CHUNK, CHUNK)
+                .map(|g| (i, g))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let chunk_tokens: Vec<u32> = (0..CHUNK as u32).map(|i| 1000 + i * 7).collect();
+    model.reset();
+
+    eprintln!(
+        "RGP prefill capture: per-layer (sliding L4, global L5), M={CHUNK}, q0={q0}.\n\
+         {PASSES} passes → {} layer .rgp; TAKE THE LAST 2 (warm L4 then L5).",
+        PASSES * REP_LAYERS.len()
+    );
+    for pass in 0..PASSES {
+        model.pos = q0;
+        model
+            .stage_prefill_chunk(&chunk_tokens)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for (i, g) in &layer_graphs {
+            model.submit(g).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let kind = if i % 6 == 5 { "global" } else { "sliding" };
+            eprintln!("  pass {pass} layer {i} ({kind})");
+        }
+    }
+    Ok(())
+}
+
 pub fn run(kernel: &str) -> anyhow::Result<()> {
     let (k, n, nb, mb, int8, swz) = shape(kernel).ok_or_else(|| {
         anyhow::anyhow!(
