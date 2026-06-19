@@ -78,6 +78,61 @@ pub fn q8_quant(vals: &[f32]) -> (Vec<u32>, Vec<u16>, Vec<f32>) {
     (quants, scales, deq)
 }
 
+/// Per-KEY Q8 quantize of V for int8 PV (Piece B). Same Q8_0 math as
+/// `q8_quant`, but the 32-blocks run along the KEY axis (the PV contraction)
+/// instead of head-dim, so each block's scale factors out of the i8 key-dot
+/// — the reason int8 PV is expressible at all (cf. docs/q8-kv-flash-impl.md §2:
+/// V's natural head-dim quant does NOT align with the key contraction).
+///
+/// `v` is the natural `[keys × n_kv_heads × head_dim]` V (row-major, the order
+/// `attention_head` reads). For each (head, head-dim column c) the `keys` are
+/// grouped into `ceil(keys/32)` blocks of ≤32; one f16 amax scale per
+/// (key-block, head, c). The i8 quants KEEP the `[keys × n_kv_heads × head_dim]`
+/// layout of the f16 V they replace (and of the K quants), packed 4/u32 — only
+/// the scales array is key-blocked. A short final block (keys not a multiple of
+/// 32) is quantized over its live keys, as the kernel will with zero-padded P.
+///
+/// Returns `(quants u32-packed [keys·n_kv_heads·head_dim / 4], scales f16
+/// [ceil(keys/32)·n_kv_heads·head_dim], dequant f32 in the input `[keys × …]`
+/// order — the values the int8 PV kernel actually multiplies)`.
+pub fn q8_quant_v(
+    v: &[f32],
+    keys: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> (Vec<u32>, Vec<u16>, Vec<f32>) {
+    assert_eq!(v.len(), keys * n_kv_heads * head_dim);
+    assert!(v.len().is_multiple_of(4));
+    let row = n_kv_heads * head_dim;
+    let kblk = keys.div_ceil(32);
+    let mut quants = vec![0u32; v.len() / 4];
+    let mut scales = vec![0u16; kblk * row];
+    let mut deq = vec![0f32; v.len()];
+    for h in 0..n_kv_heads {
+        for c in 0..head_dim {
+            for kb in 0..kblk {
+                let k0 = kb * 32;
+                let k1 = (k0 + 32).min(keys);
+                let amax = (k0..k1).fold(0f32, |a, key| {
+                    a.max(v[(key * n_kv_heads + h) * head_dim + c].abs())
+                });
+                let d = amax / 127.0;
+                let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+                let d16 = half::f16::from_f32(d);
+                scales[(kb * n_kv_heads + h) * head_dim + c] = d16.to_bits();
+                let dd = d16.to_f32();
+                for key in k0..k1 {
+                    let idx = (key * n_kv_heads + h) * head_dim + c;
+                    let qi = ((v[idx] * id).round_ties_even() as i32).clamp(-128, 127) as i8;
+                    quants[idx / 4] |= ((qi as u8 as u32) & 0xFF) << ((idx % 4) * 8);
+                    deq[idx] = dd * qi as f32;
+                }
+            }
+        }
+    }
+    (quants, scales, deq)
+}
+
 /// Max combined error: |got−want| ≤ atol + rtol·|want|, reported with index.
 pub fn assert_close(got: &[f32], want: &[f32], atol: f32, rtol: f32, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");

@@ -11,7 +11,8 @@
 mod reference;
 
 use reference::{
-    Rng, assert_close, attention_head, from_f16_bits, q8_quant, through_f16, to_f16_bits,
+    Rng, assert_close, attention_head, from_f16_bits, q8_quant, q8_quant_v, through_f16,
+    to_f16_bits,
 };
 use sg_gpu::{GpuContext, StepState};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
@@ -773,6 +774,45 @@ fn attn_prefill_global_flash_sp_iq_matches_reference() {
                     RTOL,
                     &format!("flash_sp_iq q0={q0} i={i} qh={qh}"),
                 );
+            }
+        }
+    }
+}
+
+/// CPU-only (no GPU): the per-key V Q8 reference for Piece B (int8 PV). Pins
+/// the key-axis blocking, key-blocked scale layout, 4/u32 packing, and dequant
+/// consistency — `keys` deliberately not a multiple of 32 to hit the short
+/// final block.
+#[test]
+fn q8_quant_v_reference_is_consistent() {
+    let mut rng = Rng::new(0x5EED);
+    let (keys, nkv, hd) = (70usize, GL_KV_HEADS, GL_DIM);
+    let v = through_f16(&rng.f32_vec(keys * nkv * hd));
+    let (quants, scales, deq) = q8_quant_v(&v, keys, nkv, hd);
+
+    let kblk = keys.div_ceil(32);
+    assert_eq!(quants.len(), v.len() / 4);
+    assert_eq!(scales.len(), kblk * nkv * hd);
+    assert_eq!(deq.len(), v.len());
+
+    for h in 0..nkv {
+        for c in 0..hd {
+            for kb in 0..kblk {
+                let (k0, k1) = (kb * 32, (kb * 32 + 32).min(keys));
+                let dd = half::f16::from_bits(scales[(kb * nkv + h) * hd + c]).to_f32();
+                // The scale is the amax over this 32-KEY block (not head-dim):
+                // this is what makes the per-block scale factor out of the PV
+                // key-contraction.
+                let amax = (k0..k1).fold(0f32, |a, key| a.max(v[(key * nkv + h) * hd + c].abs()));
+                assert_eq!(dd, half::f16::from_f32(amax / 127.0).to_f32(), "scale {kb},{h},{c}");
+                for key in k0..k1 {
+                    let idx = (key * nkv + h) * hd + c;
+                    let qi = (quants[idx / 4] >> ((idx % 4) * 8)) as u8 as i8;
+                    // dequant == unpacked i8 × the block scale, exactly.
+                    assert_eq!(deq[idx], dd * qi as f32, "deq {idx}");
+                    // reconstruction within one quant step of the f16'd input.
+                    assert!((v[idx] - deq[idx]).abs() <= dd + 1e-4, "recon {idx}");
+                }
             }
         }
     }
