@@ -1,5 +1,12 @@
 # Task guide — int8-MMQ in-register rescale rewrite (+ re-bench)
 
+> **UPDATE 2026-06-20 — DONE + evolved.** The in-register rescale shipped (the LDS
+> `stage` outer-product path described here). It later got a second path: building
+> the scale fragment on the fly via **0-stride coopLoad broadcasts** (no `stage`
+> fill), deployed per-shape on a `const BCAST` branch — wins the K=5376 gemms
+> (−4..−16%), loses large-K, +4..10% e2e prefill (commit `a11d1d6`). See
+> `docs/STATUS.md` 2026-06-20 and the `gemm_q4_0_i8.wgsl` `const BCAST` comment.
+
 **Task for this session:** rewrite `crates/sg-gpu/shaders/gemm_q4_0_i8.wgsl` to do the per-block
 rescale **in registers** (using coopmat ops now available in the naga fork), eliminating the
 per-block i32 `coopStore` + barriers, keep parity, and re-benchmark against f16. This is the payoff

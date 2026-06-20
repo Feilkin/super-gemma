@@ -1,10 +1,28 @@
-# Q8 KV cache — Piece A SHIPPED (reference) + Piece B plan (int8 V/PV)
+# Q8 KV cache — Piece A SHIPPED (reference) + Piece B (int8 V/PV) SHELVED
 
-**Piece A (Q8 global K cache) is done and merged to `main` (2026-06-19).** This
-doc is now (a) the as-landed reference for what exists, and (b) the starting
-point for **Piece B — int8 V/PV**, which is intended for a clean context. Read
-§1–§2 (the Q8_0 format + layout reasoning, still load-bearing) and the "Piece A
-as-landed" map before starting B.
+**Piece A (Q8 global K cache) is done and merged to `main` (2026-06-19).**
+**Piece B (int8 V/PV) was built, profiled, and SHELVED (2026-06-20).** This doc is
+now (a) the as-landed reference for Piece A (§1–§2 Q8_0 format + layout, still
+load-bearing) and (b) the record of why B doesn't pay. Read §1–§2 and the verdict
+below before touching the global KV path.
+
+## Piece B verdict (2026-06-20): SHELVED — profile-confirmed slower
+
+Built fully (int8 V cache key-blocked, in-kernel P-quant, 0-stride rescale, decode
+int8-V with open-block requant). E2e it's slower than f16 PV at every context
+(−1.3 % @8K → −11.5 % @256K prefill, gap grows; decode a wash). RGP instruction
+timing localized it: the global flash is **memory-latency-bound** (dominant stall
+`s_waitcnt vmcnt` before the WMMAs; HW util <33 % everywhere), and int8 PV adds
+**+30 % VALU** (the in-kernel P-quant + per-block rescale) that lengthens each
+wave's critical path without saturating ALUs. int8 V's halved bytes buy nothing on
+a latency-bound (not bandwidth-bound) kernel. The asymmetry vs Piece A: Q and K are
+**pre-quantized** (zero in-kernel quant → int8 QKᵀ is a pure win), but P is computed
+in the softmax, so int8 PV **must** quantize it in-kernel — that VALU is the cost.
+The committed `_ipv`/`_ipv_bcast` kernels stay in-tree (not graph-wired); the durable
+win from this arc is the **0-stride coopLoad rescale**, since reused to deploy a
+per-shape gemm speedup (`docs/STATUS.md` 2026-06-20). **Only revisit int8 PV if the
+flash is first made less latency-bound** (shrink the `vmcnt` stalls via load
+scheduling / prefetch). The plan text below is kept as the as-built record.
 
 ## Status
 

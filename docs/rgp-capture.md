@@ -82,18 +82,38 @@ RADV_THREAD_TRACE_BUFFER_SIZE=2147483648 \
   passes don't pollute the file list — only the per-layer submits emit captures.)
 - Build with `--features sg-model/int8-ffn` to trace the deployed int8 path.
 
-**Two RADV gotchas this surfaced:**
+**RADV gotchas this surfaced (corrected 2026-06-20 — an earlier version of this
+section blamed the watchdog and trace size; both were wrong):**
 
 - `RADV_THREAD_TRACE_INSTRUCTION_TIMING` **defaults to `true`** — omitting it does
   NOT disable it. Set `=false` explicitly to shrink the trace (drops per-op
   timing, keeps the occupancy/event/cache timeline).
-- **Long-context capture trips the 2 s watchdog.** Instruction-timing capture
-  overhead pushes the ~118 ms q0=32K global flash kernel past `lockup_timeout`
-  → gfx ring reset (and the reset knocks `power_dpm_force_performance_level` back
-  to `auto` — re-pin `high` after). Even without instruction timing the q0=32K
-  global trace overflows a 2 GB buffer (256 queries × 32K keys is a huge wave
-  stream); bump the buffer and/or raise `amdgpu.lockup_timeout` for that regime.
-  The q0=0 layers capture cleanly with instruction timing on.
+- **The buffer-size env is a 32-bit byte field — it WRAPS mod 2³² (4 GiB).**
+  MEASURED via the `initial buffer size: N MiB` line RADV prints: 2 GB→2048,
+  3 GB→3072, **4 GB→0, 6 GB→2048, 8 GB→0**. So any value ≥ 4 GiB silently becomes
+  a ~0-byte buffer; the SQTT writer (`SQG`) then page-faults writing the trace →
+  `gfxhub page fault … Faulty UTCL2 client ID: SQG`, gfx ring timeout, "device
+  wedged / hard recovery". Looks like a hang, but the dmesg `SQG` client ID is the
+  tell. **Use a value just under 4 GiB** (`0xFC000000` = `4227858432`, 4032 MiB),
+  and **set BOTH** `RADV_THREAD_TRACE_BUFFER_SIZE` and
+  `RADV_CACHE_COUNTERS_BUFFER_SIZE` (RADV's "too small" error names both; cache
+  counters are on by default and need room too). Auto-resize is off by default.
+- **Long-context capture is NOT watchdog- or size-limited** (the old claim).
+  `lockup_timeout` is 30 s on this box now (not 2 s — read
+  `/sys/module/amdgpu/parameters/lockup_timeout`), and the global-flash layer
+  trace is small: instruction-timing-ON `rgp-prefill` is 198 / 268 / 399 / 618 MB
+  at q0 = 4096 / 8192 / 16384 / 32512 — nowhere near 4 GiB. With a valid <4 GiB
+  buffer + both env vars, q0=32512 timing-on captures cleanly. In the RGP GUI,
+  select the flash dispatch inside a full-layer trace to read its per-op timing —
+  no need to isolate the kernel into its own submit. Working recipe:
+
+  ```sh
+  MESA_VK_TRACE=rgp MESA_VK_TRACE_PER_SUBMIT=true \
+  RADV_THREAD_TRACE_BUFFER_SIZE=4227858432 \
+  RADV_CACHE_COUNTERS_BUFFER_SIZE=4227858432 \
+  RADV_THREAD_TRACE_INSTRUCTION_TIMING=true \
+    ./target/release/sg-bench rgp-prefill --q0 32512
+  ```
 
 ## Move it to your machine + open
 

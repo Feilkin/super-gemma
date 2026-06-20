@@ -1,12 +1,34 @@
 # STATUS — read this first
 
-Last updated: **2026-06-19** (int8 made the default prefill path; f16 GEMMs removed), working on the
-Framework Desktop target box. The conversation history that produced this repo is gone; everything
-needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
+Last updated: **2026-06-20** (gemm 0-stride rescale deployed on K=5376 shapes; int8 V/PV shelved),
+working on the Framework Desktop target box. The conversation history that produced this repo is gone;
+everything needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
 
 **Perf-number rule (AGENTS.md):** every performance number here cites its benchmark + operating
 point, e.g. `(bench: gemm_variance, perf=high)`. Numbers are at `perf=high` unless noted; `auto`
 reads ~30 % low. When a benchmark changes, update the numbers (grep for the old value).
+
+## 2026-06-20 — gemm 0-stride rescale (deployed) + int8 V/PV (shelved)
+
+**Prefill headline now: 315 / 223 / 146 tok/s @ q0 0 / 8K / 32K** (bench: `sg-bench profile`,
+perf=high), up from 286 / 209 / 141 — **+9.8 / +6.8 / +4.0 %**, free (gemms bit-parity). Source:
+`gemm_q4_0_i8`'s per-block rescale now builds the [16×16] scale fragment on the fly via 0-stride
+coopLoad broadcasts (`coopLoad(da_l,0)·coopLoadT(dw2,0)`) instead of the LDS `stage` outer-product,
+**on the K=5376 shapes only** (Q/KV/FFN-gate-up). Per-shape A/B (bench: `mmq_tflops`, perf=high): the
+K=5376 gemms win −3.5..−15.8% (rescale-bound), large-K loses +2..+12% (weight-bound — freed LDS
+oversubscribes the weight stream), so it's branched on a per-variant `const BCAST` (ACO drops the dead
+path); large-K (O, FFN-down) keep the LDS path. Commit `a11d1d6`. Win is biggest at q0=0 (gemm-bound),
+tapers at long ctx (attention-bound). The numbers in the M4/headline sections below predate this.
+
+**int8 V/PV (Piece B, `attn_prefill_global_flash_sp_ipv_bcast`) — SHELVED, profile-confirmed.** Built
+fully (int8 V cache, in-kernel P-quant, decode int8-V), but e2e it's slower than f16 PV at every ctx
+(−1.3..−11.5 % prefill @ 8K..256K, gap grows; decode a wash). RGP instruction timing settled why: the
+flash is **memory-latency-bound** (stalls are `s_waitcnt vmcnt` before the WMMAs), and int8 PV adds
++30 % VALU (the in-kernel P-quant + rescale) that extends the critical path without saturating ALUs —
+int8 V's halved bytes buy nothing on a latency-bound (not bandwidth-bound) kernel. int8 K wins because
+Q/K are pre-quantized (zero in-kernel quant); int8 V can't because P is computed in-kernel. Keep Piece
+A (f16 PV). The 0-stride rescale primitive (the durable win from this arc) is what got reused on the
+gemms above. See `docs/q8-kv-flash-impl.md`.
 
 ## Where the project stands
 

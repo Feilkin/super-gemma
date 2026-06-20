@@ -19,8 +19,11 @@
 // impossible — every block's i32 dot must be pulled out, converted to f32 and
 // scaled before it can be summed into Y. The f32 output `yacc` is
 // register-resident across all blocks (a `coop_mat<f32,C>` array, zeroed once);
-// the scale is built in LDS and applied with component-wise coopmat ops
-// (`yacc += scale * f32(acc)`: OpConvertSToF + OpFMul + OpFAdd, per-lane).
+// the scale fragment is applied with component-wise coopmat ops (`yacc += scale *
+// f32(acc)`: OpConvertSToF + OpFMul + OpFAdd, per-lane). It is built either in LDS
+// (BCAST=0, `stage` outer product) or on the fly via 0-stride coopLoad broadcasts
+// (BCAST=1) — see the `const BCAST` doc; deployed BCAST=1 on the K=5376 shapes
+// (+4..10% e2e prefill, bench: sg-bench profile, perf=high; STATUS 2026-06-20).
 //
 // ISA-guided tuning + reading Q4_0 directly: ~11 TFLOPS at 2×2 ≈ 1.03× f16
 // (bench: mmq_tflops, perf=high; STATUS 2026-06-14). 2×2 is the production
