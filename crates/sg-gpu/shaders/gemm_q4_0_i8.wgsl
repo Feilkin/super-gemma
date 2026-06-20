@@ -73,6 +73,13 @@ const STAGE_BUFS: u32 = #{STAGE_BUFS}u;
 // N-strip's M-blocks launch consecutively and its weight strip stays hot in L2
 // (prefill is weight-traffic-bound — RGP 2026-06-14). Dispatch transposed at 1.
 const SWIZZLE: u32 = #{SWIZZLE}u;
+// Rescale path. 1 = build the per-block scale fragment on the fly from the row/col
+// scale VECTORS via 0-stride coopLoad broadcasts (no LDS `stage` fill); 0 = form
+// the [M_ROWS×N_COLS] outer product in `stage` and coopLoad it. Per-shape A/B
+// (mmq_tflops, perf=high): 0-stride wins K=5376 (−4..−16%, rescale-bound) but
+// loses large-K (+2..+12%, weight-bound — the freed LDS/occupancy oversubscribes
+// the weight stream). build.rs sets BCAST=1 on the K=5376 variants, 0 elsewhere.
+const BCAST: u32 = #{BCAST}u;
 
 const NB: u32 = K / 32u;            // 32-blocks per row
 const ACC: u32 = M_TILES * N_TILES; // 16×16 output tiles per workgroup
@@ -84,11 +91,15 @@ const ROW_WORDS: u32 = NB * 18u / 4u; // Q4_0 words per W row (NB even → exact
 // Unpacked int8 weights for the current 64-K block pair: [N_COLS rows × 64 K]
 // row-major (cols 0..32 = block β, 32..64 = block β+1).
 var<workgroup> wb: array<i8, N_COLS * 64u>;
-// The two blocks' per-row d_w scales, extracted from the Q4_0 blocks.
-var<workgroup> dwa: array<f32, N_COLS>;
-var<workgroup> dwb: array<f32, N_COLS>;
-// The block's row scales d_a, and the outer-product scale d_a[m]·d_w[n]
-// (STAGE_BUFS halves; buffer 0 also the f32→f16 epilogue scratch).
+// The two blocks' per-col d_w scales (block β in [0,N_COLS), β+1 in
+// [N_COLS,2·N_COLS)), extracted from the Q4_0 blocks — combined into one array so
+// the BCAST=1 rescale can take a pointer per block (`select` can't pick between
+// two array vars; the BCAST=0 path indexes it as the old dwa/dwb).
+var<workgroup> dw2: array<f32, 2u * N_COLS>;
+// The block's per-row d_a scales, plus (BCAST=0) the [M_ROWS×N_COLS] outer-product
+// scale `stage` (STAGE_BUFS-buffered; buffer 0 is also the f32→f16 epilogue
+// scratch). BCAST=1 builds the scale fragment on the fly and uses `stage` ONLY for
+// the epilogue → set STAGE_BUFS=1 on those variants so it isn't double-sized.
 var<workgroup> da_l: array<f32, M_ROWS>;
 var<workgroup> stage: array<f32, STAGE_BUFS * TILE_ELEMS>;
 
@@ -160,7 +171,7 @@ fn main(
         }
         if (lid < N_COLS) {
             // Block β: d in w_cur[0].lo, 16 qs bytes spanning w_cur[0].hi..[4].lo.
-            dwa[lid] = unpack2x16float(w_cur[0]).x;
+            dw2[lid] = unpack2x16float(w_cur[0]).x;
             unpack_block(
                 (w_cur[0] >> 16u) | (w_cur[1] << 16u),
                 (w_cur[1] >> 16u) | (w_cur[2] << 16u),
@@ -169,7 +180,7 @@ fn main(
                 lid * 64u,
             );
             // Block β+1: d in w_cur[4].hi, qs in w_cur[5..8].
-            dwb[lid] = unpack2x16float(w_cur[4]).y;
+            dw2[N_COLS + lid] = unpack2x16float(w_cur[4]).y;
             unpack_block(w_cur[5], w_cur[6], w_cur[7], w_cur[8], lid * 64u + 32u);
         }
         workgroupBarrier(); // wb + dwa/dwb written before MMA / rescale read them
@@ -195,45 +206,65 @@ fn main(
             }
         }
 
-        // Rescale both blocks into yacc. Each `u` is one block: load its row
-        // scales `d_a`, form the outer product with the block's `d_w` (dwa/dwb)
-        // in its `stage` buffer (`base`), then yacc += scale · f32(dot). At
-        // STAGE_BUFS=2 the two passes use different halves (overlap); at 1 they
-        // share one (the next pass's `da_l` barrier already orders this pass's
-        // coopLoad before the overwrite, so no extra barrier either way).
+        // Rescale both blocks into yacc. Each `u` is one block: load its row scales
+        // `d_a`, then apply the per-block scale d_a[m]·d_w[n] (an outer product over
+        // the tile) — which must enter as its own [16×16] fragment (coopmat has no
+        // per-element access). Two paths (BCAST), identical barrier count:
+        //   BCAST=1: build the fragment on the fly with 0-stride coopLoads —
+        //     coopLoad(da_l,0)[i][j]=da_l[j], coopLoadT(dw2,0)[i][j]=dw2[i], product
+        //     = da_l[j]·dw2[i], lining up with acc[i][j] (out row mt·16+j, col
+        //     nt·16+i). No `stage` fill, no LDS materialization.
+        //   BCAST=0: form the outer product in `stage` (×4-unrolled) and coopLoad it.
         for (var u = 0u; u < 2u; u += 1u) {
             let bb = beta + u;
             for (var i = lid; i < M_ROWS; i += WG) {
                 da_l[i] = f32(x_scales[(m0 + i) * NB + bb]);
             }
-            // da_l written; at STAGE_BUFS=1 also orders the previous pass's stage
-            // coopLoad before this pass overwrites `stage`.
+            // da_l written before it is read below; at BCAST=0/STAGE_BUFS=1 this
+            // also orders the previous pass's `stage` coopLoad before the overwrite.
             workgroupBarrier();
-            let base = (u % STAGE_BUFS) * TILE_ELEMS;
-            let n = lid % N_COLS;
-            let dw = select(dwb[n], dwa[n], u == 0u);
-            // ×4-unrolled column walk so independent da_l loads pipeline.
-            let step = WG / N_COLS;
-            for (var m = lid / N_COLS; m < M_ROWS; m += 4u * step) {
-                let d0 = da_l[m];
-                let d1 = da_l[m + step];
-                let d2 = da_l[m + 2u * step];
-                let d3 = da_l[m + 3u * step];
-                stage[base + m * N_COLS + n] = d0 * dw;
-                stage[base + (m + step) * N_COLS + n] = d1 * dw;
-                stage[base + (m + 2u * step) * N_COLS + n] = d2 * dw;
-                stage[base + (m + 3u * step) * N_COLS + n] = d3 * dw;
-            }
-            workgroupBarrier(); // stage written before coopLoad
-            for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                for (var nt = 0u; nt < N_TILES; nt += 1u) {
-                    let t = mt * N_TILES + nt;
-                    let scale = coopLoadT<coop_mat16x16<f32, C>>(
-                        &stage[base + (mt * 16u) * N_COLS + nt * 16u], N_COLS);
-                    if (u == 0u) {
-                        yacc[t] = yacc[t] + scale * f32(acc[t]);
-                    } else {
-                        yacc[t] = yacc[t] + scale * f32(acc2[t]);
+            if (BCAST == 1u) {
+                let dwo = u * N_COLS; // block u's d_w base in dw2
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    for (var nt = 0u; nt < N_TILES; nt += 1u) {
+                        let t = mt * N_TILES + nt;
+                        let scale = coopLoad<coop_mat16x16<f32, C>>(&da_l[mt * 16u], 0u)
+                            * coopLoadT<coop_mat16x16<f32, C>>(&dw2[dwo + nt * 16u], 0u);
+                        if (u == 0u) {
+                            yacc[t] = yacc[t] + scale * f32(acc[t]);
+                        } else {
+                            yacc[t] = yacc[t] + scale * f32(acc2[t]);
+                        }
+                    }
+                }
+                workgroupBarrier(); // coopLoad(da_l) done before next pass overwrites da_l
+            } else {
+                let base = (u % STAGE_BUFS) * TILE_ELEMS;
+                let n = lid % N_COLS;
+                let dw = select(dw2[N_COLS + n], dw2[n], u == 0u);
+                // ×4-unrolled column walk so independent da_l loads pipeline.
+                let step = WG / N_COLS;
+                for (var m = lid / N_COLS; m < M_ROWS; m += 4u * step) {
+                    let d0 = da_l[m];
+                    let d1 = da_l[m + step];
+                    let d2 = da_l[m + 2u * step];
+                    let d3 = da_l[m + 3u * step];
+                    stage[base + m * N_COLS + n] = d0 * dw;
+                    stage[base + (m + step) * N_COLS + n] = d1 * dw;
+                    stage[base + (m + 2u * step) * N_COLS + n] = d2 * dw;
+                    stage[base + (m + 3u * step) * N_COLS + n] = d3 * dw;
+                }
+                workgroupBarrier(); // stage written before coopLoad
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    for (var nt = 0u; nt < N_TILES; nt += 1u) {
+                        let t = mt * N_TILES + nt;
+                        let scale = coopLoadT<coop_mat16x16<f32, C>>(
+                            &stage[base + (mt * 16u) * N_COLS + nt * 16u], N_COLS);
+                        if (u == 0u) {
+                            yacc[t] = yacc[t] + scale * f32(acc[t]);
+                        } else {
+                            yacc[t] = yacc[t] + scale * f32(acc2[t]);
+                        }
                     }
                 }
             }

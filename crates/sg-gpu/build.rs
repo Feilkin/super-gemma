@@ -590,6 +590,8 @@ const VARIANTS: &[Variant] = &[
             ("M_TILES", 4),
             ("N_TILES", 1),
             ("SWIZZLE", 1),
+            ("BCAST", 1),      // 0-stride rescale (A/B win on K=5376)
+            ("STAGE_BUFS", 1), // `stage` is epilogue-only under BCAST → don't double-size
         ],
         workgroup: [64, 1, 1],
         bindings: 4,
@@ -665,6 +667,8 @@ const VARIANTS: &[Variant] = &[
             ("M_TILES", 4),
             ("N_TILES", 1),
             ("SWIZZLE", 1),
+            ("BCAST", 1),      // 0-stride rescale (A/B win on K=5376)
+            ("STAGE_BUFS", 1), // `stage` is epilogue-only under BCAST → don't double-size
         ],
         workgroup: [64, 1, 1],
         bindings: 4,
@@ -682,6 +686,8 @@ const VARIANTS: &[Variant] = &[
             ("M_TILES", 4),
             ("N_TILES", 1),
             ("SWIZZLE", 1),
+            ("BCAST", 1),      // 0-stride rescale (A/B win on K=5376)
+            ("STAGE_BUFS", 1), // `stage` is epilogue-only under BCAST → don't double-size
         ],
         workgroup: [64, 1, 1],
         bindings: 4,
@@ -699,6 +705,8 @@ const VARIANTS: &[Variant] = &[
             ("M_TILES", 4),
             ("N_TILES", 1),
             ("SWIZZLE", 1),
+            ("BCAST", 1),      // 0-stride rescale (A/B win on K=5376)
+            ("STAGE_BUFS", 1), // `stage` is epilogue-only under BCAST → don't double-size
         ],
         workgroup: [64, 1, 1],
         bindings: 4,
@@ -716,6 +724,8 @@ const VARIANTS: &[Variant] = &[
             ("M_TILES", 4),
             ("N_TILES", 1),
             ("SWIZZLE", 1),
+            ("BCAST", 1),      // 0-stride rescale (A/B win on K=5376)
+            ("STAGE_BUFS", 1), // `stage` is epilogue-only under BCAST → don't double-size
         ],
         workgroup: [64, 1, 1],
         bindings: 4,
@@ -1683,6 +1693,9 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         substituted = substituted.replace("#{STAGE_BUFS}", "2");
         // gemm_q4_0 reads `#{SWIZZLE}`; default 0 (x=N, y=M) unless overridden.
         substituted = substituted.replace("#{SWIZZLE}", "0");
+        // gemm_q4_0_i8 reads `#{BCAST}`; default 0 (LDS `stage` rescale) unless the
+        // variant opted into the 0-stride rescale (the K=5376 shapes — A/B win).
+        substituted = substituted.replace("#{BCAST}", "0");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {
