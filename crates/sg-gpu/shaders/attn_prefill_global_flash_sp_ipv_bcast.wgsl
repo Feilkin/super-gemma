@@ -62,12 +62,16 @@ const O_TILES: u32 = HEAD_DIM / 16u;
 const NEG_INF: f32 = -3.0e38;
 
 var<workgroup> s_stage: array<f32, #{S_STAGE_LEN}>;       // scores, reused to hold P (f32) for quant
-var<workgroup> p_i8_stage: array<i8, #{S_STAGE_LEN}>;     // P quantized i8 [16 q × N_K key]
-var<workgroup> p_scales: array<f32, #{P_SCALES_LEN}>;     // P scale per (q row, 32-key block)
-var<workgroup> corr_stage: array<f32, 256>;
+var<workgroup> p_i8_stage: array<i8, #{S_STAGE_LEN}>;     // P quantized i8 [M_Q q × N_K key]
 var<workgroup> o_stage: array<f32, 256>;
-var<workgroup> m_row: array<f32, #{M_Q}>;
-var<workgroup> l_row: array<f32, #{M_Q}>;
+var<workgroup> l_row: array<f32, #{M_Q}>;                 // softmax denom; read cross-thread in the epilogue
+// Online-softmax per-row correction. Broadcast into the [16×16] O-rescale
+// fragment by a 0-stride coopLoad (cf[r][c] = corr_l[c], query on the column
+// axis) — the same primitive as the QKᵀ/PV rescales, so no [16×16] LDS
+// materialization and no 16-col fan-out write. (`m_row` running-max and the
+// per-block P scale are thread-private — only their owning query row reads
+// them — see main; `l_row` stays in LDS, the epilogue reads it cross-row.)
+var<workgroup> corr_l: array<f32, #{M_Q}>;
 // Per-block rescale row/col scale vectors (16 each). The [16×16] outer product
 // is built from these by 0-stride coopLoads (see the rescale doc in the QKᵀ
 // loop) — no LDS matrix, unlike the f16 PV baseline / the scalar build.
@@ -88,8 +92,13 @@ fn main(
     let last_key = q0 + m0 + (M_Q - 1u);
     let n_key_tiles = last_key / N_K + 1u;
 
+    // Thread-private softmax state for this invocation's query row (lid < M_Q):
+    // the running max and the per-32-key-block P quant scale are read back only
+    // by the same row that wrote them, so they need not live in LDS.
+    var m_row: f32 = NEG_INF;
+    var p_scales: array<f32, KB>;
+
     if (lid < M_Q) {
-        m_row[lid] = NEG_INF;
         l_row[lid] = 0.0;
     }
 
@@ -155,7 +164,7 @@ fn main(
         if (lid < M_Q) {
             let qpos = q0 + m0 + lid;
             let row = lid * N_K;
-            let m_old = m_row[lid];
+            let m_old = m_row;
             var m_new = m_old;
             for (var j = 0u; j < N_K; j += 1u) {
                 if (kt * N_K + j <= qpos) {
@@ -171,7 +180,7 @@ fn main(
                 }
                 s_stage[row + j] = p;
             }
-            m_row[lid] = m_new;
+            m_row = m_new;
             // Quantize P per 32-key block AND accumulate the softmax denominator
             // from the DEQUANTIZED P, so l matches the i8 P the PV numerator uses
             // — otherwise small P's that round to 0 drop from the numerator but
@@ -187,7 +196,7 @@ fn main(
                     id = 1.0 / d;
                 }
                 let ds = f32(f16(d)); // f16-rounded scale, matches q8 dequant
-                p_scales[lid * KB + kb] = ds;
+                p_scales[kb] = ds;
                 for (var t = 0u; t < 32u; t += 1u) {
                     let q = clamp(i32(round(s_stage[row + kb * 32u + t] * id)), -128, 127);
                     p_i8_stage[row + kb * 32u + t] = i8(q);
@@ -195,15 +204,15 @@ fn main(
                 }
             }
             l_row[lid] = lsum;
-            for (var c = 0u; c < 16u; c += 1u) {
-                corr_stage[lid * 16u + c] = corr;
-            }
+            corr_l[lid] = corr;
         }
         workgroupBarrier();
 
         // O *= corr, then O += P·V in int8: per 32-KEY block, i8 dot (i32)
         // rescaled by p_scale[q,kb] ⊗ v_scale[kb,c] into the f32 O tile.
-        let cf = coopLoadT<coop_mat16x16<f32, C>>(&corr_stage[0], 16u);
+        // corr broadcast: cf[r][c] = corr_l[c] (query on the column axis, the
+        // same orientation the PV rescale loads its per-row P scale, line below).
+        let cf = coopLoad<coop_mat16x16<f32, C>>(&corr_l[0], 0u);
         let vkb0 = (kt * N_K) / 32u; // global key-block index of this tile's first block
         for (var ot = 0u; ot < O_TILES; ot += 1u) {
             o[ot] = o[ot] * cf;
@@ -220,7 +229,7 @@ fn main(
                 // above): scale the i32 PV dot by p_scale[q,kb] ⊗ v_scale[kb,c],
                 // the row/col scales built into a fragment by 0-stride coopLoads.
                 if (lid < 16u) {
-                    qs_l[lid] = p_scales[lid * KB + kb];
+                    qs_l[lid] = p_scales[kb];
                     ks_l[lid] = f32(v_scales[((vkb0 + kb) * N_KV_HEADS + kvh) * HEAD_DIM + ot * 16u + lid]);
                 }
                 workgroupBarrier(); // qs_l/ks_l written before the 0-stride loads
