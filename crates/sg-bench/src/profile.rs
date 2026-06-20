@@ -20,10 +20,31 @@ use std::time::Instant;
 
 use sg_model::{GpuModel, Sampler, SamplerParams};
 
-const DECODE_CTXS: &[u32] = &[1024, 8192, 32 * 1024];
 const REPS: usize = 5;
 const WARMUP: usize = 2;
-const GLOBAL_CAP: usize = 32 * 1024;
+
+/// Comma-separated u32 list from `var`, or `default`. Lets the long-context
+/// sweep (128K/256K, prefill + decode) run without editing the harness.
+fn env_u32s(var: &str, default: &[u32]) -> Vec<u32> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .filter(|v: &Vec<u32>| !v.is_empty())
+        .unwrap_or_else(|| default.to_vec())
+}
+
+/// Decode context lengths. Override: `SG_DECODE_CTXS=8192,131072,262144`.
+fn decode_ctxs() -> Vec<u32> {
+    env_u32s("SG_DECODE_CTXS", &[1024, 8192, 32 * 1024])
+}
+
+/// Global KV cache cap. Override: `SG_GLOBAL_CAP=262144` for the 256K sweep.
+fn global_cap() -> usize {
+    std::env::var("SG_GLOBAL_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32 * 1024)
+}
 /// Prefill chunk (token rows / gemm M). Default 256 — the production value
 /// (`examples/run.rs`, `Session`) and the measured sweet spot. Override with
 /// `SG_PREFILL_CHUNK=<n>` to re-run the sweep; rounded up to the gemm M_BLOCK
@@ -136,8 +157,9 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
     let ctx = sg_gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("gpu: {e}"))?;
     // GpuModel rounds the chunk up to the gemm M_BLOCK (64); match that here.
     let chunk = prefill_chunk().next_multiple_of(64);
-    eprintln!("uploading weights … (prefill chunk = {chunk})");
-    let mut model = GpuModel::new(&ctx, &gguf, GLOBAL_CAP, chunk)
+    let global_cap = global_cap();
+    eprintln!("uploading weights … (prefill chunk = {chunk}, global_cap = {global_cap})");
+    let mut model = GpuModel::new(&ctx, &gguf, global_cap, chunk)
         .map_err(|e| anyhow::anyhow!("upload: {e}"))?;
     let timer = ctx
         .new_timer(256)
@@ -166,7 +188,7 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
     // ── Decode at several contexts ───────────────────────────────────────
     let mut decode = BTreeMap::new();
     let mut submit_overheads = Vec::new();
-    for &ctx_len in DECODE_CTXS {
+    for &ctx_len in &decode_ctxs() {
         eprintln!("decode @ ctx {ctx_len} …");
         model.reset();
         model.pos = ctx_len - 1; // decode the token at position ctx_len−1
@@ -200,8 +222,12 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
 
     // ── Prefill chunk at several histories ───────────────────────────────
     let chunk_tokens: Vec<u32> = (0..chunk as u32).map(|i| 1000 + i * 7).collect();
-    // Last history keeps q0 + chunk within the global KV cap.
-    let prefill_q0s: [u32; 3] = [0, 8192, GLOBAL_CAP as u32 - chunk as u32];
+    // Last history keeps q0 + chunk within the global KV cap. Override with
+    // `SG_PREFILL_Q0S=8192,32768,131072,261888` for the long-context sweep.
+    let prefill_q0s = env_u32s(
+        "SG_PREFILL_Q0S",
+        &[0, 8192, global_cap as u32 - chunk as u32],
+    );
     let mut prefill = BTreeMap::new();
     for &q0 in &prefill_q0s {
         eprintln!("prefill {chunk}-chunk @ q0 {q0} …");
