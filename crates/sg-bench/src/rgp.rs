@@ -23,6 +23,17 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         // A/B against the deployed 4×1 down-gemm (mmq_variance −47.8%; this trace
         // confirms it reached high occupancy yet lost — STATUS rank #2).
         "gemm_q4_0_i8_occ_k21504_n5376" => (21504, 5376, 16, 16, true, true), // FFN down, 1×1
+        // Multi-wave occupancy GEMM (one 16×16 tile/wave, shared LDS weight strip).
+        // n-block = BN, m-block = BM; swizzled like the deployed 4×1. The down-shape
+        // family A/Bs the deployed m4n1 down-gemm; b41 up matches the gate/up site.
+        "gemm_q4_0_i8_mw_b41_k21504_n5376" => (21504, 5376, 16, 64, true, true), // 4 waves, reuse 64
+        "gemm_q4_0_i8_mw_b22_k21504_n5376" => (21504, 5376, 32, 32, true, true), // 4 waves, reuse 32
+        "gemm_q4_0_i8_mw_b42_k21504_n5376" => (21504, 5376, 32, 64, true, true), // 8 waves, reuse 64
+        "gemm_q4_0_i8_mw_b81_k21504_n5376" => (21504, 5376, 16, 128, true, true), // 8 waves, reuse 128
+        "gemm_q4_0_i8_mw_b41_k5376_n21504" => (5376, 21504, 16, 64, true, true), // gate/up, reuse 64
+        // Half-occupancy A/B vs b41 (same 64×16 block + reuse 64): 2 waves × RM=2.
+        "gemm_q4_0_i8_mw_r2_k21504_n5376" => (21504, 5376, 16, 64, true, true), // 2 waves, RM=2
+        "gemm_q4_0_i8_mw_r2_k5376_n21504" => (5376, 21504, 16, 64, true, true), // gate/up, RM=2
         // int8 2×2 (N-block = M-block = 32) — the pre-cache-block baseline.
         "gemm_q4_0_i8_t22_k21504_n5376" => (21504, 5376, 32, 32, true, false), // FFN down
         "gemm_q4_0_i8_t22_k5376_n21504" => (5376, 21504, 32, 32, true, false), // FFN gate/up
@@ -104,7 +115,62 @@ pub fn run_prefill(model_path: &std::path::Path, q0: u32) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Decode GEMV targets (`y[N] = W[N×K]·x[K]`, M=1) — the BANDWIDTH-bound
+/// reference: gemv hits ~91% of the membw ceiling (bench: gemv_bw), so its trace
+/// is the "what does a memory-system that actually streams look like" calibration
+/// for the latency-stalled prefill GEMMs. K is baked in the variant; N is the
+/// dispatch row count. k21504/n5376 mirrors the FFN-down gemm shape.
+fn gemv_shape(kernel: &str) -> Option<(usize, usize)> {
+    Some(match kernel {
+        "gemv_q4_0_k21504" => (21504, 5376), // FFN down
+        "gemv_q4_0_k5376" => (5376, 21504),  // FFN gate/up
+        "gemv_q4_0_k8192" => (8192, 5376),   // O sliding
+        "gemv_q4_0_k16384" => (16384, 5376), // O global
+        _ => return None,
+    })
+}
+
+/// One decode GEMV per submit (3 bindings: Q4_0 weights, f16 x[K], f16 y[N];
+/// grid = one wave-sized workgroup per output row). Dummy buffers — SQTT records
+/// the wave/stall/occupancy behavior, not the result.
+fn run_gemv(kernel: &str, k: usize, n: usize) -> anyhow::Result<()> {
+    let ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("gpu: {e}"))?;
+    let kern = ctx.load_kernel(kernel).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let u = BufferUsage::STORAGE_BUFFER;
+    let nb_err = |e: sg_gpu::GpuError| anyhow::anyhow!("{e}");
+
+    let w = ctx
+        .new_buffer::<u32>((n * k / 32 * 18 / 4) as u64, u)
+        .map_err(nb_err)?;
+    let x = ctx.new_buffer::<u16>(k as u64, u).map_err(nb_err)?;
+    let y = ctx.new_buffer::<u16>(n as u64, u).map_err(nb_err)?;
+
+    let groups = [n as u32, 1, 1]; // one workgroup per output row
+    eprintln!(
+        "RGP capture target: {kernel}  (GEMV M=1 K={k} N={n})  grid {groups:?}\n\
+         {SUBMITS} submits — under MESA_VK_TRACE_PER_SUBMIT take the LAST .rgp."
+    );
+    for i in 0..SUBMITS {
+        ctx.dispatch_blocking(
+            &kern,
+            vec![
+                WriteDescriptorSet::buffer(0, w.clone()),
+                WriteDescriptorSet::buffer(1, x.clone()),
+                WriteDescriptorSet::buffer(2, y.clone()),
+            ],
+            None::<u32>,
+            groups,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        eprintln!("  submit {i}/{SUBMITS} done");
+    }
+    Ok(())
+}
+
 pub fn run(kernel: &str) -> anyhow::Result<()> {
+    if let Some((k, n)) = gemv_shape(kernel) {
+        return run_gemv(kernel, k, n);
+    }
     let (k, n, nb, mb, int8, swz) = shape(kernel).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown rgp kernel `{kernel}`; the deployed int8 FFN gemms \

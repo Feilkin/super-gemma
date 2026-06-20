@@ -380,13 +380,108 @@ fn bench(c: &mut Criterion) {
         ), // O gl 4×1 s2
         (
             "gemm_q4_0_i8_swz_m4n1_s1_k16384_n5376",
-            i8_writes,
+            i8_writes.clone(),
             16,
             64,
             true,
             16384,
             5376,
         ), // O gl 4×1 s1
+        // Multi-wave occupancy GEMM: one 16×16 tile/wave, BM_TILES·BN_TILES waves
+        // sharing the LDS weight strip — high occupancy at reuse=BM. A/B vs the
+        // deployed 4×1 on the FFN up (k5376) + down (k21504) shapes. m_block=BM,
+        // n_block=BN; these are SWIZZLE=1 → dispatch transposed [m/BM, n/BN].
+        (
+            "gemm_q4_0_i8_mw_b41_k5376_n21504",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            5376,
+            21504,
+        ), // reuse 64, 4 waves (headline)
+        (
+            "gemm_q4_0_i8_mw_b22_k5376_n21504",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            5376,
+            21504,
+        ), // reuse 32, 4 waves, wider N
+        (
+            "gemm_q4_0_i8_mw_b42_k5376_n21504",
+            i8_writes.clone(),
+            32,
+            64,
+            true,
+            5376,
+            21504,
+        ), // reuse 64, 8 waves
+        (
+            "gemm_q4_0_i8_mw_b81_k5376_n21504",
+            i8_writes.clone(),
+            16,
+            128,
+            true,
+            5376,
+            21504,
+        ), // reuse 128, 8 waves
+        (
+            "gemm_q4_0_i8_mw_b41_k21504_n5376",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            21504,
+            5376,
+        ), // down: reuse 64, 4 waves
+        (
+            "gemm_q4_0_i8_mw_b22_k21504_n5376",
+            i8_writes.clone(),
+            32,
+            32,
+            true,
+            21504,
+            5376,
+        ), // down: reuse 32, 4 waves
+        (
+            "gemm_q4_0_i8_mw_b42_k21504_n5376",
+            i8_writes.clone(),
+            32,
+            64,
+            true,
+            21504,
+            5376,
+        ), // down: reuse 64, 8 waves
+        (
+            "gemm_q4_0_i8_mw_b81_k21504_n5376",
+            i8_writes.clone(),
+            16,
+            128,
+            true,
+            21504,
+            5376,
+        ), // down: reuse 128, 8 waves
+        // Half-occupancy A/B vs b41 (same 64×16 block + reuse 64): 2 waves × RM=2.
+        (
+            "gemm_q4_0_i8_mw_r2_k5376_n21504",
+            i8_writes.clone(),
+            16,
+            64,
+            true,
+            5376,
+            21504,
+        ), // up: 2 waves, RM=2 (half occ)
+        (
+            "gemm_q4_0_i8_mw_r2_k21504_n5376",
+            i8_writes,
+            16,
+            64,
+            true,
+            21504,
+            5376,
+        ), // down: 2 waves, RM=2 (half occ)
     ];
 
     let mut group = c.benchmark_group("mmq_vs_f16");

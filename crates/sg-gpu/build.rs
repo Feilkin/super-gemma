@@ -654,6 +654,246 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // MULTI-WAVE occupancy GEMM (gemm_q4_0_i8_mw) — TESTED DEAD END (2026-06-21),
+    // kept as documented A/B baselines like gemm_q4_0_i8_occ; NOT in any graph. A
+    // workgroup of BM_TILES·BN_TILES waves, ONE 16×16 tile per wave, sharing the
+    // LDS weight strip (high occupancy without the _occ kernel's reuse loss) — but
+    // RGP showed the occupancy thrashes L2 + a multi-wave s_barrier tax, and the
+    // deployed GEMM is already ~86% bandwidth-bound, so occupancy can't help (see
+    // the kernel header + STATUS 2026-06-21). WG_X = BM_TILES·BN_TILES·64. Parity
+    // variants (k512_n128) cover the 2D wave grid (b22: wm/wn both vary), the 1D-M
+    // max-occupancy config (b41: wn≡0), and the register-tiled half-occupancy path
+    // (r2: RM=2). The k21504_n5376 b41/r2 pair is the down-shape bench/RGP A/B.
+    Variant {
+        name: "gemm_q4_0_i8_mw_b22_k512_n128",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 256),
+            ("BM_TILES", 2),
+            ("BN_TILES", 2),
+        ],
+        workgroup: [256, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_b41_k512_n128",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 256),
+            ("BM_TILES", 4),
+            ("BN_TILES", 1),
+        ],
+        workgroup: [256, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Bench shapes (FFN up k5376_n21504, down k21504_n5376), SWIZZLE=1 → graph/
+    // bench dispatch transposed. The occupancy×reuse sweep against the deployed
+    // 4×1: b41 (reuse 64, 4 waves) is the headline; b22 (reuse 32, 4 waves, wider
+    // N), b42 (reuse 64, 8 waves), b81 (reuse 128, 8 waves).
+    Variant {
+        name: "gemm_q4_0_i8_mw_b41_k5376_n21504",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 256),
+            ("BM_TILES", 4),
+            ("BN_TILES", 1),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [256, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_b22_k5376_n21504",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 256),
+            ("BM_TILES", 2),
+            ("BN_TILES", 2),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [256, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_b42_k5376_n21504",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 512),
+            ("BM_TILES", 4),
+            ("BN_TILES", 2),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [512, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_b81_k5376_n21504",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 512),
+            ("BM_TILES", 8),
+            ("BN_TILES", 1),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [512, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_b41_k21504_n5376",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 256),
+            ("BM_TILES", 4),
+            ("BN_TILES", 1),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [256, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_b22_k21504_n5376",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 256),
+            ("BM_TILES", 2),
+            ("BN_TILES", 2),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [256, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_b42_k21504_n5376",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 512),
+            ("BM_TILES", 4),
+            ("BN_TILES", 2),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [512, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_b81_k21504_n5376",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 512),
+            ("BM_TILES", 8),
+            ("BN_TILES", 1),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [512, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Half-occupancy A/B vs b41: SAME 64×16 block + reuse 64, but 2 waves each
+    // doing RM=2 register M-tiles (B coopLoad'd once, fed to both → in-wave ILP +
+    // register reuse) → ~2× VGPR → ~half the waves/SIMD. Tests whether warmer L2
+    // (fewer resident wavefronts) beats max occupancy. r2 parity covers the RM>1
+    // register-tile + epilogue path.
+    Variant {
+        name: "gemm_q4_0_i8_mw_r2_k512_n128",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 128),
+            ("BM_TILES", 2),
+            ("BN_TILES", 1),
+            ("RM", 2),
+        ],
+        workgroup: [128, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_r2_k21504_n5376",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 128),
+            ("BM_TILES", 2),
+            ("BN_TILES", 1),
+            ("RM", 2),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [128, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_mw_r2_k5376_n21504",
+        src: "gemm_q4_0_i8_mw",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 128),
+            ("BM_TILES", 2),
+            ("BN_TILES", 1),
+            ("RM", 2),
+            ("SWIZZLE", 1),
+        ],
+        workgroup: [128, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // 4×1 attention shapes (Q/KV/O × sliding/global) for the cache-blocking
     // deployment — default STAGE_BUFS=2 (the 4×1 tile's low LDS makes the
     // double buffer free even on the large-K O shapes).
@@ -1696,6 +1936,10 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         // gemm_q4_0_i8 reads `#{BCAST}`; default 0 (LDS `stage` rescale) unless the
         // variant opted into the 0-stride rescale (the K=5376 shapes — A/B win).
         substituted = substituted.replace("#{BCAST}", "0");
+        // gemm_q4_0_i8_mw reads `#{RM}` (register M-tiles per wave); default 1
+        // (one tile/wave, max occupancy) unless the variant lowers occupancy by
+        // tiling RM tiles per wave (the half-occupancy A/B).
+        substituted = substituted.replace("#{RM}", "1");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {

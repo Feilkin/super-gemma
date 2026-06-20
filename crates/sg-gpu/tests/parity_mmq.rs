@@ -213,6 +213,14 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
         ("gemm_q4_0_i8_t12_k512_n128", 16, 512, 128, 16, 32),
         // 4×4 tiling (f16-equivalent), validates the 64×64 tile index path.
         ("gemm_q4_0_i8_t44_k512_n256", 64, 512, 256, 64, 64),
+        // Multi-wave kernel (one tile/wave): b22 exercises the 2D wave grid
+        // (wm/wn both vary), b41 the 1D-M headline config (wn≡0). m_rows=BM,
+        // n_cols=BN; dispatch [n/BN, m/BM] (these variants are SWIZZLE=0).
+        ("gemm_q4_0_i8_mw_b22_k512_n128", 64, 512, 128, 32, 32),
+        ("gemm_q4_0_i8_mw_b41_k512_n128", 64, 512, 128, 64, 16),
+        // RM=2 register-tiled (half-occupancy): 2 waves, each 2 M-tiles. BM=64,
+        // BN=16; exercises the RM>1 MMA + epilogue path.
+        ("gemm_q4_0_i8_mw_r2_k512_n128", 64, 512, 128, 64, 16),
     ];
 
     for (variant, m, k, n, m_rows, n_cols) in cases {

@@ -8,6 +8,57 @@ everything needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
 point, e.g. `(bench: gemm_variance, perf=high)`. Numbers are at `perf=high` unless noted; `auto`
 reads ~30 % low. When a benchmark changes, update the numbers (grep for the old value).
 
+## 2026-06-21 — multi-wave occupancy GEMM (DEAD END) + the deployed GEMM is ~86% BANDWIDTH-bound
+
+**Headline (corrects the long-standing "prefill gemms are memory-LATENCY-bound at a fraction of
+bandwidth" reading):** the deployed int8 GEMM is **~206 GB/s = ~86% of the ~240 GiB/s ceiling — it is
+bandwidth-bound, near peak.** Measured the only trustworthy way: **RGP `local-video-memory bytes ÷
+dispatch duration**, calibrated against the decode gemv (gemv 68 MB / 300.9 µs = 226 GB/s ≈ its known
+218 GiB/s, `gemv_bw`). For the FFN-down gemm (`gemm_q4_0_i8_swz_m4n1_k21504_n5376`, M=256): **800 MB
+local-video / 3878.8 µs = ~206 GB/s.** The old "~46 GB/s, ~6× matrix-unit-idle, memory-LATENCY-bound"
+note (2026-06-14) was the **f16** kernel pre-int8/swizzle/cacheblock/prefetch; the current kernel
+closed that gap. **There is no bandwidth headroom left to chase on these gemms.**
+
+**Methodology fix (important — we misread RGP for most of a session):** `VMEM utilization %` and
+`memory unit stalled %` are **NOT bandwidth.** Proof: the gemv, known to hit 91% of the membw ceiling,
+reads **VMEM util 8.9%, memory 99.9% stalled** — nearly identical to the gemms (6.6% / ~97%). ~8–9%
+VMEM-util is what FULL Q4_0 streaming looks like (wide coalesced loads → issue port rarely busy), and
+~99% "stalled" is the baseline for ANY memory-bound kernel, saturated or not. Read bandwidth off the
+**byte counters** (`fetch size` = total incl. cache/over-fetch; `local-video-memory bytes` = Infinity
+Cache (32 MB MALL) / VRAM traffic = the L2-miss residual) **÷ duration**, never util%/stall%. The
+gemm's 800 MB local-video = the 24% of a 3.4 G `fetch` that missed L2 (76% L2 hit — matches the
+hit-rate graph); with no L2 it would be ~3.4 G, so L2 is working, not leaking.
+
+**The only remaining gemm lever is MOVING FEWER BYTES** (time ∝ local-video bytes when bandwidth-bound).
+The 800 MB is ~11× the 70 MB of unique data, dominated by **activation re-reads**: weights ~260 MB
+(swizzle already gives the M-block reuse) but X[256×21504] is re-`coopLoadT`'d once per N-strip × 336
+strips ≈ **1.85 G logical**. Reusing X across N-strips (N-blocking) is the classic GEMM tradeoff vs
+weight reuse — **not pursued**, noted as the one direction that could still help. Occupancy, tile shape,
+and "decouple the weight stream" cannot reduce byte volume → none touch what's binding.
+
+**Multi-wave occupancy GEMM — BUILT, PROFILED, DEAD END (`gemm_q4_0_i8_mw.wgsl`, kept as a documented
+A/B baseline like `_occ`; NOT in any graph).** A fresh "occupancy-maximized" design distinct from both
+the deployed single-wave 4×1 and the dead `_occ` 1×1: a workgroup of N waves tiles the output block
+ACROSS waves (one 16×16 tile/wave) sharing the unpacked weight strip in LDS — keeping weight-reuse = BM
+like the deployed kernel but at tiny per-wave VGPR → high occupancy. Parity-green (nrmse 2e-4, both
+wave-grid layouts + the RM=2 register-tile path). **Measured (bench: mmq_tflops, perf=high, vs deployed
+~14.4 down / ~17.4 up):**
+
+| variant | waves/SIMD | down k21504 | up k5376 |
+|---|---|---|---|
+| `_b41` max-occ (RM=1) | 12/16 | 9.2 | 9.2 |
+| `_r2` half-occ (RM=2 reg-tile) | 10/16 | 10.5 | 11.0 |
+| deployed 4×1 | 3/16 | **14.4** | **17.4** |
+
+RGP diagnosis (traces on the box: `/tmp/{draft0_mw_b41,r2_mw_RM2,deployed_4x1,decode_gemv}_*.rgp`):
+the high occupancy **thrashes the cache** — 4× resident wavefronts spread the working set so L2 hit%
+**decays over the run** (b41 80→50%) where the deployed stays flat 80%, and a genuine multi-wave
+`s_barrier` (free in single-wave kernels) becomes the top stall. Lowering occupancy via register
+M-tiles (`_r2`) re-warms L2 (→~75–90%) and recovers ~15–20%, but only converges toward the deployed
+design — and the bandwidth finding above shows why none of it can win: **occupancy can't move fewer
+bytes on a bandwidth-bound kernel.** The occupancy axis (both `_occ` 1×1 and now `_mw` multi-wave) is
+fully explored and settled.
+
 ## 2026-06-20 — gemm 0-stride rescale (deployed) + int8 V/PV (shelved)
 
 **Prefill headline now: 315 / 223 / 146 tok/s @ q0 0 / 8K / 32K** (bench: `sg-bench profile`,
