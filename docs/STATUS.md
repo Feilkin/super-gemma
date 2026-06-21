@@ -52,8 +52,16 @@ serialized (n_disp=1): l2 8.2 ≡ basic_dir 8.0 ≡ basic_e1 8.1 ≡ occ 8.2 (al
 vs deployed 16.4 — every prior A/B conclusion intact. `mmq_variance` now defaults `SG_BENCH_DISPATCHES=1`
 (fence-serialized = production rate; the prefill graph barriers GEMMs on data deps). New
 `gemm_q4_0_i8_l2.wgsl`: hardcoded down shape, 1D dispatch, swappable `tile_index` decode — the
-platform for the L2-blocking experiment (NEXT: blocked decode so co-resident waves share an L2-sized
-weight+activation block).
+platform for the L2-blocking experiment.
+
+**L2 scheduling works + the GEMM is MLP-bound not byte-bound (2026-06-21).** `l2`'s `tile_index`
+2D super-block (`BN_SB`=4: 4 n-blocks × all m-blocks, m-outer) → **10.76 TFLOPS @9/16, beating basic
+10.0 @5/16** — high occupancy is a NET WIN once L2-scheduled (took the thrashing 9/16 kernel 7.6→10.8).
+But 8×1 (`M_TILES`=8, register weight reuse) read **2.5× FEWER bytes yet ran SLOWER** (7.16 vs 10.76;
+effective BW 45 vs 169 GB/s) → the GEMM is **MLP/latency-bound, NOT byte-bound**; byte-reduction
+(8×1 / β×2 — both add accumulator VGPR → cost occupancy) is a dead axis. Measure effective BW
+(local-video÷duration), not byte count. **NEXT: weight prefetch on l2-b4** (adds MLP, occupancy-cheap;
+the gap to deployed 16.0 is latency-hiding). See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
 
 ## 2026-06-21 — multi-wave occupancy GEMM (DEAD END) + the deployed GEMM is ~86% BANDWIDTH-bound
 

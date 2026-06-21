@@ -69,9 +69,15 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     // basic with per-tile epilogue (EPI_TILES=1): higher occupancy, SAME coalesced
     // store — isolates occupancy-thrash from the store pattern.
     ("basic e1", "gemm_q4_0_i8_basic_e1_k21504_n5376", 64),
-    // L2-blocking experiment kernel (1D dispatch, swappable tile_index decode).
-    ("l2", "gemm_q4_0_i8_l2", 64),
-    ("basic nobar", "gemm_q4_0_i8_basic_nobar_k21504_n5376", 64),
+    // L2-blocking experiment kernel (1D dispatch). l2 = transpose (BN_SB=1);
+    // _b2/_b4/_b8 = 2D super-block sweep (BN_SB n-blocks, m-outer).
+    ("l2 (b1)", "gemm_q4_0_i8_l2", 64),
+    ("l2 b2", "gemm_q4_0_i8_l2_b2", 64),
+    ("l2 b4", "gemm_q4_0_i8_l2_b4", 64),
+    ("l2 b8", "gemm_q4_0_i8_l2_b8", 64),
+    // 8×1 tile (M_ROWS=128 → mb=128 for the grid math): register-level weight reuse.
+    ("l2 m8", "gemm_q4_0_i8_l2_m8", 128),
+    ("l2 m8 b4", "gemm_q4_0_i8_l2_m8_b4", 128),
     // PD=2: deeper weight prefetch (2 loads outstanding/wave) — the MLP A/B for
     // the memory-latency-bound GEMM (+9 VGPR; STATUS 2026-06-21).
     ("pd2", "gemm_q4_0_i8_swz_m4n1_pd2_k21504_n5376", 64),

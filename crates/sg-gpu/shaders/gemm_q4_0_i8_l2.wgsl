@@ -22,20 +22,31 @@ enable wgpu_cooperative_matrix;
 
 const K: u32 = 21504u;
 const N: u32 = 5376u;
-const M_TILES: u32 = 4u;          // tall-thin 4×1
+const M_TILES: u32 = #{M_TILES}u; // tall-thin M_TILES×1 (register-level weight reuse)
 const N_COLS: u32 = 16u;          // N_TILES = 1
-const M_ROWS: u32 = 64u;          // M_TILES * 16
+const M_ROWS: u32 = M_TILES * 16u;
+const M_TOTAL: u32 = 256u;            // prefill chunk under test (hardcoded for the decode)
 const NB: u32 = K / 32u;              // 672 32-blocks per row
 const ROW_WORDS: u32 = NB * 18u / 4u; // Q4_0 words per W row
-const NB_N: u32 = N / N_COLS;         // 336 N-blocks (the row width of the tile grid)
+const NB_N: u32 = N / N_COLS;         // 336 N-blocks
+const NB_M: u32 = M_TOTAL / M_ROWS;   // 4 M-blocks (tile grid is NB_N × NB_M)
 
-// THE L2-SCHEDULING KNOB. Map a linear workgroup id → (m_block, n_block).
-// Identity = N-block fast (= today's [N-blocks, M-blocks] launch order): the
-// co-resident window sweeps N-blocks, each pulling its own weight strip → L2
-// thrash at high occupancy. Replace this with a blocked walk to shrink the
-// co-resident footprint.
+// THE L2-SCHEDULING KNOB. Map a linear workgroup id → (n_block, m_block); the
+// launch-order-consecutive ids are the co-resident window. 2D super-block walk:
+// each super-block is BN_SB adjacent n-blocks × all NB_M m-blocks, ordered
+// m-OUTER (for each m, sweep the BN_SB n-blocks). So the BN_SB weight strips are
+// reused across all NB_M m-blocks (read once vs NB_M× from DRAM), while only ONE
+// activation block X[m] is hot at a time — footprint ≈ BN_SB·(K·16 weights) + one
+// 64×K activation, tuned to the 2 MB L2. BN_SB=1 is the plain transpose.
+const BN_SB: u32 = #{BN_SB}u;
+
 fn tile_index(t: u32) -> vec2<u32> {
-    return vec2(t % NB_N, t / NB_N); // .x = n_block, .y = m_block
+    let per_sb = BN_SB * NB_M;        // tiles per super-block
+    let sb = t / per_sb;             // super-block index along N
+    let in_sb = t % per_sb;
+    let m_block = in_sb / BN_SB;      // m OUTER: 0..NB_M
+    let n_block = sb * BN_SB + in_sb % BN_SB;
+    return vec2(n_block, m_block);    // .x = n_block, .y = m_block
 }
 
 var<workgroup> wb: array<i8, N_COLS * 64u>;

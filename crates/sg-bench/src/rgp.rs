@@ -38,6 +38,9 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         // L2-blocking experiment kernel (1D dispatch, hardcoded down shape).
         "gemm_q4_0_i8_l2" => (21504, 5376, 16, 64, true, false), // FFN down
         "gemm_q4_0_i8_l2_k21504_n5376" => (21504, 5376, 16, 64, true, false), // alias
+        "gemm_q4_0_i8_l2_b4" => (21504, 5376, 16, 64, true, false),      // 4×1, BN_SB=4 (best)
+        "gemm_q4_0_i8_l2_m8" => (21504, 5376, 16, 128, true, false),     // 8×1 (M_ROWS=128)
+        "gemm_q4_0_i8_l2_m8_b4" => (21504, 5376, 16, 128, true, false),  // 8×1, BN_SB=4
         // PD=2 (deeper weight prefetch) A/B vs the deployed 4×1 — the MLP lever for
         // the memory-latency-bound GEMM (STATUS 2026-06-21). Read occupancy +
         // whether the first-WMMA vmcnt stall shrinks vs the PD=1 capture.
@@ -288,9 +291,11 @@ pub fn run(kernel: &str) -> anyhow::Result<()> {
     let x_f16 = ctx.new_buffer::<u16>((m * k) as u64, u).map_err(nb_err)?;
 
     // Swizzled kernels expect [M-blocks, N-blocks]; the rest [N-blocks, M-blocks].
-    // The l2 kernel decodes its tile from wg, so it takes the 2D [N,M] grid too
-    // (t = wg.y·NB_N + wg.x) — same dispatch as basic_dir for an apples-to-apples A/B.
-    let groups = if swz {
+    // The l2 kernel is 1D (one workgroup per output tile, tile_index decode) — its
+    // bench/winning config, so capture it that way.
+    let groups = if kernel.contains("_l2") {
+        [(n as u32 / nb) * (m as u32 / mb), 1, 1]
+    } else if swz {
         [m as u32 / mb, n as u32 / nb, 1]
     } else {
         [n as u32 / nb, m as u32 / mb, 1]

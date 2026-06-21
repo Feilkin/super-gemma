@@ -888,6 +888,58 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // 2D super-block sweep (BN_SB n-blocks per super-block, m-outer).
+    Variant {
+        name: "gemm_q4_0_i8_l2_b2",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 2)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_l2_b8",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 8)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // 8×1 tile (M_TILES=8): register-level weight reuse, NB_M=2. Plain + BN_SB=4.
+    Variant {
+        name: "gemm_q4_0_i8_l2_m8",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("M_TILES", 8)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_l2_m8_b4",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("M_TILES", 8), ("BN_SB", 4)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // Occupancy isolation: basic with the per-tile epilogue (EPI_TILES=1, 1024 B
     // scratch) — higher occupancy, SAME coalesced store. Does it reproduce
     // basic_dir's +21% DRAM traffic (→ occupancy) or stay fast (→ the store)?
@@ -2309,6 +2361,11 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         // 4096 B scratch). 1 = per-tile passes, 1024 B scratch → higher occupancy,
         // same coalesced store (the occupancy-vs-store isolation probe).
         substituted = substituted.replace("#{EPI_TILES}", "4");
+        // gemm_q4_0_i8_l2 reads `#{BN_SB}` (n-blocks per L2 super-block); default 1
+        // (plain transpose). Variants sweep it (STATUS 2026-06-21).
+        substituted = substituted.replace("#{BN_SB}", "1");
+        // gemm_q4_0_i8_l2 reads `#{M_TILES}` (tall-thin M_TILES×1); default 4.
+        substituted = substituted.replace("#{M_TILES}", "4");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {
