@@ -962,6 +962,38 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // BN_SB sweep WITH β×2 (1st b = BN_SB, 2nd b2 = β×2) — does the L2-schedule optimum
+    // shift once ILP changes the access timing? (b4_b2 above is BN_SB=4.)
+    Variant {
+        name: "gemm_q4_0_i8_l2_b1_b2",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 1), ("B2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_l2_b2_b2",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 2), ("B2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_l2_b8_b2",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 8), ("B2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // 8×1 tile (M_TILES=8): register-level weight reuse, NB_M=2. Plain + BN_SB=4.
     Variant {
         name: "gemm_q4_0_i8_l2_m8",

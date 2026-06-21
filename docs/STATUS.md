@@ -69,8 +69,19 @@ top of β×2 just costs +12 VGPR/occupancy and hurts). Best l2 = `b4_b2` (β×2,
 within 9% of deployed 16.21** (arc: 7.4 thrashing → 14.71). The high-occ + L2-schedule + β×2 path
 reaches deployed's neighborhood but doesn't beat it; the last 9% is deployed's low-occ(3/16)+β×2+PF+
 swizzle (PF helps it at 3/16, hurts us at 9/16). Prefetch's `lid<N_COLS && beta+2<NB` guard adds an
-`s_cbranch_execz` stall (~930K clk) — branchless prefetch is a parked lever. Open: BN_SB-with-β×2
-sweep, LDS epilogue, up shape. See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
+`s_cbranch_execz` stall (~930K clk) — branchless prefetch is a parked lever.
+
+**Pinned-clock verdict + next lever (2026-06-21).** At 2900 MHz: deployed **16.29** vs best l2
+`b4_b2` **14.36 (deployed +12%)**; BN_SB=4 stays optimal with β×2 (sb1/2/8 worse). Clock-crossing is
+real: deployed +25%/+7%-clock (ILP-bound), l2 +3.6% (memory-bound, clock-flat) → l2 may win when the
+box throttles (an e2e-at-thermals question, not a microbench one). High-occ arc reached 88% of deployed
+at peak; tile-shape/β×2/PF/BN_SB levers are tapped. **The one non-margin lever left: COOPERATIVE
+DEQUANT.** Disasm (l2_b4_b2 prologue) shows the weight load+unpack runs under `if (lid < N_COLS)` →
+only **16 of 64 lanes** do it (48 branch around the `s_cbranch_execz`): buffer_load(9 words) + ~50 VALU
+nibble unpacks + ds_write to `wb`, on 1/4 the wave, gating the MMA. Full-wave dequant (spread the 144
+words/K-iter across all 64 lanes, coalesced load + 4× VALU, no execz) ≈ 4× faster prologue — the
+indicated next experiment (`COOP_DEQUANT` const on gemm_q4_0_i8_l2, A/B vs l2_b4_b2 at pinned clock).
+See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
 
 ## 2026-06-21 — multi-wave occupancy GEMM (DEAD END) + the deployed GEMM is ~86% BANDWIDTH-bound
 
