@@ -374,6 +374,16 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         eprintln!("{variant} vs basic_dir nrmse {err:.8}");
         assert_close(&got, &want, 1e-4, 1e-4, variant);
     }
+
+    // Deployed swz down (4×1, SWIZZLE=1 → 2D [M-blocks, N-blocks]) and its EPI=1
+    // direct-coopStore epilogue: EPI only changes the y store path, so the epi
+    // variant must be BIT-IDENTICAL to the deployed kernel.
+    let dep_grid = [(m / 64) as u32, nb_n, 1];
+    let dep = run("gemm_q4_0_i8_swz_m4n1_k21504_n5376", dep_grid);
+    let epi = run("gemm_q4_0_i8_swz_m4n1_epi_k21504_n5376", dep_grid);
+    let err = nrmse(&epi, &dep);
+    eprintln!("swz_m4n1_epi vs deployed nrmse {err:.8}");
+    assert_close(&epi, &dep, 1e-6, 1e-6, "swz_m4n1_epi");
 }
 
 /// Barrier probe (STATUS 2026-06-21): which of the basic 4×1 kernel's three

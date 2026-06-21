@@ -60,6 +60,7 @@ fn config() -> (usize, usize, usize, &'static [(&'static str, &'static str, u32)
 /// rewrite (16-row blocks → many waves/SIMD; the occupancy-vs-reuse test).
 const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     ("deployed (s2+pf)", "gemm_q4_0_i8_swz_m4n1_k21504_n5376", 64),
+    ("deployed epi (coopStore)", "gemm_q4_0_i8_swz_m4n1_epi_k21504_n5376", 64),
     // basic: clean no-frills 4×1 (no β×2/prefetch/swizzle) — the readable baseline
     // (STATUS 2026-06-21). How much do all the deployed optimizations actually buy?
     ("basic", "gemm_q4_0_i8_basic_k21504_n5376", 64),

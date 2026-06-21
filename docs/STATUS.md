@@ -126,6 +126,16 @@ stall). Attacking X (β×2 path, down M=256, gpu-timestamp, all parity nrmse 0.0
   you can't bolt deployed's PF onto l2. **axp4 ≈ 5.6% behind deployed is the high-occupancy ceiling**;
   closing it means *lowering* l2's occupancy toward deployed's, i.e. converging into deployed.
 
+**Direct-coopStore epilogue on deployed-down — documented negative (2026-06-21).** `EPI=1` on
+`gemm_q4_0_i8` (convert yacc→f16 coopmat in regs, `coopStoreT` straight to y; the l2/basic_dir epilogue)
+vs the deployed LDS round-trip. Variant `gemm_q4_0_i8_swz_m4n1_epi_k21504_n5376`, bit-identical
+(nrmse 0.0), **−1% at pinned 2900 MHz**. **Resource-neutral: both 168 VGPR, 10 KB LDS** — EPI doesn't
+free LDS on the down kernel because the **`stage` buffer is pinned by the BCAST=0 rescale**, not the
+epilogue, so there's NO occupancy lever here (would need BCAST=1 too, separately a loss on large-K). So
+the coopStore epilogue is a marginal store-path change, not a win; the LDS round-trip stays. NB: EPI=1 is
+also NOT graph-safe (direct coopStore to y is invisible to vulkano auto-sync → races the consumer) —
+A/B only. [[coopstore-scalar-match-coopload-lax]]
+
 **Lever ladder, fully mapped:** weight-side (PF/cooperative-dequant/minimal-fetch) all dead → wrong stall;
 activation hoist +3.5%; activation cross-iter static-ping-pong **+5.0% (best)**; cross-iter single-buf
 (swaps) / dynamic-index (8× instrs) dead. f16 scale staging neutral [[scale-staging-width-neutral-vgpr-bound]].

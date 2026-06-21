@@ -27,6 +27,7 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         // int8 4×1 swizzled (N-block 16, M-block 64) — the DEPLOYED prefill
         // tiling (graph.rs); the occupancy/L2 recapture target (STATUS).
         "gemm_q4_0_i8_swz_m4n1_k21504_n5376" => (21504, 5376, 16, 64, true, true), // FFN down
+        "gemm_q4_0_i8_swz_m4n1_epi_k21504_n5376" => (21504, 5376, 16, 64, true, true), // FFN down, direct-coopStore epilogue
         "gemm_q4_0_i8_swz_m4n1_k5376_n21504" => (5376, 21504, 16, 64, true, true), // FFN gate/up
         // Clean no-frills 4×1 baseline (swizzle-less → [N-blocks, M-blocks] grid).
         "gemm_q4_0_i8_basic_k21504_n5376" => (21504, 5376, 16, 64, true, false), // FFN down

@@ -83,6 +83,13 @@ const SWIZZLE: u32 = #{SWIZZLE}u;
 // loses large-K (+2..+12%, weight-bound — the freed LDS/occupancy oversubscribes
 // the weight stream). build.rs sets BCAST=1 on the K=5376 variants, 0 elsewhere.
 const BCAST: u32 = #{BCAST}u;
+// Epilogue. 0 = stage yacc (f32) to LDS then write y via reflection-visible normal
+// stores (the deployed path — a direct coopStore to y is invisible to vulkano's
+// auto-sync and would race the graph consumer). 1 = convert yacc→f16 coopmat in
+// registers and coopStoreT straight to y (no LDS round-trip, like the l2/basic_dir
+// kernels). EPI=1 is an A/B of the epilogue mechanism ONLY — NOT graph-safe without a
+// manual barrier; and at BCAST=0 it doesn't free LDS (the rescale still needs `stage`).
+const EPI: u32 = #{EPI}u;
 // Software-prefetch depth on the WEIGHT stream (the cold DRAM read; X is the
 // cache-hot one). 1 = the deployed pipeline (load pair β+2 while computing β);
 // 2 keeps two weight loads outstanding per wave, adding memory-level parallelism
@@ -363,16 +370,24 @@ fn main(
     // would race the consumer (geglu/rms). The LDS round-trip keeps the y write
     // reflection-visible, exactly as the f16 gemm does. `stage` (buffer 0) is
     // free here — its last loop use was the rescale's coopLoad.
-    workgroupBarrier(); // last rescale's stage coopLoad done before reuse
-    for (var t = 0u; t < ACC; t += 1u) {
-        coopStoreT(yacc[t], &stage[t * 256u], 16u);
-    }
-    workgroupBarrier();
-    for (var i = lid; i < TILE_ELEMS; i += WG) {
-        let t = i / 256u;
-        let e = i % 256u;
-        let row = m0 + (t / N_TILES) * 16u + e / 16u;
-        let col = n0 + (t % N_TILES) * 16u + e % 16u;
-        y[row * N + col] = f16(stage[i]);
+    if (EPI == 1u) {
+        // Direct: f16(yacc) coopmat in registers → coopStoreT straight to y, no LDS
+        // round-trip (NOT graph-safe — invisible to auto-sync; A/B only).
+        for (var t = 0u; t < ACC; t += 1u) {
+            coopStoreT(f16(yacc[t]), &y[(m0 + (t / N_TILES) * 16u) * N + n0 + (t % N_TILES) * 16u], N);
+        }
+    } else {
+        workgroupBarrier(); // last rescale's stage coopLoad done before reuse
+        for (var t = 0u; t < ACC; t += 1u) {
+            coopStoreT(yacc[t], &stage[t * 256u], 16u);
+        }
+        workgroupBarrier();
+        for (var i = lid; i < TILE_ELEMS; i += WG) {
+            let t = i / 256u;
+            let e = i % 256u;
+            let row = m0 + (t / N_TILES) * 16u + e / 16u;
+            let col = n0 + (t % N_TILES) * 16u + e % 16u;
+            y[row * N + col] = f16(stage[i]);
+        }
     }
 }

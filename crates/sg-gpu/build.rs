@@ -687,6 +687,26 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Direct-coopStore epilogue A/B (EPI=1) on the deployed down kernel — drops the
+    // LDS round-trip in the epilogue (mechanism A/B; not graph-safe, see EPI comment).
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_epi_k21504_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 1),
+            ("SWIZZLE", 1),
+            ("EPI", 1),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_i8_swz_m4n1_s1_k21504_n5376",
         src: "gemm_q4_0_i8",
