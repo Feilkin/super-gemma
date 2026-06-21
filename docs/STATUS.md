@@ -35,9 +35,10 @@ occupancy ("use the worse epilogue") — it's L2-FRIENDLY high occupancy** (cach
 concurrently-resident waves share L2 residency). **NEXT: make `basic_dir` L2-friendly.**
 
 Also this session: deployed optimizations (β×2 + prefetch) are worth **~1.5×** (`basic` −32% vs
-deployed). Deeper weight prefetch (`PD=2`) and activation prefetch (`AXPF=1` hoist, `AXPF=2`
-cross-barrier) all came back **flat** — ACO already schedules the loads; the wall is occupancy/L2, not
-load scheduling. **Single-wave `workgroupBarrier`s are redundant** (barrier probe: drop all 3 →
+deployed). ⚠ **CORRECTED 2026-06-21 (see "PD/AXPF NOT flat" below):** PD=2/AXPF were called **flat**
+here — that was a wall-clock/dispatch-overlap measurement artifact; on the fixed gpu-timestamp bench
+they reproducibly run **~+4%** over deployed. The "ACO already schedules the loads" story was attached
+to a non-result. **Single-wave `workgroupBarrier`s are redundant** (barrier probe: drop all 3 →
 nrmse- and perf-identical; ACO elides the `s_barrier`). **coopStore needs scalar match** (f32 acc can't
 store to f16 y; naga fork) — coopLoad doesn't. **RGP single-dispatch durations are NOT
 cross-kernel-comparable** (idle-DVFS clock + thermal revert + isolated-vs-steady regime distort them
@@ -75,13 +76,32 @@ swizzle (PF helps it at 3/16, hurts us at 9/16). Prefetch's `lid<N_COLS && beta+
 `b4_b2` **14.36 (deployed +12%)**; BN_SB=4 stays optimal with β×2 (sb1/2/8 worse). Clock-crossing is
 real: deployed +25%/+7%-clock (ILP-bound), l2 +3.6% (memory-bound, clock-flat) → l2 may win when the
 box throttles (an e2e-at-thermals question, not a microbench one). High-occ arc reached 88% of deployed
-at peak; tile-shape/β×2/PF/BN_SB levers are tapped. **The one non-margin lever left: COOPERATIVE
-DEQUANT.** Disasm (l2_b4_b2 prologue) shows the weight load+unpack runs under `if (lid < N_COLS)` →
-only **16 of 64 lanes** do it (48 branch around the `s_cbranch_execz`): buffer_load(9 words) + ~50 VALU
-nibble unpacks + ds_write to `wb`, on 1/4 the wave, gating the MMA. Full-wave dequant (spread the 144
-words/K-iter across all 64 lanes, coalesced load + 4× VALU, no execz) ≈ 4× faster prologue — the
-indicated next experiment (`COOP_DEQUANT` const on gemm_q4_0_i8_l2, A/B vs l2_b4_b2 at pinned clock).
-See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
+at peak; tile-shape/β×2/PF/BN_SB levers are tapped.
+
+**Cooperative dequant — TESTED, DEAD (2026-06-21).** The l2_b4_b2 prologue runs the weight load+unpack
+under `if (lid < N_COLS)` → only **16 of 64 lanes** (48 branch around an `s_cbranch_execz`). Hypothesis
+was full-wave dequant ≈ 4× faster prologue. Built two variants (parity-clean, nrmse 0.0): **CD=1**
+(all 64 lanes cooperatively load 144 words/K-iter into LDS, barrier, full-wave unpack) and **CD=2**
+(each lane loads its 2–3 words straight to registers, no LDS staging). Both **REGRESSED**, monotone in
+added traffic: CD=1 **−8%**, CD=2 **−15%** vs b4_b2. RGP confirms why: the cooperative work left the
+big `buffer_load_b96` + `s_waitcnt` **untouched** and only bolted more branching *after* it — the
+prologue load latency was already **hidden behind the prior K-iter's MMA**, so it was never on the
+critical path (the MLP-bound story). Killing the branch (CD=2 has none) made it *slower*, not faster —
+the execz stall was a red herring for throughput. **Lever is dead; code reverted** (not kept). Adjacent
+note: u32 is already the right weight-load width (4-byte alignment → wide `b96`/`b128`); narrowing to
+u16/u8 only de-vectorizes. The real prologue lever, if any, is hiding the `s_waitcnt` (prefetch), not
+lane-count or element width. See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
+
+**PD/AXPF NOT flat — reproducibly ~+4% (2026-06-21).** The earlier "PD=2/AXPF flat" verdict (top of
+this section, and the multi-wave dead-end note) is **WRONG**. Re-A/B'd on the fixed bench (gpu
+timestamps, n_disp=1, round-robin, 3 runs @~2810 MHz auto): **axpf +4.1/+4.2/+3.8%**, **pd2
++3.7/+4.1/+4.2%**, axpf2 ~+1.5%, all vs deployed, cv ~1–2%, drift ~0.4pp → outside noise. Likely the
+old "flat" was read off the **wall-clock** metric (still flat-looking for pd2 here: +1.5/−0.6/+1.7%,
+CB-build/submit jitter buries a 4% gpu win) and/or under the pre-fix dispatch-overlap regime. axpf/pd2
+are `deployed + one knob` → a potential **~+4% free win on the production prefill down-GEMM**, but it's
+one operating point (auto ~2810 MHz, isolated down-GEMM): confirm **pinned `high` + RGP (where does the
++4% come from?) + up-shape + e2e** before touching the deployed kernel. See
+[[pd-axpf-not-flat-reproducible]], [[measure-before-declaring-dead]].
 
 **f16 scale staging — NEUTRAL (2026-06-21).** The rescale rows (`dw2` weight-block d's, `da_l`
 activation d_a's) were staged as **f32** in LDS though both sources are f16. A/B'd staging them at
