@@ -60,9 +60,17 @@ fn tile_index(t: u32) -> vec2<u32> {
     return vec2(n_block, m_block);    // .x = n_block, .y = m_block
 }
 
+// Scale staging type (build-time token, NOT a runtime const — a WGSL const can't
+// switch a var<workgroup> element type). #{SCALE_TY} = f32 (default) stages the
+// f16-sourced scales as f32 in LDS; = f16 stages them at native width (halves these
+// two arrays) and #{SCALE_CVT} = f32() converts each scale fragment to f32 BEFORE
+// the f32 scale·scale multiply (never multiply the two scales in f16 — the weight
+// d's are ~0.05). For f32, SCALE_CVT is empty (the read is already f32). The A/B is
+// the SF16 variant; LDS here isn't the occupancy limiter (VGPR is) so this is mostly
+// a representation-cleanliness probe.
 var<workgroup> wb: array<i8, N_COLS * 64u>;
-var<workgroup> dw2: array<f32, 2u * N_COLS>;
-var<workgroup> da_l: array<f32, M_ROWS>;
+var<workgroup> dw2: array<#{SCALE_TY}, 2u * N_COLS>;
+var<workgroup> da_l: array<#{SCALE_TY}, M_ROWS>;
 
 // Unpack one Q4_0 block (4 qs words) to i8 (q−8) at wb[base..+32].
 fn unpack_block(q0: u32, q1: u32, q2: u32, q3: u32, base: u32) {
@@ -125,7 +133,7 @@ fn main(
             }
         }
         if (lid < N_COLS) {
-            dw2[lid] = unpack2x16float(w[0]).x;
+            dw2[lid] = #{SCALE_TY}(unpack2x16float(w[0]).x);
             unpack_block(
                 (w[0] >> 16u) | (w[1] << 16u),
                 (w[1] >> 16u) | (w[2] << 16u),
@@ -133,7 +141,7 @@ fn main(
                 (w[3] >> 16u) | (w[4] << 16u),
                 lid * 64u,
             );
-            dw2[N_COLS + lid] = unpack2x16float(w[4]).y;
+            dw2[N_COLS + lid] = #{SCALE_TY}(unpack2x16float(w[4]).y);
             unpack_block(w[5], w[6], w[7], w[8], lid * 64u + 32u);
         }
         workgroupBarrier(); // wb + dw2 written before coopLoad/rescale read them
@@ -160,12 +168,12 @@ fn main(
             }
             for (var u = 0u; u < 2u; u += 1u) {
                 for (var i = lid; i < M_ROWS; i += 64u) {
-                    da_l[i] = f32(x_scales[(m0 + i) * NB + (beta + u)]);
+                    da_l[i] = #{SCALE_TY}(x_scales[(m0 + i) * NB + (beta + u)]);
                 }
                 workgroupBarrier();
                 for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                    let scale = coopLoad<coop_mat16x16<f32, C>>(&da_l[mt * 16u], 0u)
-                        * coopLoadT<coop_mat16x16<f32, C>>(&dw2[u * N_COLS], 0u);
+                    let scale = #{SCALE_CVT}(coopLoad<coop_mat16x16<#{SCALE_TY}, C>>(&da_l[mt * 16u], 0u))
+                        * #{SCALE_CVT}(coopLoadT<coop_mat16x16<#{SCALE_TY}, C>>(&dw2[u * N_COLS], 0u));
                     if (u == 0u) {
                         yacc[mt] = yacc[mt] + scale * f32(acc0[mt]);
                     } else {
@@ -189,12 +197,12 @@ fn main(
                     }
                 }
                 for (var i = lid; i < M_ROWS; i += 64u) {
-                    da_l[i] = f32(x_scales[(m0 + i) * NB + (beta + u)]);
+                    da_l[i] = #{SCALE_TY}(x_scales[(m0 + i) * NB + (beta + u)]);
                 }
                 workgroupBarrier(); // da_l written before the 0-stride broadcast reads it
                 for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                    let scale = coopLoad<coop_mat16x16<f32, C>>(&da_l[mt * 16u], 0u)
-                        * coopLoadT<coop_mat16x16<f32, C>>(&dw2[u * N_COLS], 0u);
+                    let scale = #{SCALE_CVT}(coopLoad<coop_mat16x16<#{SCALE_TY}, C>>(&da_l[mt * 16u], 0u))
+                        * #{SCALE_CVT}(coopLoadT<coop_mat16x16<#{SCALE_TY}, C>>(&dw2[u * N_COLS], 0u));
                     yacc[mt] = yacc[mt] + scale * f32(acc[mt]);
                 }
                 workgroupBarrier(); // broadcast read done before next block overwrites da_l

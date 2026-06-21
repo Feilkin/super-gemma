@@ -962,6 +962,19 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // f16 scale staging on the best combo (BN_SB=4, β×2): stage dw2/da_l at native
+    // f16 width instead of f32, convert per-fragment to f32 before the multiply. A/B
+    // vs b4_b2 — LDS isn't the occupancy limiter here, so this probes whether it matters.
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4_b2_sf16",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4), ("B2", 1), ("SF16", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // BN_SB sweep WITH β×2 (1st b = BN_SB, 2nd b2 = β×2) — does the L2-schedule optimum
     // shift once ILP changes the access timing? (b4_b2 above is BN_SB=4.)
     Variant {
@@ -2445,6 +2458,14 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         substituted = substituted.replace("#{PF}", "0");
         // gemm_q4_0_i8_l2 reads `#{B2}` (β×2 WMMA-ILP interleave); default 0.
         substituted = substituted.replace("#{B2}", "0");
+        // gemm_q4_0_i8_l2 scale-staging type: SF16=1 → stage the f16-sourced scales
+        // as f16 in LDS and f32()-convert each fragment before the f32 multiply;
+        // default (SF16 absent/0) keeps them f32 (SCALE_CVT empty — read is already
+        // f32). String tokens, not the integer `defs` path, because they pick a type.
+        let sf16 = variant.defs.iter().any(|(k, v)| *k == "SF16" && *v == 1);
+        let (scale_ty, scale_cvt) = if sf16 { ("f16", "f32") } else { ("f32", "") };
+        substituted = substituted.replace("#{SCALE_TY}", scale_ty);
+        substituted = substituted.replace("#{SCALE_CVT}", scale_cvt);
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {

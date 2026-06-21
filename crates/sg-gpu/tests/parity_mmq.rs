@@ -361,6 +361,7 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         ("gemm_q4_0_i8_l2_b4_pf", 64u32), // weight prefetch
         ("gemm_q4_0_i8_l2_b4_b2", 64u32), // β×2 interleave
         ("gemm_q4_0_i8_l2_b4_pf_b2", 64u32), // prefetch + β×2 (full combo)
+        ("gemm_q4_0_i8_l2_b4_b2_sf16", 64u32), // f16 scale staging
     ] {
         let got = run(variant, [nb_n * (m as u32 / m_rows), 1, 1]);
         let err = nrmse(&got, &want);

@@ -83,6 +83,16 @@ words/K-iter across all 64 lanes, coalesced load + 4× VALU, no execz) ≈ 4× f
 indicated next experiment (`COOP_DEQUANT` const on gemm_q4_0_i8_l2, A/B vs l2_b4_b2 at pinned clock).
 See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
 
+**f16 scale staging — NEUTRAL (2026-06-21).** The rescale rows (`dw2` weight-block d's, `da_l`
+activation d_a's) were staged as **f32** in LDS though both sources are f16. A/B'd staging them at
+native **f16** width (build-time `SCALE_TY`/`SCALE_CVT` tokens → `gemm_q4_0_i8_l2_b4_b2_sf16`),
+converting each fragment to f32 *before* the f32 scale·scale multiply (never multiply the two scales
+in f16 — weight d's ~0.05). **Parity-identical (nrmse 0.0); perf a wash** (3× gpu-timestamp:
+sf16 −0.6/−0.9/−1.1% vs b4_b2, all inside cv ~1.7% → flat, leaning a hair negative). Confirms LDS is
+**not** the occupancy limiter here (it's VGPR/accumulators): halving the scale arrays (192 B of ~1.4 KB)
+frees nothing, and the per-fragment f16→f32 convert adds a touch of apply-side VALU. Kept as a
+documented neutral A/B (deployed/default path stays f32). See [[scale-staging-width-neutral-vgpr-bound]].
+
 ## 2026-06-21 — multi-wave occupancy GEMM (DEAD END) + the deployed GEMM is ~86% BANDWIDTH-bound
 
 **⚠ SUPERSEDED by 2026-06-21b above — the "86% bandwidth-bound" reading is FALSE (MALL inflates
