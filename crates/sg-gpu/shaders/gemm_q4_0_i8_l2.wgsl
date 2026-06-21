@@ -30,6 +30,17 @@ const NB: u32 = K / 32u;              // 672 32-blocks per row
 const ROW_WORDS: u32 = NB * 18u / 4u; // Q4_0 words per W row
 const NB_N: u32 = N / N_COLS;         // 336 N-blocks
 const NB_M: u32 = M_TOTAL / M_ROWS;   // 4 M-blocks (tile grid is NB_N × NB_M)
+// Weight prefetch. 0 = inline load (load the block-pair words, then unpack). 1 =
+// software pipeline: hold the NEXT pair's words in registers, issue its load one
+// iteration ahead so its DRAM latency hides behind this iteration's unpack + MMA.
+// Adds MLP (the lever — the GEMM is MLP-bound), occupancy-cheap (9 regs, not a
+// whole accumulator set).
+const PF: u32 = #{PF}u;
+// β×2 WMMA-ILP. 0 = process the pair's two blocks sequentially (one accumulator).
+// 1 = interleave both blocks' MMAs (acc0 + acc1 updated together) so independent
+// WMMAs hide each other's latency — the deployed kernel's ILP. Costs a 2nd
+// accumulator set (VGPR → occupancy); the A/B vs occupancy is the point.
+const B2: u32 = #{B2}u;
 
 // THE L2-SCHEDULING KNOB. Map a linear workgroup id → (n_block, m_block); the
 // launch-order-consecutive ids are the co-resident window. 2D super-block walk:
@@ -86,13 +97,34 @@ fn main(
         yacc[i] = zero_f;
     }
 
+    // PF=1 prologue: prefetch block-pair 0's words into registers.
+    var w_next: array<u32, 9>;
+    if (PF == 1u && lid < N_COLS) {
+        let wb0 = (n0 + lid) * ROW_WORDS;
+        for (var i = 0u; i < 9u; i += 1u) {
+            w_next[i] = weights[wb0 + i];
+        }
+    }
+
     for (var beta = 0u; beta < NB; beta += 2u) {
-        if (lid < N_COLS) {
-            let wp = (n0 + lid) * ROW_WORDS + (beta / 2u) * 9u;
-            var w: array<u32, 9>;
+        var w: array<u32, 9>; // this pair's words (consumed by the unpack below)
+        if (PF == 1u) {
             for (var i = 0u; i < 9u; i += 1u) {
-                w[i] = weights[wp + i];
+                w[i] = w_next[i]; // consume the prefetched pair (element copy)
             }
+            if (lid < N_COLS && beta + 2u < NB) {
+                let wp = (n0 + lid) * ROW_WORDS + ((beta + 2u) / 2u) * 9u;
+                for (var i = 0u; i < 9u; i += 1u) {
+                    w_next[i] = weights[wp + i]; // issue next pair's load now
+                }
+            }
+        } else if (lid < N_COLS) {
+            let wp = (n0 + lid) * ROW_WORDS + (beta / 2u) * 9u;
+            for (var i = 0u; i < 9u; i += 1u) {
+                w[i] = weights[wp + i]; // inline load
+            }
+        }
+        if (lid < N_COLS) {
             dw2[lid] = unpack2x16float(w[0]).x;
             unpack_block(
                 (w[0] >> 16u) | (w[1] << 16u),
@@ -106,30 +138,67 @@ fn main(
         }
         workgroupBarrier(); // wb + dw2 written before coopLoad/rescale read them
 
-        for (var u = 0u; u < 2u; u += 1u) {
-            var zero_i: coop_mat16x16<i32, C>;
-            var acc: array<coop_mat16x16<i32, C>, M_TILES>;
+        var zero_i: coop_mat16x16<i32, C>;
+        if (B2 == 1u) {
+            // Interleave the pair's two blocks' MMAs (independent → WMMA ILP).
+            var acc0: array<coop_mat16x16<i32, C>, M_TILES>;
+            var acc1: array<coop_mat16x16<i32, C>, M_TILES>;
             for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                acc[mt] = zero_i;
+                acc0[mt] = zero_i;
+                acc1[mt] = zero_i;
             }
-            let k0 = (beta + u) * 32u;
+            let k0 = beta * 32u;
             for (var s = 0u; s < 2u; s += 1u) {
-                let bt = coopLoad<coop_mat16x16<i8, B>>(&wb[u * 32u + s * 16u], 64u);
+                let bt0 = coopLoad<coop_mat16x16<i8, B>>(&wb[s * 16u], 64u);
+                let bt1 = coopLoad<coop_mat16x16<i8, B>>(&wb[32u + s * 16u], 64u);
                 for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                    let at = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
-                    acc[mt] = coopMultiplyAdd(at, bt, acc[mt]);
+                    let a0 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
+                    let a1 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
+                    acc0[mt] = coopMultiplyAdd(a0, bt0, acc0[mt]);
+                    acc1[mt] = coopMultiplyAdd(a1, bt1, acc1[mt]);
                 }
             }
-            for (var i = lid; i < M_ROWS; i += 64u) {
-                da_l[i] = f32(x_scales[(m0 + i) * NB + (beta + u)]);
+            for (var u = 0u; u < 2u; u += 1u) {
+                for (var i = lid; i < M_ROWS; i += 64u) {
+                    da_l[i] = f32(x_scales[(m0 + i) * NB + (beta + u)]);
+                }
+                workgroupBarrier();
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    let scale = coopLoad<coop_mat16x16<f32, C>>(&da_l[mt * 16u], 0u)
+                        * coopLoadT<coop_mat16x16<f32, C>>(&dw2[u * N_COLS], 0u);
+                    if (u == 0u) {
+                        yacc[mt] = yacc[mt] + scale * f32(acc0[mt]);
+                    } else {
+                        yacc[mt] = yacc[mt] + scale * f32(acc1[mt]);
+                    }
+                }
+                workgroupBarrier();
             }
-            workgroupBarrier(); // da_l written before the 0-stride broadcast reads it
-            for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                let scale = coopLoad<coop_mat16x16<f32, C>>(&da_l[mt * 16u], 0u)
-                    * coopLoadT<coop_mat16x16<f32, C>>(&dw2[u * N_COLS], 0u);
-                yacc[mt] = yacc[mt] + scale * f32(acc[mt]);
+        } else {
+            for (var u = 0u; u < 2u; u += 1u) {
+                var acc: array<coop_mat16x16<i32, C>, M_TILES>;
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    acc[mt] = zero_i;
+                }
+                let k0 = (beta + u) * 32u;
+                for (var s = 0u; s < 2u; s += 1u) {
+                    let bt = coopLoad<coop_mat16x16<i8, B>>(&wb[u * 32u + s * 16u], 64u);
+                    for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                        let at = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
+                        acc[mt] = coopMultiplyAdd(at, bt, acc[mt]);
+                    }
+                }
+                for (var i = lid; i < M_ROWS; i += 64u) {
+                    da_l[i] = f32(x_scales[(m0 + i) * NB + (beta + u)]);
+                }
+                workgroupBarrier(); // da_l written before the 0-stride broadcast reads it
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    let scale = coopLoad<coop_mat16x16<f32, C>>(&da_l[mt * 16u], 0u)
+                        * coopLoadT<coop_mat16x16<f32, C>>(&dw2[u * N_COLS], 0u);
+                    yacc[mt] = yacc[mt] + scale * f32(acc[mt]);
+                }
+                workgroupBarrier(); // broadcast read done before next block overwrites da_l
             }
-            workgroupBarrier(); // broadcast read done before next block overwrites da_l
         }
     }
 

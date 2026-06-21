@@ -60,8 +60,17 @@ platform for the L2-blocking experiment.
 But 8×1 (`M_TILES`=8, register weight reuse) read **2.5× FEWER bytes yet ran SLOWER** (7.16 vs 10.76;
 effective BW 45 vs 169 GB/s) → the GEMM is **MLP/latency-bound, NOT byte-bound**; byte-reduction
 (8×1 / β×2 — both add accumulator VGPR → cost occupancy) is a dead axis. Measure effective BW
-(local-video÷duration), not byte count. **NEXT: weight prefetch on l2-b4** (adds MLP, occupancy-cheap;
-the gap to deployed 16.0 is latency-hiding). See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
+(local-video÷duration), not byte count.
+
+**β×2 is the dominant lever (2026-06-21).** On l2 (4×1, BN_SB=4, down M=256, gpu): b4 10.99 →
++prefetch (`PF`) 11.39 (+5.7%) → **+β×2 (`B2`, no PF) 14.71 (+34%!)** → β×2+PF 12.97 (WORSE). So β×2
+WMMA-ILP is the biggest single lever, and prefetch SUBSTITUTES for it (hides the same latency → PF on
+top of β×2 just costs +12 VGPR/occupancy and hurts). Best l2 = `b4_b2` (β×2, no prefetch) = **14.71,
+within 9% of deployed 16.21** (arc: 7.4 thrashing → 14.71). The high-occ + L2-schedule + β×2 path
+reaches deployed's neighborhood but doesn't beat it; the last 9% is deployed's low-occ(3/16)+β×2+PF+
+swizzle (PF helps it at 3/16, hurts us at 9/16). Prefetch's `lid<N_COLS && beta+2<NB` guard adds an
+`s_cbranch_execz` stall (~930K clk) — branchless prefetch is a parked lever. Open: BN_SB-with-β×2
+sweep, LDS epilogue, up shape. See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
 
 ## 2026-06-21 — multi-wave occupancy GEMM (DEAD END) + the deployed GEMM is ~86% BANDWIDTH-bound
 

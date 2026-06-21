@@ -75,6 +75,11 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     ("l2 b2", "gemm_q4_0_i8_l2_b2", 64),
     ("l2 b4", "gemm_q4_0_i8_l2_b4", 64),
     ("l2 b8", "gemm_q4_0_i8_l2_b8", 64),
+    // weight prefetch (PF=1) — the MLP lever, on b4 and the plain transpose.
+    ("l2 b4 pf", "gemm_q4_0_i8_l2_b4_pf", 64),
+    // β×2 WMMA-ILP: alone vs + prefetch (the full combo vs deployed's low-occ ILP).
+    ("l2 b4 b2", "gemm_q4_0_i8_l2_b4_b2", 64),
+    ("l2 b4 pf b2", "gemm_q4_0_i8_l2_b4_pf_b2", 64),
     // 8×1 tile (M_ROWS=128 → mb=128 for the grid math): register-level weight reuse.
     ("l2 m8", "gemm_q4_0_i8_l2_m8", 128),
     ("l2 m8 b4", "gemm_q4_0_i8_l2_m8_b4", 128),

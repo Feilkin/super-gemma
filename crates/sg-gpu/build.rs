@@ -919,6 +919,49 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Weight prefetch (PF=1, software pipeline) on the best L2-schedule (BN_SB=4)
+    // and the plain transpose — the MLP lever (STATUS 2026-06-21).
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4_pf",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4), ("PF", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_l2_pf",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("PF", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // β×2 WMMA-ILP: alone, + prefetch, + prefetch on the BN_SB=4 schedule (full combo).
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4_b2",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4), ("B2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4_pf_b2",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4), ("PF", 1), ("B2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // 8×1 tile (M_TILES=8): register-level weight reuse, NB_M=2. Plain + BN_SB=4.
     Variant {
         name: "gemm_q4_0_i8_l2_m8",
@@ -2366,6 +2409,10 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         substituted = substituted.replace("#{BN_SB}", "1");
         // gemm_q4_0_i8_l2 reads `#{M_TILES}` (tall-thin M_TILES×1); default 4.
         substituted = substituted.replace("#{M_TILES}", "4");
+        // gemm_q4_0_i8_l2 reads `#{PF}` (weight prefetch); default 0 (inline load).
+        substituted = substituted.replace("#{PF}", "0");
+        // gemm_q4_0_i8_l2 reads `#{B2}` (β×2 WMMA-ILP interleave); default 0.
+        substituted = substituted.replace("#{B2}", "0");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {

@@ -355,7 +355,13 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
     let want = run("gemm_q4_0_i8_basic_dir_k21504_n5376", [nb_n, (m / 64) as u32, 1]);
     // l2 (4×1, M_ROWS=64) and l2_m8 (8×1, M_ROWS=128) — both decode tiles internally
     // and must reproduce basic_dir. Grid = [(N/16)·(M/M_ROWS), 1, 1].
-    for (variant, m_rows) in [("gemm_q4_0_i8_l2", 64u32), ("gemm_q4_0_i8_l2_m8", 128u32)] {
+    for (variant, m_rows) in [
+        ("gemm_q4_0_i8_l2", 64u32),
+        ("gemm_q4_0_i8_l2_m8", 128u32),
+        ("gemm_q4_0_i8_l2_b4_pf", 64u32), // weight prefetch
+        ("gemm_q4_0_i8_l2_b4_b2", 64u32), // β×2 interleave
+        ("gemm_q4_0_i8_l2_b4_pf_b2", 64u32), // prefetch + β×2 (full combo)
+    ] {
         let got = run(variant, [nb_n * (m as u32 / m_rows), 1, 1]);
         let err = nrmse(&got, &want);
         eprintln!("{variant} vs basic_dir nrmse {err:.8}");
