@@ -44,6 +44,17 @@ cross-kernel-comparable** (idle-DVFS clock + thermal revert + isolated-vs-steady
 per-kernel) — RGP for structure, `mmq_variance` (GPU timestamps, round-robin, env shape/M/dispatch)
 for timing; cross-checked wall≈timestamp within ~1%, dispatch-sweep 1/8/32 flat (submit overhead <1%).
 
+**Bench artifact found + fixed:** with >1 dispatch/submit, back-to-back dispatches can OVERLAP (no
+barrier — a `coopStore` to `y` is invisible to vulkano auto-sync), and an overlapping kernel thrashes
+its own L2 across the concurrent dispatches → **~2× slower, purely as an artifact**. This was the
+`l2`-vs-`basic_dir` red herring (l2 looked 2× slower at n_disp=8, **identical at n_disp=1**). Confirmed
+serialized (n_disp=1): l2 8.2 ≡ basic_dir 8.0 ≡ basic_e1 8.1 ≡ occ 8.2 (all 9/16) vs basic 10.6 (5/16)
+vs deployed 16.4 — every prior A/B conclusion intact. `mmq_variance` now defaults `SG_BENCH_DISPATCHES=1`
+(fence-serialized = production rate; the prefill graph barriers GEMMs on data deps). New
+`gemm_q4_0_i8_l2.wgsl`: hardcoded down shape, 1D dispatch, swappable `tile_index` decode — the
+platform for the L2-blocking experiment (NEXT: blocked decode so co-resident waves share an L2-sized
+weight+activation block).
+
 ## 2026-06-21 — multi-wave occupancy GEMM (DEAD END) + the deployed GEMM is ~86% BANDWIDTH-bound
 
 **⚠ SUPERSEDED by 2026-06-21b above — the "86% bandwidth-bound" reading is FALSE (MALL inflates

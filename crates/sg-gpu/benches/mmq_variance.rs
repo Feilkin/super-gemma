@@ -22,15 +22,19 @@ const N_BLOCK: u32 = 16;
 const BATCHES: usize = 50;
 const WARMUP: Duration = Duration::from_secs(12);
 
-/// Dispatches recorded per timed submit (amortizes the CB-build + submit + fence
-/// overhead inside the wall-clock window). Env-overridable (`SG_BENCH_DISPATCHES`)
-/// so we can sweep it: if TFLOPS is flat across 1/8/32, the per-submit overhead is
-/// negligible and the wall clock ≈ GPU execution; if it climbs, overhead matters.
+/// Dispatches recorded per timed submit. **Default 1** — with >1, back-to-back
+/// dispatches in one submit can OVERLAP (no barrier between them: a coopStore to
+/// `y` is invisible to vulkano auto-sync, so it inserts none). Whether they overlap
+/// differs per kernel, and an overlapping kernel thrashes its own L2 across the
+/// concurrent dispatches → ~2× slower, confounding cross-kernel A/Bs (the l2 vs
+/// basic_dir red herring, 2026-06-21). One dispatch per submit serializes via the
+/// fence — the production-representative per-dispatch rate (the real prefill graph
+/// barriers GEMMs on their data deps). `SG_BENCH_DISPATCHES>1` only to study overlap.
 fn dispatches() -> usize {
     std::env::var("SG_BENCH_DISPATCHES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8)
+        .unwrap_or(1)
 }
 
 /// Shape + M from env (default down/256 = the original config). `SG_BENCH_SHAPE`
@@ -59,15 +63,15 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     // basic: clean no-frills 4×1 (no β×2/prefetch/swizzle) — the readable baseline
     // (STATUS 2026-06-21). How much do all the deployed optimizations actually buy?
     ("basic", "gemm_q4_0_i8_basic_k21504_n5376", 64),
-    // basic with the three probed barriers removed (parity-redundant) — barrier
-    // perf cost A/B.
-    ("basic nobar", "gemm_q4_0_i8_basic_nobar_k21504_n5376", 64),
     // basic with the direct f16-coopmat store epilogue (no LDS scratch) — epilogue
     // A/B vs the LDS round-trip.
     ("basic dir", "gemm_q4_0_i8_basic_dir_k21504_n5376", 64),
     // basic with per-tile epilogue (EPI_TILES=1): higher occupancy, SAME coalesced
     // store — isolates occupancy-thrash from the store pattern.
     ("basic e1", "gemm_q4_0_i8_basic_e1_k21504_n5376", 64),
+    // L2-blocking experiment kernel (1D dispatch, swappable tile_index decode).
+    ("l2", "gemm_q4_0_i8_l2", 64),
+    ("basic nobar", "gemm_q4_0_i8_basic_nobar_k21504_n5376", 64),
     // PD=2: deeper weight prefetch (2 loads outstanding/wave) — the MLP A/B for
     // the memory-latency-bound GEMM (+9 VGPR; STATUS 2026-06-21).
     ("pd2", "gemm_q4_0_i8_swz_m4n1_pd2_k21504_n5376", 64),
@@ -144,7 +148,10 @@ fn main() {
     let grids: Vec<[u32; 3]> = variants
         .iter()
         .map(|(_, kern, mb)| {
-            if kern.contains("basic") {
+            if kern.contains("_l2") {
+                // 1D: one workgroup per output tile, decoded in-kernel.
+                [(ndim as u32 / N_BLOCK) * (mdim as u32 / mb), 1, 1]
+            } else if kern.contains("basic") {
                 [ndim as u32 / N_BLOCK, mdim as u32 / mb, 1]
             } else {
                 [mdim as u32 / mb, ndim as u32 / N_BLOCK, 1]

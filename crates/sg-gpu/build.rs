@@ -875,6 +875,19 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // L2-blocking experiment kernel: hardcoded down shape, 1D dispatch, swappable
+    // tile_index decode (STATUS 2026-06-21). M flows through the dispatch size:
+    // dispatch [(M/64)·(N/16), 1, 1].
+    Variant {
+        name: "gemm_q4_0_i8_l2",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // Occupancy isolation: basic with the per-tile epilogue (EPI_TILES=1, 1024 B
     // scratch) — higher occupancy, SAME coalesced store. Does it reproduce
     // basic_dir's +21% DRAM traffic (→ occupancy) or stay fast (→ the store)?
