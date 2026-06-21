@@ -7,8 +7,17 @@
 
 use sg_gpu::{BufferUsage, GpuContext, WriteDescriptorSet};
 
-const M: usize = 256; // prefill chunk rows (the M dimension)
 const SUBMITS: usize = 8;
+
+/// Prefill chunk rows (the M dimension). Default 256 (production chunk); override
+/// with `SG_RGP_M` for the two-M GEMM capture (weight re-stream scales M/64,
+/// activation traffic scales M·K — the slope splits the 800M local-video).
+fn rgp_m() -> usize {
+    std::env::var("SG_RGP_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
 
 /// (K, N, N-block, M-block, int8, swizzled) for the supported capture targets.
 /// `swizzled` kernels take a transposed `[M-blocks, N-blocks]` grid (the L2
@@ -167,10 +176,65 @@ fn run_gemv(kernel: &str, k: usize, n: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Phase-0 MALL probe: stream-read a `SG_PROBE_MB`-sized buffer `SG_PROBE_REPS`
+/// times (push = {elems, reps}). Run sub- (e.g. 8) vs super-MALL (e.g. 64) and
+/// compare RGP duration + "local video memory bytes": equal logical reads, so a
+/// duration gap = MALL bandwidth vs DRAM, and whether local-video tracks the
+/// MALL-resident case tells us if it counts Infinity Cache hits (STATUS).
+fn run_probe() -> anyhow::Result<()> {
+    let mb: usize = std::env::var("SG_PROBE_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let reps: u32 = std::env::var("SG_PROBE_REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let elems = mb * 1024 * 1024 / 4; // u32 words
+    let total_threads = 1024u32 * 256; // 1024 groups × WG 256; stride = full sweep
+
+    let ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("gpu: {e}"))?;
+    let kern = ctx.load_kernel("mall_probe").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let u = BufferUsage::STORAGE_BUFFER;
+    let nb_err = |e: sg_gpu::GpuError| anyhow::anyhow!("{e}");
+    let src = ctx.new_buffer::<u32>(elems as u64, u).map_err(nb_err)?;
+    let dst = ctx
+        .new_buffer::<u32>(total_threads as u64, u)
+        .map_err(nb_err)?;
+
+    let logical_gib = (elems as f64 * 4.0 * reps as f64) / (1024.0 * 1024.0 * 1024.0);
+    eprintln!(
+        "RGP MALL probe: {mb} MiB buffer ({} {}MALL) × {reps} reps = {logical_gib:.2} GiB \
+         logical reads\n  grid [1024,1,1] WG 256; {SUBMITS} submits — take the LAST .rgp; \
+         read duration + local-video bytes.",
+        if mb <= 32 { "≤32, fits" } else { ">32, exceeds" },
+        if mb <= 32 { "" } else { "super-" },
+    );
+    let push = [elems as u32, reps];
+    for i in 0..SUBMITS {
+        ctx.dispatch_blocking(
+            &kern,
+            vec![
+                WriteDescriptorSet::buffer(0, src.clone()),
+                WriteDescriptorSet::buffer(1, dst.clone()),
+            ],
+            Some(push),
+            [1024, 1, 1],
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        eprintln!("  submit {i}/{SUBMITS} done");
+    }
+    Ok(())
+}
+
 pub fn run(kernel: &str) -> anyhow::Result<()> {
+    if kernel == "mall_probe" {
+        return run_probe();
+    }
     if let Some((k, n)) = gemv_shape(kernel) {
         return run_gemv(kernel, k, n);
     }
+    let m = rgp_m();
     let (k, n, nb, mb, int8, swz) = shape(kernel).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown rgp kernel `{kernel}`; the deployed int8 FFN gemms \
@@ -191,25 +255,25 @@ pub fn run(kernel: &str) -> anyhow::Result<()> {
     let w = ctx
         .new_buffer::<u32>((n * k / 32 * 18 / 4) as u64, u)
         .map_err(nb_err)?;
-    let y = ctx.new_buffer::<u16>((M * n) as u64, u).map_err(nb_err)?;
+    let y = ctx.new_buffer::<u16>((m * n) as u64, u).map_err(nb_err)?;
     // int8 path: x = Q8 quants (u32-packed = i8 bytes), x_scales = f16. f16 path:
     // x = f16 activations.
     let x_i8 = ctx
-        .new_buffer::<u32>((M * k / 4) as u64, u)
+        .new_buffer::<u32>((m * k / 4) as u64, u)
         .map_err(nb_err)?;
     let xs = ctx
-        .new_buffer::<u16>((M * k / 32) as u64, u)
+        .new_buffer::<u16>((m * k / 32) as u64, u)
         .map_err(nb_err)?;
-    let x_f16 = ctx.new_buffer::<u16>((M * k) as u64, u).map_err(nb_err)?;
+    let x_f16 = ctx.new_buffer::<u16>((m * k) as u64, u).map_err(nb_err)?;
 
     // Swizzled kernels expect [M-blocks, N-blocks]; the rest [N-blocks, M-blocks].
     let groups = if swz {
-        [M as u32 / mb, n as u32 / nb, 1]
+        [m as u32 / mb, n as u32 / nb, 1]
     } else {
-        [n as u32 / nb, M as u32 / mb, 1]
+        [n as u32 / nb, m as u32 / mb, 1]
     };
     eprintln!(
-        "RGP capture target: {kernel}  (M={M} K={k} N={n})  grid {groups:?}\n\
+        "RGP capture target: {kernel}  (M={m} K={k} N={n})  grid {groups:?}\n\
          {SUBMITS} submits — under MESA_VK_TRACE_PER_SUBMIT take the LAST .rgp."
     );
     for i in 0..SUBMITS {

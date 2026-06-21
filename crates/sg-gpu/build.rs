@@ -249,6 +249,19 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: false,
     },
+    // Phase-0 MALL probe (STATUS 2026-06-21): strided streaming re-read, push =
+    // {elems, reps}. Run sub- vs super-MALL (SG_PROBE_MB) to disambiguate whether
+    // RGP "local video memory bytes" counts Infinity Cache hits or only DRAM.
+    Variant {
+        name: "mall_probe",
+        src: "mall_probe",
+        defs: &[],
+        workgroup: [256, 1, 1],
+        bindings: 2,
+        push_bytes: 8,
+        subgroup_size: 0,
+        raw: false,
+    },
     // KV plumbing (plan 02 step 7): append into ring/linear stores, and
     // f16↔Q8_0 block-pair codecs for cache2 page traffic.
     Variant {
