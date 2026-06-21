@@ -90,6 +90,7 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     ("l2 b4 b2 axp2", "gemm_q4_0_i8_l2_b4_b2_axp2", 64),
     ("l2 b4 b2 axp3", "gemm_q4_0_i8_l2_b4_b2_axp3", 64),
     ("l2 axp4 (ping-pong)", "gemm_q4_0_i8_l2_axp4", 64),
+    ("l2 axp4+pf", "gemm_q4_0_i8_l2_axp4_pf", 64),
     // 8×1 tile (M_ROWS=128 → mb=128 for the grid math): register-level weight reuse.
     ("l2 m8", "gemm_q4_0_i8_l2_m8", 128),
     ("l2 m8 b4", "gemm_q4_0_i8_l2_m8_b4", 128),

@@ -36,6 +36,12 @@ const ROW_WORDS: u32 = NB * 18u / 4u; // 3024 Q4_0 words per W row
 const NB_N: u32 = N / N_COLS;         // 336
 const NB_M: u32 = M_TOTAL / M_ROWS;   // 4
 const BN_SB: u32 = 4u;                // L2 super-block (the best schedule)
+// Weight prefetch. 0 = inline-load each pair's 9 Q4_0 words then dequant. 1 = software
+// pipeline: hold the NEXT pair's words in registers (w_nxt), issue its load one pair-step
+// ahead so its DRAM latency hides behind this pair's dequant+MMA — the deployed kernel's
+// weight PF, here on top of the cross-iter X prefetch. Targets the weight-dequant stall
+// that's dominant once X is hidden (RGP 2026-06-21).
+const WPF: u32 = #{WPF}u;
 
 // 2D super-block walk, m-OUTER (see gemm_q4_0_i8_l2 for the rationale).
 fn tile_index(t: u32) -> vec2<u32> {
@@ -64,14 +70,9 @@ fn unpack_block(q0: u32, q1: u32, q2: u32, q3: u32, base: u32) {
     }
 }
 
-// Inline weight load + dequant of one block-pair (β) into wb/dw2 (16 lanes).
-fn load_dequant(beta: u32, n0: u32, lid: u32) {
+// Dequant one block-pair from its 9 already-loaded words (16 lanes) into wb/dw2.
+fn dequant_words(lid: u32, w: array<u32, 9>) {
     if (lid < N_COLS) {
-        let wp = (n0 + lid) * ROW_WORDS + (beta / 2u) * 9u;
-        var w: array<u32, 9>;
-        for (var i = 0u; i < 9u; i += 1u) {
-            w[i] = weights[wp + i];
-        }
         dw2[lid] = unpack2x16float(w[0]).x;
         unpack_block(
             (w[0] >> 16u) | (w[1] << 16u),
@@ -83,6 +84,30 @@ fn load_dequant(beta: u32, n0: u32, lid: u32) {
         dw2[N_COLS + lid] = unpack2x16float(w[4]).y;
         unpack_block(w[5], w[6], w[7], w[8], lid * 64u + 32u);
     }
+}
+
+// Produce pair `pc`'s words (pair index = β/2): WPF consumes the prefetched w_nxt and
+// reissues pair `pf`'s load into it; otherwise inline-loads pair `pc`. `pf` is clamped
+// by the caller. Per-lane (only lid<N_COLS rows hold real words; rest are unused).
+fn pair_words(n0: u32, lid: u32, pc: u32, pf: u32, w_nxt: ptr<function, array<u32, 9>>) -> array<u32, 9> {
+    var w: array<u32, 9>;
+    if (WPF == 1u) {
+        for (var i = 0u; i < 9u; i += 1u) {
+            w[i] = (*w_nxt)[i]; // consume (element-wise; whole-array copy aliases in raw naga)
+        }
+        if (lid < N_COLS) {
+            let wp = (n0 + lid) * ROW_WORDS + pf * 9u;
+            for (var i = 0u; i < 9u; i += 1u) {
+                (*w_nxt)[i] = weights[wp + i]; // issue next pair's prefetch
+            }
+        }
+    } else if (lid < N_COLS) {
+        let wp = (n0 + lid) * ROW_WORDS + pc * 9u;
+        for (var i = 0u; i < 9u; i += 1u) {
+            w[i] = weights[wp + i];
+        }
+    }
+    return w;
 }
 
 @compute @workgroup_size(64)
@@ -119,9 +144,20 @@ fn main(
     var acc0: array<coop_mat16x16<i32, C>, M_TILES>;
     var acc1: array<coop_mat16x16<i32, C>, M_TILES>;
 
+    // WPF prologue: prefetch pair 0's words. NPAIR-1 is the last valid pair index.
+    let NPAIR = NB / 2u; // 336 pairs per row
+    var w_nxt: array<u32, 9>;
+    if (WPF == 1u && lid < N_COLS) {
+        let wp = (n0 + lid) * ROW_WORDS;
+        for (var i = 0u; i < 9u; i += 1u) {
+            w_nxt[i] = weights[wp + i];
+        }
+    }
+
     for (var beta = 0u; beta < NB; beta += 4u) {
         // ===================== sub-iter 1: current = A, prefetch β+2 → B =========
-        load_dequant(beta, n0, lid);
+        let w1 = pair_words(n0, lid, beta / 2u, min((beta + 2u) / 2u, NPAIR - 1u), &w_nxt);
+        dequant_words(lid, w1);
         workgroupBarrier();
         // Prefetch β+2's X into B (in flight through the MMA + rescale below).
         let k1 = min((beta + 2u) * 32u, (NB - 2u) * 32u);
@@ -161,7 +197,8 @@ fn main(
         }
 
         // ===================== sub-iter 2: current = B (β+2), prefetch β+4 → A ====
-        load_dequant(beta + 2u, n0, lid);
+        let w2 = pair_words(n0, lid, (beta + 2u) / 2u, min((beta + 4u) / 2u, NPAIR - 1u), &w_nxt);
+        dequant_words(lid, w2);
         workgroupBarrier();
         let k2 = min((beta + 4u) * 32u, (NB - 2u) * 32u);
         for (var s = 0u; s < 2u; s += 1u) {

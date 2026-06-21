@@ -1008,6 +1008,18 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // axp4 + weight prefetch (WPF=1): cross-iter X ping-pong AND software-pipelined
+    // weight load — the full deployed-style combo on the l2 design.
+    Variant {
+        name: "gemm_q4_0_i8_l2_axp4_pf",
+        src: "gemm_q4_0_i8_l2_axp4",
+        defs: &[("WPF", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // Minimal-fetch prefetch (PFW=5: prefetch block β only, inline-load β+1) on the
     // best combo — hides the 0x124 weight-load stall at ~half the prefetch VGPR of
     // full PF. A/B vs b4_b2 (no PF) and b4_pf_b2 (full PF).
@@ -2531,6 +2543,8 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         let (scale_ty, scale_cvt) = if sf16 { ("f16", "f32") } else { ("f32", "") };
         substituted = substituted.replace("#{SCALE_TY}", scale_ty);
         substituted = substituted.replace("#{SCALE_CVT}", scale_cvt);
+        // gemm_q4_0_i8_l2_axp4 reads `#{WPF}` (weight prefetch on the ping-pong); default 0.
+        substituted = substituted.replace("#{WPF}", "0");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {

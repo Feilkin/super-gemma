@@ -116,6 +116,14 @@ stall). Attacking X (β×2 path, down M=256, gpu-timestamp, all parity nrmse 0.0
   **+5.0% vs b4_b2, ~+1.9% over the hoist, within ~5.6% of deployed — the best l2 of the session.**
   180 VGPR, 1510 instrs (no explosion), 46 residual swaps. So cross-iter X prefetch IS viable; axp3's
   −43% was specifically the dynamic index, exactly as its trace showed.
+- `gemm_q4_0_i8_l2_axp4_pf` = axp4 + **weight prefetch** (WPF=1, the last deployed ingredient): **−0.7%
+  vs axp4** (consistent across 3 runs, within cv), 192 VGPR. The weight-dequant stall axp4's trace showed
+  as dominant (0x398/0x1c08) is large per-wavefront but **already hidden cross-wave at l2's 4/16
+  occupancy** — so PF removes a non-critical stall and just costs +12 VGPR. This is *why* l2 ≠ deployed:
+  deployed NEEDS weight PF because at **3/16** it has fewer waves to hide that stall; the same ingredient
+  pays there, not here. The designs sit at different occupancy points where different levers apply —
+  you can't bolt deployed's PF onto l2. **axp4 ≈ 5.6% behind deployed is the high-occupancy ceiling**;
+  closing it means *lowering* l2's occupancy toward deployed's, i.e. converging into deployed.
 
 **Lever ladder, fully mapped:** weight-side (PF/cooperative-dequant/minimal-fetch) all dead → wrong stall;
 activation hoist +3.5%; activation cross-iter static-ping-pong **+5.0% (best)**; cross-iter single-buf
