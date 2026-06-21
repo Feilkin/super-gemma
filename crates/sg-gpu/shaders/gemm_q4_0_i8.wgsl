@@ -83,6 +83,27 @@ const SWIZZLE: u32 = #{SWIZZLE}u;
 // loses large-K (+2..+12%, weight-bound — the freed LDS/occupancy oversubscribes
 // the weight stream). build.rs sets BCAST=1 on the K=5376 variants, 0 elsewhere.
 const BCAST: u32 = #{BCAST}u;
+// Software-prefetch depth on the WEIGHT stream (the cold DRAM read; X is the
+// cache-hot one). 1 = the deployed pipeline (load pair β+2 while computing β);
+// 2 keeps two weight loads outstanding per wave, adding memory-level parallelism
+// to hide DRAM latency WITHOUT raising occupancy — the lever for a kernel that's
+// memory-LATENCY-bound (runs +32% over its all-DRAM floor at 3/16 occupancy),
+// not bandwidth-bound (MALL probe, STATUS 2026-06-21). Costs +9 VGPR; whether
+// that drops a wave is the A/B. Default 1 (build.rs) → the PD>=2 paths const-fold
+// away, leaving the deployed variants byte-identical. ONLY 1 or 2 are valid: this
+// kernel carries one extra buffer (`w_next2`); depth 3 needs a `w_next3` + a
+// 3-pair prologue, else pairs get skipped.
+const PD: u32 = #{PREFETCH_DEPTH}u;
+// Activation prefetch. 0 = the deployed inline load (one `coopLoadT` of X per
+// consuming WMMA — zero issue-distance, so the X-load latency lands on the WMMA;
+// this is the `vmcnt` half of the pre-first-WMMA stall, RGP 2026-06-21). 1 =
+// hoist all M_TILES A-tile loads for the s-step ahead of the MMA loop (proven
+// moot — ACO already schedules them there, and the workgroupBarrier fences them).
+// 2 = issue EVERY A-load for the β before the unpack + barrier (the A tiles
+// depend only on k0/m0, not `wb`), so the X-latency overlaps the unpack, barrier
+// and B-load instead of landing on the first WMMA. Costs 4·M_TILES tiny i8 A
+// fragments held across the barrier. Default 0 (build.rs) → deployed byte-identical.
+const AXPF: u32 = #{AXPF}u;
 
 const NB: u32 = K / 32u;            // 32-blocks per row
 const ACC: u32 = M_TILES * N_TILES; // 16×16 output tiles per workgroup
@@ -142,16 +163,23 @@ fn main(
         yacc[i] = zero_f;
     }
 
-    // Prefetch block-pair 0's 9 weight words into registers (the prologue of
-    // the software pipeline; each thread owns one W row's words). Loading the
-    // next pair one iteration ahead hides the DRAM weight-load latency behind
-    // the current iteration's MMA + rescale instead of stalling the WMMAs on
-    // vmcnt — the right lever at this kernel's low (3-wave) occupancy.
+    // Prefetch the first PD block-pairs' 9 weight words into registers (the
+    // prologue of the software pipeline; each thread owns one W row's words).
+    // Loading PD pairs ahead keeps PD weight loads outstanding so DRAM latency
+    // hides behind the MMA + rescale instead of stalling the WMMAs on vmcnt —
+    // the lever at this kernel's low (3-wave) occupancy. `w_next` is the pair
+    // consumed next; `w_next2` the one after (dead-stripped when PD==1).
     var w_next: array<u32, 9>;
+    var w_next2: array<u32, 9>;
     if (lid < N_COLS) {
         let wb0 = (n0 + lid) * ROW_WORDS;
         for (var i = 0u; i < 9u; i += 1u) {
             w_next[i] = weights[wb0 + i];
+        }
+        if (PD >= 2u) {
+            for (var i = 0u; i < 9u; i += 1u) {
+                w_next2[i] = weights[wb0 + 9u + i]; // pair 1
+            }
         }
     }
 
@@ -161,15 +189,44 @@ fn main(
             acc[i] = zero_i;
             acc2[i] = zero_i;
         }
-        // Consume this pair's prefetched words, then ISSUE the next pair's load
-        // now (its DRAM latency hides behind this iteration's MMA + rescale; the
-        // vmcnt wait lands at next iteration's `w_cur = w_next`, by which time
-        // the load is done). Each thread unpacks its 9-word block pair into `wb`.
+        // Consume this pair's prefetched words, then ISSUE a load PD pairs ahead
+        // (its DRAM latency hides behind this + the next PD-1 iterations' MMA +
+        // rescale; the vmcnt wait lands PD iterations later). Each thread unpacks
+        // its 9-word block pair into `wb`. PD==1: reload `w_next` with pair β+2.
+        // PD>=2: shift `w_next2`→`w_next` and reload `w_next2` with pair β+2·PD.
         let w_cur = w_next;
-        if (lid < N_COLS && beta + 2u < NB) {
-            let wbn = (n0 + lid) * ROW_WORDS + ((beta + 2u) / 2u) * 9u;
-            for (var i = 0u; i < 9u; i += 1u) {
-                w_next[i] = weights[wbn + i];
+        if (lid < N_COLS) {
+            if (PD >= 2u) {
+                w_next = w_next2;
+                if (beta + 2u * PD < NB) {
+                    let wbn = (n0 + lid) * ROW_WORDS + ((beta + 2u * PD) / 2u) * 9u;
+                    for (var i = 0u; i < 9u; i += 1u) {
+                        w_next2[i] = weights[wbn + i];
+                    }
+                }
+            } else if (beta + 2u < NB) {
+                let wbn = (n0 + lid) * ROW_WORDS + ((beta + 2u) / 2u) * 9u;
+                for (var i = 0u; i < 9u; i += 1u) {
+                    w_next[i] = weights[wbn + i];
+                }
+            }
+        }
+        // [AXPF==2] CROSS-BARRIER activation prefetch: A tiles depend only on
+        // k0/m0 (not on `wb`), so issue every A `coopLoadT` for this β BEFORE the
+        // unpack + barrier — the VMEM latency then overlaps the unpack, the
+        // workgroupBarrier and the B coopLoad, instead of landing on the first
+        // WMMA (the fenced `vmcnt` stall). Held across the barrier in [s·M_TILES+mt].
+        // coopLoadT is uniform (all lanes) → must sit outside the unpack's
+        // `lid < N_COLS` divergence. Unused/stripped at AXPF 0/1.
+        let k0 = beta * 32u;
+        var ap0: array<coop_mat16x16<i8, A>, 2u * M_TILES>;
+        var ap1: array<coop_mat16x16<i8, A>, 2u * M_TILES>;
+        if (AXPF == 2u) {
+            for (var s = 0u; s < 2u; s += 1u) {
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    ap0[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
+                    ap1[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
+                }
             }
         }
         if (lid < N_COLS) {
@@ -191,7 +248,6 @@ fn main(
         // Interleaved MMA for the two blocks (independent → WMMA ILP). B tiles
         // come from `wb` (LDS i8); A tiles from X (global i8). Block β occupies
         // wb cols 0..32, block β+1 cols 32..64; row stride is 64.
-        let k0 = beta * 32u;
         for (var s = 0u; s < 2u; s += 1u) {
             var b0: array<coop_mat16x16<i8, B>, N_TILES>;
             var b1: array<coop_mat16x16<i8, B>, N_TILES>;
@@ -199,12 +255,39 @@ fn main(
                 b0[nt] = coopLoad<coop_mat16x16<i8, B>>(&wb[(nt * 16u) * 64u + s * 16u], 64u);
                 b1[nt] = coopLoad<coop_mat16x16<i8, B>>(&wb[(nt * 16u) * 64u + 32u + s * 16u], 64u);
             }
-            for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                let a0 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
-                let a1 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
-                for (var nt = 0u; nt < N_TILES; nt += 1u) {
-                    acc[mt * N_TILES + nt] = coopMultiplyAdd(a0, b0[nt], acc[mt * N_TILES + nt]);
-                    acc2[mt * N_TILES + nt] = coopMultiplyAdd(a1, b1[nt], acc2[mt * N_TILES + nt]);
+            if (AXPF == 2u) {
+                // Consume the cross-barrier prefetched A tiles (already in flight
+                // since before the barrier).
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    for (var nt = 0u; nt < N_TILES; nt += 1u) {
+                        acc[mt * N_TILES + nt] = coopMultiplyAdd(ap0[s * M_TILES + mt], b0[nt], acc[mt * N_TILES + nt]);
+                        acc2[mt * N_TILES + nt] = coopMultiplyAdd(ap1[s * M_TILES + mt], b1[nt], acc2[mt * N_TILES + nt]);
+                    }
+                }
+            } else if (AXPF == 1u) {
+                // Issue ALL M_TILES A-loads for this s-step up front (vmcnt
+                // accumulates), THEN the WMMAs drain behind one wait instead of
+                // stalling 1:1 on each inline load. A i8 fragments are ~1 VGPR.
+                var a0: array<coop_mat16x16<i8, A>, M_TILES>;
+                var a1: array<coop_mat16x16<i8, A>, M_TILES>;
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    a0[mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
+                    a1[mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
+                }
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    for (var nt = 0u; nt < N_TILES; nt += 1u) {
+                        acc[mt * N_TILES + nt] = coopMultiplyAdd(a0[mt], b0[nt], acc[mt * N_TILES + nt]);
+                        acc2[mt * N_TILES + nt] = coopMultiplyAdd(a1[mt], b1[nt], acc2[mt * N_TILES + nt]);
+                    }
+                }
+            } else {
+                for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                    let a0 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
+                    let a1 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
+                    for (var nt = 0u; nt < N_TILES; nt += 1u) {
+                        acc[mt * N_TILES + nt] = coopMultiplyAdd(a0, b0[nt], acc[mt * N_TILES + nt]);
+                        acc2[mt * N_TILES + nt] = coopMultiplyAdd(a1, b1[nt], acc2[mt * N_TILES + nt]);
+                    }
                 }
             }
         }

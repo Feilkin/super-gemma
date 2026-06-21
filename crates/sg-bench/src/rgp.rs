@@ -28,6 +28,24 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         // tiling (graph.rs); the occupancy/L2 recapture target (STATUS).
         "gemm_q4_0_i8_swz_m4n1_k21504_n5376" => (21504, 5376, 16, 64, true, true), // FFN down
         "gemm_q4_0_i8_swz_m4n1_k5376_n21504" => (5376, 21504, 16, 64, true, true), // FFN gate/up
+        // Clean no-frills 4×1 baseline (swizzle-less → [N-blocks, M-blocks] grid).
+        "gemm_q4_0_i8_basic_k21504_n5376" => (21504, 5376, 16, 64, true, false), // FFN down
+        "gemm_q4_0_i8_basic_k5376_n21504" => (5376, 21504, 16, 64, true, false), // FFN gate/up
+        // Direct f16-coopmat store epilogue (no LDS) — the −25% A/B vs basic.
+        "gemm_q4_0_i8_basic_dir_k21504_n5376" => (21504, 5376, 16, 64, true, false), // FFN down
+        // Per-tile epilogue (higher occupancy, same coalesced store) — occupancy isolation.
+        "gemm_q4_0_i8_basic_e1_k21504_n5376" => (21504, 5376, 16, 64, true, false), // FFN down
+        // PD=2 (deeper weight prefetch) A/B vs the deployed 4×1 — the MLP lever for
+        // the memory-latency-bound GEMM (STATUS 2026-06-21). Read occupancy +
+        // whether the first-WMMA vmcnt stall shrinks vs the PD=1 capture.
+        "gemm_q4_0_i8_swz_m4n1_pd2_k21504_n5376" => (21504, 5376, 16, 64, true, true), // FFN down
+        "gemm_q4_0_i8_swz_m4n1_pd2_k5376_n21504" => (5376, 21504, 16, 64, true, true), // FFN gate/up
+        // Activation prefetch (hoisted X loads) — attacks the vmcnt stall directly.
+        "gemm_q4_0_i8_swz_m4n1_axpf_k21504_n5376" => (21504, 5376, 16, 64, true, true), // FFN down
+        "gemm_q4_0_i8_swz_m4n1_axpf_k5376_n21504" => (5376, 21504, 16, 64, true, true), // FFN gate/up
+        // Cross-barrier activation prefetch (issued before unpack+barrier).
+        "gemm_q4_0_i8_swz_m4n1_axpf2_k21504_n5376" => (21504, 5376, 16, 64, true, true), // FFN down
+        "gemm_q4_0_i8_swz_m4n1_axpf2_k5376_n21504" => (5376, 21504, 16, 64, true, true), // FFN gate/up
         // int8 max-occupancy 1×1 (N-block = M-block = 16) — the occupancy-vs-reuse
         // A/B against the deployed 4×1 down-gemm (mmq_variance −47.8%; this trace
         // confirms it reached high occupancy yet lost — STATUS rank #2).

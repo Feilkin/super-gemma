@@ -210,6 +210,12 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
         ("gemm_q4_0_i8_k512_n128", 32, 512, 128, 32, 64),
         // Occupancy-sweep tilings (validate the 2×2 / 1×2 index paths).
         ("gemm_q4_0_i8_t22_k512_n128", 32, 512, 128, 32, 32),
+        // Depth-2 weight prefetch (w_next2 shift/prologue); same 2×2 as t22.
+        ("gemm_q4_0_i8_pd2_k512_n128", 32, 512, 128, 32, 32),
+        // Activation prefetch (hoisted A-loads / reordered MMA); same 2×2.
+        ("gemm_q4_0_i8_axpf_k512_n128", 32, 512, 128, 32, 32),
+        // Cross-barrier activation prefetch (ap0/ap1 issued pre-barrier); same 2×2.
+        ("gemm_q4_0_i8_axpf2_k512_n128", 32, 512, 128, 32, 32),
         ("gemm_q4_0_i8_t12_k512_n128", 16, 512, 128, 16, 32),
         // 4×4 tiling (f16-equivalent), validates the 64×64 tile index path.
         ("gemm_q4_0_i8_t44_k512_n256", 64, 512, 256, 64, 64),
@@ -221,6 +227,13 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
         // RM=2 register-tiled (half-occupancy): 2 waves, each 2 M-tiles. BM=64,
         // BN=16; exercises the RM>1 MMA + epilogue path.
         ("gemm_q4_0_i8_mw_r2_k512_n128", 64, 512, 128, 64, 16),
+        // Clean no-frills 4×1 baseline (all barriers on): de-interleaved blocks,
+        // 0-stride rescale, LDS-scratch epilogue. m_rows=64, n_cols=16.
+        ("gemm_q4_0_i8_basic_k512_n128", 64, 512, 128, 64, 16),
+        // Direct f16-coopmat store epilogue (no LDS scratch); same 4×1.
+        ("gemm_q4_0_i8_basic_dir_k512_n128", 64, 512, 128, 64, 16),
+        // Per-tile epilogue passes (EPI_TILES=1, smaller scratch); same 4×1.
+        ("gemm_q4_0_i8_basic_e1_k512_n128", 64, 512, 128, 64, 16),
     ];
 
     for (variant, m, k, n, m_rows, n_cols) in cases {
@@ -279,4 +292,72 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
         eprintln!("{variant}: kernel vs MMQ oracle nrmse {err:.6}");
         assert_close(&got, &want, 2e-2, 2e-2, variant);
     }
+}
+
+/// Barrier probe (STATUS 2026-06-21): which of the basic 4×1 kernel's three
+/// workgroupBarriers are actually required? Runs the all-on baseline and each
+/// single-barrier-dropped variant and PRINTS nrmse — non-asserting (a dropped
+/// barrier that races shows a large/garbage nrmse; one that's redundant stays
+/// ~2e-4). Run with `--nocapture`. Only the baseline is assert-checked so CI
+/// stays green regardless of what the probe reveals.
+#[test]
+fn gemm_q4_0_i8_basic_barrier_probe() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.cooperative_matrix {
+        eprintln!("skipping: no VK_KHR_cooperative_matrix");
+        return;
+    }
+    let (m, k, n, m_rows, n_cols) = (64usize, 512usize, 128usize, 64usize, 16usize);
+    let nb = k / QK4_0;
+    let mut rng = Rng::new(0x4D);
+    let weights = random_q4_0(&mut rng, n * k / QK4_0);
+    let x = through_f16(&rng.f32_vec(m * k));
+    let want = mmq_q4_0_q8(&weights, &x, m, k, n);
+
+    let mut x_i8 = Vec::with_capacity(m * k);
+    let mut x_scales = Vec::with_capacity(m * nb);
+    for mi in 0..m {
+        let (sc, q) = quant_q8_0(&x[mi * k..][..k]);
+        x_scales.extend_from_slice(&sc);
+        x_i8.extend(q.iter().map(|&b| b as i8));
+    }
+    let w_buf = ctx
+        .buffer_from_iter(
+            weights
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap())),
+            BufferUsage::STORAGE_BUFFER,
+        )
+        .unwrap();
+    let x_buf = ctx.buffer_from_iter(x_i8, BufferUsage::STORAGE_BUFFER).unwrap();
+    let xs_buf = ctx
+        .buffer_from_iter(x_scales, BufferUsage::STORAGE_BUFFER)
+        .unwrap();
+
+    for variant in [
+        "gemm_q4_0_i8_basic_k512_n128",      // all barriers on
+        "gemm_q4_0_i8_basic_nowb_k512_n128", // drop RAW wb
+        "gemm_q4_0_i8_basic_noda_k512_n128", // drop RAW da_l
+        "gemm_q4_0_i8_basic_nowar_k512_n128", // drop WAR
+    ] {
+        let kernel = ctx.load_kernel(variant).expect(variant);
+        let y_buf = ctx
+            .new_buffer::<u16>((m * n) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                WriteDescriptorSet::buffer(0, w_buf.clone()),
+                WriteDescriptorSet::buffer(1, x_buf.clone()),
+                WriteDescriptorSet::buffer(2, xs_buf.clone()),
+                WriteDescriptorSet::buffer(3, y_buf.clone()),
+            ],
+            None::<u32>,
+            [(n / n_cols) as u32, (m / m_rows) as u32, 1],
+        )
+        .unwrap();
+        let got = from_f16_bits(&y_buf.read().unwrap());
+        eprintln!("BARRIER PROBE {variant}: nrmse {:.6}", nrmse(&got, &want));
+    }
+    eprintln!("(baseline must be ~2e-4; a needed barrier shows large nrmse when dropped)");
 }

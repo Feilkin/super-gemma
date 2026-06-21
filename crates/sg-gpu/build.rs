@@ -520,6 +520,63 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Depth-2 weight prefetch at the parity shape (correctness of the w_next2
+    // shift/prologue; the PD path is tile-independent so 2×2 covers it).
+    Variant {
+        name: "gemm_q4_0_i8_pd2_k512_n128",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 2),
+            ("PREFETCH_DEPTH", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Activation prefetch at the parity shape (hoisted A-tile loads; the AXPF
+    // path is tile-independent so 2×2 covers the load/MMA reorder correctness).
+    Variant {
+        name: "gemm_q4_0_i8_axpf_k512_n128",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 2),
+            ("AXPF", 1),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Cross-barrier activation prefetch at the parity shape (ap0/ap1 issued before
+    // the barrier, consumed after — load-before-fence + held-across reorder).
+    Variant {
+        name: "gemm_q4_0_i8_axpf2_k512_n128",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 512),
+            ("N_DIM", 128),
+            ("WG_X", 64),
+            ("M_TILES", 2),
+            ("N_TILES", 2),
+            ("AXPF", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     Variant {
         name: "gemm_q4_0_i8_t12_k512_n128",
         src: "gemm_q4_0_i8",
@@ -642,6 +699,271 @@ const VARIANTS: &[Variant] = &[
             ("STAGE_BUFS", 1),
             ("SWIZZLE", 1),
         ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Depth-2 weight-prefetch A/Bs of the two deployed 4×1 FFN shapes (PD=2 vs the
+    // default PD=1): the MLP lever for the memory-LATENCY-bound GEMM (STATUS
+    // 2026-06-21). Identical to the deployed down/up variants but PREFETCH_DEPTH=2;
+    // +9 VGPR/wave — bench (mmq_variance) + RGP (occupancy + the vmcnt/first-WMMA
+    // stall) decide whether the extra outstanding load beats the lost wave.
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_pd2_k21504_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 1),
+            ("SWIZZLE", 1),
+            ("PREFETCH_DEPTH", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_pd2_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 1),
+            ("SWIZZLE", 1),
+            ("BCAST", 1),
+            ("STAGE_BUFS", 1),
+            ("PREFETCH_DEPTH", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Activation-prefetch A/Bs of the two deployed 4×1 FFN shapes (AXPF=1 vs the
+    // default inline X load): the indicated lever — the pre-first-WMMA stall's
+    // vmcnt half is the unprefetched `coopLoadT` of X (RGP 2026-06-21). Hoists
+    // M_TILES A-loads ahead of the MMA loop; ~8 tiny i8 A-fragments of VGPR.
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_axpf_k21504_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 1),
+            ("SWIZZLE", 1),
+            ("AXPF", 1),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_axpf_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 1),
+            ("SWIZZLE", 1),
+            ("BCAST", 1),
+            ("STAGE_BUFS", 1),
+            ("AXPF", 1),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // AXPF=2: CROSS-BARRIER activation prefetch (issue every A-load before the
+    // unpack+barrier so X-latency overlaps them) — the indicated fix for the
+    // fenced vmcnt stall the AXPF=1 hoist couldn't reach (RGP 2026-06-21).
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_axpf2_k21504_n5376",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 1),
+            ("SWIZZLE", 1),
+            ("AXPF", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_swz_m4n1_axpf2_k5376_n21504",
+        src: "gemm_q4_0_i8",
+        defs: &[
+            ("K_DIM", 5376),
+            ("N_DIM", 21504),
+            ("WG_X", 64),
+            ("M_TILES", 4),
+            ("N_TILES", 1),
+            ("SWIZZLE", 1),
+            ("BCAST", 1),
+            ("STAGE_BUFS", 1),
+            ("AXPF", 2),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // ── Clean no-frills 4×1 baseline (gemm_q4_0_i8_basic) — readable reference +
+    // barrier probe (STATUS 2026-06-21). No β×2/prefetch/swizzle/stage. Default
+    // all barriers on; the _nowb/_noda/_nowar parity variants drop one each to
+    // learn which workgroupBarrier is actually required.
+    Variant {
+        name: "gemm_q4_0_i8_basic_k512_n128",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 512), ("N_DIM", 128), ("WG_X", 64)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_basic_nowb_k512_n128",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 512), ("N_DIM", 128), ("WG_X", 64), ("BAR_WB", 0)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_basic_noda_k512_n128",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 512), ("N_DIM", 128), ("WG_X", 64), ("BAR_DA", 0)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_basic_nowar_k512_n128",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 512), ("N_DIM", 128), ("WG_X", 64), ("BAR_WAR", 0)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Occupancy isolation: basic with the per-tile epilogue (EPI_TILES=1, 1024 B
+    // scratch) — higher occupancy, SAME coalesced store. Does it reproduce
+    // basic_dir's +21% DRAM traffic (→ occupancy) or stay fast (→ the store)?
+    Variant {
+        name: "gemm_q4_0_i8_basic_e1_k512_n128",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 512), ("N_DIM", 128), ("WG_X", 64), ("EPI_TILES", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_basic_e1_k21504_n5376",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 21504), ("N_DIM", 5376), ("WG_X", 64), ("EPI_TILES", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Direct-store epilogue (f16 coopmat → coopStore to y, no LDS scratch): parity
+    // of the f16-coopmat conversion + scalar-matched store, and the perf A/B.
+    Variant {
+        name: "gemm_q4_0_i8_basic_dir_k512_n128",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 512), ("N_DIM", 128), ("WG_X", 64), ("EPI", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_basic_dir_k21504_n5376",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 21504), ("N_DIM", 5376), ("WG_X", 64), ("EPI", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_basic_dir_k5376_n21504",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 5376), ("N_DIM", 21504), ("WG_X", 64), ("EPI", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // basic baseline at the two deployed FFN shapes (bench + RGP reference).
+    Variant {
+        name: "gemm_q4_0_i8_basic_k21504_n5376",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 21504), ("N_DIM", 5376), ("WG_X", 64)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // All three probed barriers OFF (parity-redundant on the single wave) — the
+    // perf A/B vs basic: do the barriers cost cycles, or did ACO already elide them?
+    Variant {
+        name: "gemm_q4_0_i8_basic_nobar_k21504_n5376",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[
+            ("K_DIM", 21504),
+            ("N_DIM", 5376),
+            ("WG_X", 64),
+            ("BAR_WB", 0),
+            ("BAR_DA", 0),
+            ("BAR_WAR", 0),
+        ],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_basic_k5376_n21504",
+        src: "gemm_q4_0_i8_basic",
+        defs: &[("K_DIM", 5376), ("N_DIM", 21504), ("WG_X", 64)],
         workgroup: [64, 1, 1],
         bindings: 4,
         push_bytes: 0,
@@ -1953,6 +2275,27 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         // (one tile/wave, max occupancy) unless the variant lowers occupancy by
         // tiling RM tiles per wave (the half-occupancy A/B).
         substituted = substituted.replace("#{RM}", "1");
+        // gemm_q4_0_i8 reads `#{PREFETCH_DEPTH}`; default 1 (deployed 1-deep weight
+        // prefetch) unless a variant deepens it (the MLP A/B — latency-bound, not
+        // bandwidth-bound; STATUS 2026-06-21). Only 1 or 2 are valid.
+        substituted = substituted.replace("#{PREFETCH_DEPTH}", "1");
+        // gemm_q4_0_i8 reads `#{AXPF}`; default 0 (deployed inline X load) unless a
+        // variant hoists the A-tile loads ahead of the MMA loop (the activation-
+        // prefetch A/B — the vmcnt stall is on X, not weights; STATUS 2026-06-21).
+        substituted = substituted.replace("#{AXPF}", "0");
+        // gemm_q4_0_i8_basic reads `#{BAR_WB}`/`#{BAR_DA}`/`#{BAR_WAR}`; default 1
+        // (all barriers on = correct). A variant drops one (→ 0) to probe whether
+        // that workgroupBarrier is actually required (STATUS 2026-06-21).
+        substituted = substituted.replace("#{BAR_WB}", "1");
+        substituted = substituted.replace("#{BAR_DA}", "1");
+        substituted = substituted.replace("#{BAR_WAR}", "1");
+        // gemm_q4_0_i8_basic reads `#{EPI}`; default 0 (LDS-scratch epilogue). 1 =
+        // convert to f16 coopmat in registers + direct coopStore to y (no LDS).
+        substituted = substituted.replace("#{EPI}", "0");
+        // gemm_q4_0_i8_basic reads `#{EPI_TILES}`; default 4 (= M_TILES, one-shot
+        // 4096 B scratch). 1 = per-tile passes, 1024 B scratch → higher occupancy,
+        // same coalesced store (the occupancy-vs-store isolation probe).
+        substituted = substituted.replace("#{EPI_TILES}", "4");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {

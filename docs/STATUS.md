@@ -1,6 +1,7 @@
 # STATUS — read this first
 
-Last updated: **2026-06-20** (gemm 0-stride rescale deployed on K=5376 shapes; int8 V/PV shelved),
+Last updated: **2026-06-21** (MALL probe → "86% BW-bound" is dead, GEMM is memory-latency-bound;
+occupancy→L2-thrash cleanly isolated; `mmq_variance` now GPU-timestamped + round-robin),
 working on the Framework Desktop target box. The conversation history that produced this repo is gone;
 everything needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
 
@@ -8,7 +9,45 @@ everything needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
 point, e.g. `(bench: gemm_variance, perf=high)`. Numbers are at `perf=high` unless noted; `auto`
 reads ~30 % low. When a benchmark changes, update the numbers (grep for the old value).
 
+## 2026-06-21b — MALL probe kills the "86% BW-bound" claim; occupancy→L2-thrash cleanly isolated; bench methodology hardened
+
+**This SUPERSEDES the "~86% bandwidth-bound" section below** — that number treated RGP `local-video
+memory bytes` as DRAM traffic, but the MALL probe (`mall_probe`, sub- vs super-32 MB-MALL buffer)
+showed **local-video COUNTS Infinity Cache hits** (MALL ≥3× DRAM: 8 MiB-resident 730 GiB/s vs
+128 MiB 242 GiB/s ≈ the DRAM spec). So `local-video÷duration` is a blended MALL+DRAM figure, not a
+DRAM-util fraction. The deployed GEMM is **memory-LATENCY-bound, not bandwidth-bound** (M=256 runs
++32% over the time to stream all its local-video at full DRAM).
+
+**Occupancy is net-NEGATIVE here, cleanly isolated (not the confounded `_occ`/`_mw` runs).** New clean
+baseline `gemm_q4_0_i8_basic.wgsl` (4×1, no β×2/prefetch/swizzle), three epilogues, down M=256
+(bench: `mmq_variance`, GPU-timestamp, warm round-robin, sclk ~2.75 GHz auto-boost — `perf=high`
+thermal-reverts mid-run):
+- `basic` (LDS scratch 4096 B, VGPR 108) → **5/16 occ, 10.68 TFLOPS**
+- `basic_dir` (direct f16-coopmat coopStore, no scratch) → 9/16 occ, 8.14 TFLOPS
+- `basic_e1` (SAME coalesced LDS store, scratch shrunk to 1024 B; VGPR 84, LDS 3072) → **9/16 occ,
+  720 waves, 8.11 TFLOPS** — lands on `basic_dir`, not `basic`.
+
+`basic_e1` changes only the epilogue *footprint* (→ occupancy), keeps the store pattern, and
+reproduces the full slowdown: **more occupancy → working set spreads across the 2 MB L2 / 32 MB MALL
+→ +21% local-video (712→859 MB) → ~25% slower.** Store pattern exonerated (the "store-bound" guess was
+wrong — no epilogue stalls; dominant stall is a main-loop vmcnt). **Reframe: the fix is NOT capping
+occupancy ("use the worse epilogue") — it's L2-FRIENDLY high occupancy** (cache-block / swizzle so
+concurrently-resident waves share L2 residency). **NEXT: make `basic_dir` L2-friendly.**
+
+Also this session: deployed optimizations (β×2 + prefetch) are worth **~1.5×** (`basic` −32% vs
+deployed). Deeper weight prefetch (`PD=2`) and activation prefetch (`AXPF=1` hoist, `AXPF=2`
+cross-barrier) all came back **flat** — ACO already schedules the loads; the wall is occupancy/L2, not
+load scheduling. **Single-wave `workgroupBarrier`s are redundant** (barrier probe: drop all 3 →
+nrmse- and perf-identical; ACO elides the `s_barrier`). **coopStore needs scalar match** (f32 acc can't
+store to f16 y; naga fork) — coopLoad doesn't. **RGP single-dispatch durations are NOT
+cross-kernel-comparable** (idle-DVFS clock + thermal revert + isolated-vs-steady regime distort them
+per-kernel) — RGP for structure, `mmq_variance` (GPU timestamps, round-robin, env shape/M/dispatch)
+for timing; cross-checked wall≈timestamp within ~1%, dispatch-sweep 1/8/32 flat (submit overhead <1%).
+
 ## 2026-06-21 — multi-wave occupancy GEMM (DEAD END) + the deployed GEMM is ~86% BANDWIDTH-bound
+
+**⚠ SUPERSEDED by 2026-06-21b above — the "86% bandwidth-bound" reading is FALSE (MALL inflates
+local-video; the GEMM is memory-latency-bound).** Kept for the multi-wave dead-end record.
 
 **Headline (corrects the long-standing "prefill gemms are memory-LATENCY-bound at a fraction of
 bandwidth" reading):** the deployed int8 GEMM is **~206 GB/s = ~86% of the ~240 GiB/s ceiling — it is

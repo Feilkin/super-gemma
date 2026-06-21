@@ -16,15 +16,37 @@ use vulkano::command_buffer::{
 };
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::pipeline::PipelineBindPoint;
-use vulkano::sync::GpuFuture;
+use vulkano::sync::{GpuFuture, PipelineStage};
 
-const M: usize = 256; // prefill chunk
-const K: usize = 21504; // FFN-down K
-const N: usize = 5376;
 const N_BLOCK: u32 = 16;
-const DISPATCHES: usize = 8; // per timed batch
 const BATCHES: usize = 50;
 const WARMUP: Duration = Duration::from_secs(12);
+
+/// Dispatches recorded per timed submit (amortizes the CB-build + submit + fence
+/// overhead inside the wall-clock window). Env-overridable (`SG_BENCH_DISPATCHES`)
+/// so we can sweep it: if TFLOPS is flat across 1/8/32, the per-submit overhead is
+/// negligible and the wall clock ≈ GPU execution; if it climbs, overhead matters.
+fn dispatches() -> usize {
+    std::env::var("SG_BENCH_DISPATCHES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+}
+
+/// Shape + M from env (default down/256 = the original config). `SG_BENCH_SHAPE`
+/// = down|up, `SG_BENCH_M` = prefill chunk rows. The occupancy/bytes confirmation
+/// (STATUS 2026-06-21) sweeps the up shape and a second M for the basic vs
+/// basic_dir (LDS-scratch vs direct-store) A/B.
+fn config() -> (usize, usize, usize, &'static [(&'static str, &'static str, u32)]) {
+    let m: usize = std::env::var("SG_BENCH_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    match std::env::var("SG_BENCH_SHAPE").as_deref() {
+        Ok("up") => (m, 5376, 21504, VARIANTS_UP),
+        _ => (m, 21504, 5376, VARIANTS_DOWN),
+    }
+}
 
 /// Down-gemm variants under test — same shape/bindings, so the only difference
 /// is the kernel body + its tile decomposition (`m_block` = M-rows per
@@ -32,10 +54,39 @@ const WARMUP: Duration = Duration::from_secs(12);
 /// pre-prefetch kernel here, 2026-06-18); `s1` (single-buffered scale) is the
 /// standing occupancy A/B baseline (−2.1%); `occ` is the max-occupancy 1×1
 /// rewrite (16-row blocks → many waves/SIMD; the occupancy-vs-reuse test).
-const VARIANTS: &[(&str, &str, u32)] = &[
+const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     ("deployed (s2+pf)", "gemm_q4_0_i8_swz_m4n1_k21504_n5376", 64),
+    // basic: clean no-frills 4×1 (no β×2/prefetch/swizzle) — the readable baseline
+    // (STATUS 2026-06-21). How much do all the deployed optimizations actually buy?
+    ("basic", "gemm_q4_0_i8_basic_k21504_n5376", 64),
+    // basic with the three probed barriers removed (parity-redundant) — barrier
+    // perf cost A/B.
+    ("basic nobar", "gemm_q4_0_i8_basic_nobar_k21504_n5376", 64),
+    // basic with the direct f16-coopmat store epilogue (no LDS scratch) — epilogue
+    // A/B vs the LDS round-trip.
+    ("basic dir", "gemm_q4_0_i8_basic_dir_k21504_n5376", 64),
+    // basic with per-tile epilogue (EPI_TILES=1): higher occupancy, SAME coalesced
+    // store — isolates occupancy-thrash from the store pattern.
+    ("basic e1", "gemm_q4_0_i8_basic_e1_k21504_n5376", 64),
+    // PD=2: deeper weight prefetch (2 loads outstanding/wave) — the MLP A/B for
+    // the memory-latency-bound GEMM (+9 VGPR; STATUS 2026-06-21).
+    ("pd2", "gemm_q4_0_i8_swz_m4n1_pd2_k21504_n5376", 64),
+    // axpf: post-barrier hoist of X loads (proven moot — ACO already schedules it).
+    ("axpf", "gemm_q4_0_i8_swz_m4n1_axpf_k21504_n5376", 64),
+    // axpf2: CROSS-BARRIER X prefetch (issued before unpack+barrier) — the real
+    // attack on the fenced vmcnt stall (RGP 2026-06-21).
+    ("axpf2", "gemm_q4_0_i8_swz_m4n1_axpf2_k21504_n5376", 64),
     ("s1", "gemm_q4_0_i8_swz_m4n1_s1_k21504_n5376", 64),
     ("occ 1×1", "gemm_q4_0_i8_occ_k21504_n5376", 16),
+];
+
+/// Up shape (FFN gate/up, K=5376 N=21504) — the occupancy/bytes confirmation set:
+/// deployed reference + the basic (LDS scratch, 5/16 occ) vs basic_dir (direct
+/// store, 9/16 occ) A/B.
+const VARIANTS_UP: &[(&str, &str, u32)] = &[
+    ("deployed (s2+pf)", "gemm_q4_0_i8_swz_m4n1_k5376_n21504", 64),
+    ("basic", "gemm_q4_0_i8_basic_k5376_n21504", 64),
+    ("basic dir", "gemm_q4_0_i8_basic_dir_k5376_n21504", 64),
 ];
 
 fn sclk_mhz() -> String {
@@ -61,34 +112,44 @@ fn main() {
         eprintln!("skipping: no VK_KHR_cooperative_matrix");
         return;
     }
+    let (mdim, kdim, ndim, variants) = config();
+    let n_disp = dispatches();
 
     // int8 operands: Q4_0 weights (u32 words), Q8 activations (i8 packed u32),
     // f16 scales, f16 out. Dummy-filled — steady-state timing is data-independent.
     let w: Subbuffer<[u32]> = ctx
         .buffer_from_iter(
-            (0..(N * K / 32 * 18 / 4) as u32).map(|i| i.wrapping_mul(0x9E37_79B9)),
+            (0..(ndim * kdim / 32 * 18 / 4) as u32).map(|i| i.wrapping_mul(0x9E37_79B9)),
             BufferUsage::STORAGE_BUFFER,
         )
         .unwrap();
     let x = ctx
-        .new_buffer::<u32>((M * K / 4) as u64, BufferUsage::STORAGE_BUFFER)
+        .new_buffer::<u32>((mdim * kdim / 4) as u64, BufferUsage::STORAGE_BUFFER)
         .unwrap();
     let xs = ctx
-        .new_buffer::<u16>((M * K / 32) as u64, BufferUsage::STORAGE_BUFFER)
+        .new_buffer::<u16>((mdim * kdim / 32) as u64, BufferUsage::STORAGE_BUFFER)
         .unwrap();
     let y = ctx
-        .new_buffer::<u16>((M * N) as u64, BufferUsage::STORAGE_BUFFER)
+        .new_buffer::<u16>((mdim * ndim) as u64, BufferUsage::STORAGE_BUFFER)
         .unwrap();
 
-    let kernels: Vec<Kernel> = VARIANTS
+    let kernels: Vec<Kernel> = variants
         .iter()
-        .map(|(_, n, _)| ctx.load_kernel(n).expect(n))
+        .map(|(_, kn, _)| ctx.load_kernel(kn).expect(kn))
         .collect();
-    // Per-variant swizzled [M-blocks, N-blocks] grid (m_block differs: 64 for
-    // the 4×1 tile, 16 for the 1×1 occ kernel — both cover the full M×N).
-    let grids: Vec<[u32; 3]> = VARIANTS
+    // Per-variant grid (m_block differs: 64 for the 4×1 tile, 16 for the 1×1 occ
+    // kernel — both cover the full M×N). Swizzled kernels take [M-blocks,
+    // N-blocks]; the swizzle-less `basic` baseline takes the transposed
+    // [N-blocks, M-blocks] (wg.x=N, wg.y=M).
+    let grids: Vec<[u32; 3]> = variants
         .iter()
-        .map(|(_, _, mb)| [M as u32 / mb, N as u32 / N_BLOCK, 1])
+        .map(|(_, kern, mb)| {
+            if kern.contains("basic") {
+                [ndim as u32 / N_BLOCK, mdim as u32 / mb, 1]
+            } else {
+                [mdim as u32 / mb, ndim as u32 / N_BLOCK, 1]
+            }
+        })
         .collect();
     let sets: Vec<_> = kernels
         .iter()
@@ -108,13 +169,20 @@ fn main() {
         })
         .collect();
 
-    let run = |k: &Kernel, set: &std::sync::Arc<DescriptorSet>, grid: [u32; 3]| {
+    // GPU timestamps bracket the dispatches (BottomOfPipe→BottomOfPipe), so we
+    // can compare PURE on-GPU execution against the CPU wall clock and confirm the
+    // CB-build/submit overhead isn't in the number. `run` returns the GPU ns.
+    let timer = ctx.new_timer(2).expect("timer");
+    let run = |k: &Kernel, set: &std::sync::Arc<DescriptorSet>, grid: [u32; 3]| -> f64 {
         let mut b = AutoCommandBufferBuilder::primary(
             ctx.command_buffer_allocator().clone(),
             ctx.queue().queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
+        // SAFETY: pool not in use by a prior submit (we wait() below before reuse);
+        // BottomOfPipe orders the writes after all prior commands.
+        unsafe { b.reset_query_pool(timer.pool().clone(), 0..2) }.unwrap();
         b.bind_pipeline_compute(k.pipeline().clone())
             .unwrap()
             .bind_descriptor_sets(
@@ -124,10 +192,12 @@ fn main() {
                 set.clone(),
             )
             .unwrap();
-        for _ in 0..DISPATCHES {
+        unsafe { b.write_timestamp(timer.pool().clone(), 0, PipelineStage::BottomOfPipe) }.unwrap();
+        for _ in 0..n_disp {
             // SAFETY: swizzled [M-blocks, N-blocks] grid, the kernel's contract.
             unsafe { b.dispatch(grid) }.unwrap();
         }
+        unsafe { b.write_timestamp(timer.pool().clone(), 1, PipelineStage::BottomOfPipe) }.unwrap();
         b.build()
             .unwrap()
             .execute(ctx.queue().clone())
@@ -136,6 +206,8 @@ fn main() {
             .unwrap()
             .wait(None)
             .unwrap();
+        let ts = timer.read_ns().unwrap();
+        ts[1] - ts[0]
     };
 
     // Warm up to the boost clock (round-robin so no variant is favoured).
@@ -147,35 +219,46 @@ fn main() {
     }
     eprintln!("warmed up, sclk={}", sclk_mhz());
 
-    let flops = 2.0 * M as f64 * N as f64 * K as f64 * DISPATCHES as f64;
-    let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(BATCHES); VARIANTS.len()];
+    let flops = 2.0 * mdim as f64 * ndim as f64 * kdim as f64 * n_disp as f64;
+    // Per variant: wall-clock TFLOPS (CPU round-trip) and GPU-timestamp TFLOPS
+    // (BottomOfPipe interval). The two columns quantify the CB/submit overhead.
+    let mut wall: Vec<Vec<f64>> = vec![Vec::with_capacity(BATCHES); variants.len()];
+    let mut gpu: Vec<Vec<f64>> = vec![Vec::with_capacity(BATCHES); variants.len()];
     for _ in 0..BATCHES {
         for (i, ((k, s), &g)) in kernels.iter().zip(&sets).zip(&grids).enumerate() {
             let start = Instant::now();
-            run(k, s, g);
-            samples[i].push(flops / start.elapsed().as_secs_f64() / 1e12);
+            let gpu_ns = run(k, s, g);
+            wall[i].push(flops / start.elapsed().as_secs_f64() / 1e12);
+            gpu[i].push(flops / (gpu_ns / 1e9) / 1e12);
         }
     }
 
     eprintln!(
-        "int8 down-gemm steady-state ({BATCHES} interleaved batches × {DISPATCHES} dispatches), \
-         sclk={}:",
+        "int8 gemm steady-state K={kdim} N={ndim} M={mdim} ({BATCHES} batches × {n_disp} \
+         dispatches), sclk={}:",
         sclk_mhz()
     );
-    let median = |v: &mut Vec<f64>| {
+    let median = |v: &Vec<f64>| {
+        let mut v = v.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    let base = median(&mut samples[0].clone());
-    for (i, (label, _, _)) in VARIANTS.iter().enumerate() {
-        let mut s = samples[i].clone();
-        let med = median(&mut s);
-        let mean = s.iter().sum::<f64>() / s.len() as f64;
-        let sd = (s.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / s.len() as f64).sqrt();
+    let cv = |v: &Vec<f64>| {
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+        100.0 * sd / mean
+    };
+    let wall_base = median(&wall[0]);
+    let gpu_base = median(&gpu[0]);
+    eprintln!("  {:18} {:>22}   {:>22}", "", "wall (CPU round-trip)", "gpu (timestamps)");
+    for (i, (label, _, _)) in variants.iter().enumerate() {
+        let (wm, gm) = (median(&wall[i]), median(&gpu[i]));
         eprintln!(
-            "  {label:18} median {med:6.2} TFLOPS  cv {:.2}%  Δ vs deployed {:+.1}%",
-            100.0 * sd / mean,
-            100.0 * (med - base) / base,
+            "  {label:18} {wm:6.2} TFLOPS cv {:.2}% Δ{:+5.1}%   {gm:6.2} TFLOPS cv {:.2}% Δ{:+5.1}%",
+            cv(&wall[i]),
+            100.0 * (wm - wall_base) / wall_base,
+            cv(&gpu[i]),
+            100.0 * (gm - gpu_base) / gpu_base,
         );
     }
 }

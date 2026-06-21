@@ -206,6 +206,18 @@ pub struct GpuTimer {
 }
 
 impl GpuTimer {
+    /// The underlying query pool — for recording `reset_query_pool` /
+    /// `write_timestamp` directly into a raw command buffer (e.g. a microbench
+    /// timing a bare `AutoCommandBufferBuilder` rather than a `CommandGraph`).
+    pub fn pool(&self) -> &Arc<QueryPool> {
+        &self.pool
+    }
+
+    /// Number of queries in the pool.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
     /// Read all timestamps in nanoseconds (waits for availability). Only
     /// meaningful after the graph containing the writes has been submitted.
     pub fn read_ns(&self) -> Result<Vec<f64>, GpuError> {
