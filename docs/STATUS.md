@@ -35,10 +35,11 @@ occupancy ("use the worse epilogue") — it's L2-FRIENDLY high occupancy** (cach
 concurrently-resident waves share L2 residency). **NEXT: make `basic_dir` L2-friendly.**
 
 Also this session: deployed optimizations (β×2 + prefetch) are worth **~1.5×** (`basic` −32% vs
-deployed). ⚠ **CORRECTED 2026-06-21 (see "PD/AXPF NOT flat" below):** PD=2/AXPF were called **flat**
-here — that was a wall-clock/dispatch-overlap measurement artifact; on the fixed gpu-timestamp bench
-they reproducibly run **~+4%** over deployed. The "ACO already schedules the loads" story was attached
-to a non-result. **Single-wave `workgroupBarrier`s are redundant** (barrier probe: drop all 3 →
+deployed). PD=2/AXPF are **flat** (the original verdict; confirmed at PINNED 2900 MHz: axpf −0.0%,
+pd2 −0.5%, axpf2 −1.2% vs deployed, cv ~0.3% — "ACO already schedules the loads" was right). ⚠ A
+mid-session "they're ~+4%" correction was WRONG — it was measured at `auto` clock and was itself an
+**auto-clock artifact** (idled fclk/socclk + per-kernel DVFS). PIN THE CLOCK before any cross-kernel
+A/B. **Single-wave `workgroupBarrier`s are redundant** (barrier probe: drop all 3 →
 nrmse- and perf-identical; ACO elides the `s_barrier`). **coopStore needs scalar match** (f32 acc can't
 store to f16 y; naga fork) — coopLoad doesn't. **RGP single-dispatch durations are NOT
 cross-kernel-comparable** (idle-DVFS clock + thermal revert + isolated-vs-steady regime distort them
@@ -133,16 +134,17 @@ PF "+12 VGPR occupancy", hoist "hides the stall", axp3 "occupancy collapse") —
 trace/shaderstats reads. Outcomes are measured; trust the bench/ISA, not the causal story.
 See [[prefill-gemm-is-mlp-bound-not-byte-bound]], [[radv-shaderstats-vgpr-occupancy]].
 
-**PD/AXPF NOT flat — reproducibly ~+4% (2026-06-21).** The earlier "PD=2/AXPF flat" verdict (top of
-this section, and the multi-wave dead-end note) is **WRONG**. Re-A/B'd on the fixed bench (gpu
-timestamps, n_disp=1, round-robin, 3 runs @~2810 MHz auto): **axpf +4.1/+4.2/+3.8%**, **pd2
-+3.7/+4.1/+4.2%**, axpf2 ~+1.5%, all vs deployed, cv ~1–2%, drift ~0.4pp → outside noise. Likely the
-old "flat" was read off the **wall-clock** metric (still flat-looking for pd2 here: +1.5/−0.6/+1.7%,
-CB-build/submit jitter buries a 4% gpu win) and/or under the pre-fix dispatch-overlap regime. axpf/pd2
-are `deployed + one knob` → a potential **~+4% free win on the production prefill down-GEMM**, but it's
-one operating point (auto ~2810 MHz, isolated down-GEMM): confirm **pinned `high` + RGP (where does the
-+4% come from?) + up-shape + e2e** before touching the deployed kernel. See
-[[pd-axpf-not-flat-reproducible]], [[measure-before-declaring-dead]].
+**PD/AXPF are FLAT — the original verdict was right; my "+4%" was an auto-clock artifact (2026-06-21).**
+Mid-session I measured axpf/pd2 ~+4% at `auto` (~2810 MHz) and "corrected" the records to claim a win.
+That was WRONG. Re-A/B'd at **PINNED 2900 MHz** (gpu-timestamp, n_disp=1, round-robin, 3 runs, cv
+**0.25–0.45%**): **axpf −0.0% (flat), pd2 −0.5%, axpf2 −1.2%** vs deployed — no win, slight loss. The
++4% only appeared under `auto`, where idled fclk/socclk + per-kernel DVFS let the more memory-hungry
+prefetch variants ride a higher effective fabric clock — a clock artifact, not a kernel gain. `axpf`
+landing *exactly* on deployed (16.18 vs 16.18) confirms the original "ACO already schedules the loads"
+explanation. **Lesson: PIN THE CLOCK before any cross-kernel A/B** (I have a memory saying exactly this
+and didn't apply it to my own claim — [[pin-perf-level-high-fabric-clock-idles-under-auto]]). Nothing
+this session beats deployed at the real operating point. See [[pd-axpf-flat-at-pinned-clock]],
+[[measure-before-declaring-dead]].
 
 **f16 scale staging — NEUTRAL (2026-06-21).** The rescale rows (`dw2` weight-block d's, `da_l`
 activation d_a's) were staged as **f32** in LDS though both sources are f16. A/B'd staging them at
