@@ -43,6 +43,11 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         "gemm_q4_0_i8_l2_b4_b2" => (21504, 5376, 16, 64, true, false),   // 4×1, BN_SB=4 + β×2 (best l2)
         "gemm_q4_0_i8_l2_b4_pf_b2" => (21504, 5376, 16, 64, true, false), // + prefetch (worse)
         "gemm_q4_0_i8_l2_b4_b2_sf16" => (21504, 5376, 16, 64, true, false), // + f16 scale staging
+        "gemm_q4_0_i8_l2_b4_b2_pf5" => (21504, 5376, 16, 64, true, false), // + minimal-fetch prefetch (PFW=5)
+        "gemm_q4_0_i8_l2_b4_b2_axp" => (21504, 5376, 16, 64, true, false), // + activation prefetch (hoist)
+        "gemm_q4_0_i8_l2_b4_b2_axp2" => (21504, 5376, 16, 64, true, false), // + activation prefetch (cross-iter)
+        "gemm_q4_0_i8_l2_b4_b2_axp3" => (21504, 5376, 16, 64, true, false), // + activation prefetch (cross-iter, double-buffered)
+        "gemm_q4_0_i8_l2_axp4" => (21504, 5376, 16, 64, true, false), // static-unroll ping-pong
         "gemm_q4_0_i8_l2_m8" => (21504, 5376, 16, 128, true, false),     // 8×1 (M_ROWS=128)
         "gemm_q4_0_i8_l2_m8_b4" => (21504, 5376, 16, 128, true, false),  // 8×1, BN_SB=4
         // PD=2 (deeper weight prefetch) A/B vs the deployed 4×1 — the MLP lever for

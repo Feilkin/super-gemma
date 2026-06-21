@@ -36,11 +36,26 @@ const NB_M: u32 = M_TOTAL / M_ROWS;   // 4 M-blocks (tile grid is NB_N × NB_M)
 // Adds MLP (the lever — the GEMM is MLP-bound), occupancy-cheap (9 regs, not a
 // whole accumulator set).
 const PF: u32 = #{PF}u;
+// Prefetch words (only meaningful when PF=1). Full PF (PFW=9) prefetches the whole
+// next pair → +9 live VGPR/wave, which drops occupancy enough to lose net (b4_pf_b2
+// 12.97 < b4_b2 14.71). MINIMAL-FETCH (PFW=5) prefetches only block β's 5 words (the
+// first-consumed) and inline-loads block β+1's 4 words (w5..8) — issued at the top of
+// the iter so their latency overlaps block β's dequant (β+1 is unpacked second). Hides
+// the head of the 0x124 weight-load stall at ~half the prefetch VGPR. PFW∈[5,9].
+const PFW: u32 = #{PFW}u;
 // β×2 WMMA-ILP. 0 = process the pair's two blocks sequentially (one accumulator).
 // 1 = interleave both blocks' MMAs (acc0 + acc1 updated together) so independent
 // WMMAs hide each other's latency — the deployed kernel's ILP. Costs a 2nd
 // accumulator set (VGPR → occupancy); the A/B vs occupancy is the point.
 const B2: u32 = #{B2}u;
+// Activation prefetch (β×2 path only). The trace shows the binding stall is the
+// before-WMMA `s_waitcnt vmcnt` on the X (activation) global loads — weights are in
+// LDS by then, so the only VMEM the WMMA waits on is X. 0 = load each a-fragment
+// inline right before its MMA (today). 1 = HOIST: issue ALL of this K-iter's
+// activation coopLoadTs up front (max in-flight before any MMA), then consume them
+// from registers — the l2 analogue of the deployed kernel's AXPF (+4%). Costs ~16
+// i8 fragments of VGPR; the A/B is whether earlier-in-flight X beats that.
+const AXP: u32 = #{AXP_L2}u;
 
 // THE L2-SCHEDULING KNOB. Map a linear workgroup id → (n_block, m_block); the
 // launch-order-consecutive ids are the co-resident window. 2D super-block walk:
@@ -105,25 +120,63 @@ fn main(
         yacc[i] = zero_f;
     }
 
-    // PF=1 prologue: prefetch block-pair 0's words into registers.
-    var w_next: array<u32, 9>;
+    // PF=1 prologue: prefetch block-pair 0's first PFW words into registers.
+    var w_next: array<u32, PFW>;
     if (PF == 1u && lid < N_COLS) {
         let wb0 = (n0 + lid) * ROW_WORDS;
-        for (var i = 0u; i < 9u; i += 1u) {
+        for (var i = 0u; i < PFW; i += 1u) {
             w_next[i] = weights[wb0 + i];
+        }
+    }
+
+    // AXP=2 cross-iter activation pipeline: hold the CURRENT K-iter's X fragments in
+    // registers (prefetched a whole iteration ahead), so the before-WMMA vmcnt is
+    // satisfied — the loads had the prior iter's dequant+MMA+rescale to arrive.
+    // Prologue prefetches β=0's fragments.
+    var xp0: array<coop_mat16x16<i8, A>, 2u * M_TILES>;
+    var xp1: array<coop_mat16x16<i8, A>, 2u * M_TILES>;
+    if (AXP == 2u) {
+        for (var s = 0u; s < 2u; s += 1u) {
+            for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                xp0[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + s * 16u], K);
+                xp1[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + 32u + s * 16u], K);
+            }
+        }
+    }
+    // AXP=3 = AXP=2 but DOUBLE-BUFFERED: two physical fragment buffers, the current one
+    // selected by β-parity via a uniform dynamic index (no branch around coop ops, no
+    // register rotation → kills the v_swap reconciliation axp2 pays). Reload targets the
+    // OTHER buffer, so its loads never alias the buffer the MMA is reading. Holds 2× the
+    // fragments (4·M_TILES). Prologue loads buffer 0 (β=0's parity).
+    var xpd0: array<coop_mat16x16<i8, A>, 4u * M_TILES>;
+    var xpd1: array<coop_mat16x16<i8, A>, 4u * M_TILES>;
+    if (AXP == 3u) {
+        for (var s = 0u; s < 2u; s += 1u) {
+            for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                xpd0[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + s * 16u], K);
+                xpd1[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + 32u + s * 16u], K);
+            }
         }
     }
 
     for (var beta = 0u; beta < NB; beta += 2u) {
         var w: array<u32, 9>; // this pair's words (consumed by the unpack below)
         if (PF == 1u) {
-            for (var i = 0u; i < 9u; i += 1u) {
-                w[i] = w_next[i]; // consume the prefetched pair (element copy)
+            if (lid < N_COLS && PFW < 9u) {
+                // inline-load the words NOT prefetched (w[PFW..9]); issued FIRST so
+                // their round-trip overlaps the dequant of the prefetched head.
+                let wp = (n0 + lid) * ROW_WORDS + (beta / 2u) * 9u;
+                for (var i = PFW; i < 9u; i += 1u) {
+                    w[i] = weights[wp + i];
+                }
+            }
+            for (var i = 0u; i < PFW; i += 1u) {
+                w[i] = w_next[i]; // consume the prefetched head (register copy)
             }
             if (lid < N_COLS && beta + 2u < NB) {
                 let wp = (n0 + lid) * ROW_WORDS + ((beta + 2u) / 2u) * 9u;
-                for (var i = 0u; i < 9u; i += 1u) {
-                    w_next[i] = weights[wp + i]; // issue next pair's load now
+                for (var i = 0u; i < PFW; i += 1u) {
+                    w_next[i] = weights[wp + i]; // issue next pair's prefetch now
                 }
             }
         } else if (lid < N_COLS) {
@@ -156,14 +209,83 @@ fn main(
                 acc1[mt] = zero_i;
             }
             let k0 = beta * 32u;
-            for (var s = 0u; s < 2u; s += 1u) {
-                let bt0 = coopLoad<coop_mat16x16<i8, B>>(&wb[s * 16u], 64u);
-                let bt1 = coopLoad<coop_mat16x16<i8, B>>(&wb[32u + s * 16u], 64u);
-                for (var mt = 0u; mt < M_TILES; mt += 1u) {
-                    let a0 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
-                    let a1 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
-                    acc0[mt] = coopMultiplyAdd(a0, bt0, acc0[mt]);
-                    acc1[mt] = coopMultiplyAdd(a1, bt1, acc1[mt]);
+            if (AXP == 1u) {
+                // Hoist: issue every activation load for this K-iter up front so they
+                // are all in flight before any MMA, then consume from registers — the
+                // before-WMMA vmcnt stall now waits on a fully-issued batch, not a
+                // just-issued one. Holds 2·M_TILES a0 + 2·M_TILES a1 fragments.
+                var av0: array<coop_mat16x16<i8, A>, 2u * M_TILES>;
+                var av1: array<coop_mat16x16<i8, A>, 2u * M_TILES>;
+                for (var s = 0u; s < 2u; s += 1u) {
+                    for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                        av0[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
+                        av1[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
+                    }
+                }
+                for (var s = 0u; s < 2u; s += 1u) {
+                    let bt0 = coopLoad<coop_mat16x16<i8, B>>(&wb[s * 16u], 64u);
+                    let bt1 = coopLoad<coop_mat16x16<i8, B>>(&wb[32u + s * 16u], 64u);
+                    for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                        acc0[mt] = coopMultiplyAdd(av0[s * M_TILES + mt], bt0, acc0[mt]);
+                        acc1[mt] = coopMultiplyAdd(av1[s * M_TILES + mt], bt1, acc1[mt]);
+                    }
+                }
+            } else if (AXP == 2u) {
+                // Cross-iter: consume this iter's prefetched fragments, THEN reload
+                // xp0/xp1 with the NEXT iter's X — issued after the MMAs so the load
+                // latency hides behind the rescale + next iter's weight load/dequant/
+                // barrier. Single-buffered (16 frags): the MMA reads xp0/xp1 (loaded
+                // last iter → already arrived), so the before-WMMA vmcnt is a no-op.
+                for (var s = 0u; s < 2u; s += 1u) {
+                    let bt0 = coopLoad<coop_mat16x16<i8, B>>(&wb[s * 16u], 64u);
+                    let bt1 = coopLoad<coop_mat16x16<i8, B>>(&wb[32u + s * 16u], 64u);
+                    for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                        acc0[mt] = coopMultiplyAdd(xp0[s * M_TILES + mt], bt0, acc0[mt]);
+                        acc1[mt] = coopMultiplyAdd(xp1[s * M_TILES + mt], bt1, acc1[mt]);
+                    }
+                }
+                // Unconditional reload (coop ops need uniform flow → no beta guard).
+                // Clamp k0n to the last valid pair so the final iteration's reload
+                // reads in-bounds garbage into xp0/xp1 that the (ended) loop never uses.
+                let k0n = min(k0 + 64u, (NB - 2u) * 32u);
+                for (var s = 0u; s < 2u; s += 1u) {
+                    for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                        xp0[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0n + s * 16u], K);
+                        xp1[s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0n + 32u + s * 16u], K);
+                    }
+                }
+            } else if (AXP == 3u) {
+                // Double-buffered: cur = β-parity buffer (loaded last iter, ready),
+                // nxt = the other. Issue next iter's loads into nxt (in flight, no alias
+                // with cur), then MMA from cur — no rotation, no swaps. cur/nxt are
+                // uniform (β-derived), so the array index is a uniform select.
+                let cur = ((beta >> 1u) & 1u) * (2u * M_TILES);
+                let nxt = (2u * M_TILES) - cur;
+                let k0n = min(k0 + 64u, (NB - 2u) * 32u);
+                for (var s = 0u; s < 2u; s += 1u) {
+                    for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                        xpd0[nxt + s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0n + s * 16u], K);
+                        xpd1[nxt + s * M_TILES + mt] = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0n + 32u + s * 16u], K);
+                    }
+                }
+                for (var s = 0u; s < 2u; s += 1u) {
+                    let bt0 = coopLoad<coop_mat16x16<i8, B>>(&wb[s * 16u], 64u);
+                    let bt1 = coopLoad<coop_mat16x16<i8, B>>(&wb[32u + s * 16u], 64u);
+                    for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                        acc0[mt] = coopMultiplyAdd(xpd0[cur + s * M_TILES + mt], bt0, acc0[mt]);
+                        acc1[mt] = coopMultiplyAdd(xpd1[cur + s * M_TILES + mt], bt1, acc1[mt]);
+                    }
+                }
+            } else {
+                for (var s = 0u; s < 2u; s += 1u) {
+                    let bt0 = coopLoad<coop_mat16x16<i8, B>>(&wb[s * 16u], 64u);
+                    let bt1 = coopLoad<coop_mat16x16<i8, B>>(&wb[32u + s * 16u], 64u);
+                    for (var mt = 0u; mt < M_TILES; mt += 1u) {
+                        let a0 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + s * 16u], K);
+                        let a1 = coopLoadT<coop_mat16x16<i8, A>>(&x[(m0 + mt * 16u) * K + k0 + 32u + s * 16u], K);
+                        acc0[mt] = coopMultiplyAdd(a0, bt0, acc0[mt]);
+                        acc1[mt] = coopMultiplyAdd(a1, bt1, acc1[mt]);
+                    }
                 }
             }
             for (var u = 0u; u < 2u; u += 1u) {

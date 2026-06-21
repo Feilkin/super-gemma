@@ -962,6 +962,65 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // Activation prefetch (AXP=1: hoist all this-iter X loads before the MMAs) on the
+    // best combo — attacks the binding before-WMMA vmcnt stall on X. A/B vs b4_b2.
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4_b2_axp",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4), ("B2", 1), ("AXP_L2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // AXP=2: cross-iter activation pipeline (prefetch next β's X a whole iter ahead).
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4_b2_axp2",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4), ("B2", 1), ("AXP_L2", 2)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // AXP=3: cross-iter, DOUBLE-BUFFERED (β-parity buffer select) — kills axp2's swaps.
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4_b2_axp3",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4), ("B2", 1), ("AXP_L2", 3)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // axp4: static-unroll ping-pong (dedicated file) — double-buffered X prefetch
+    // with two named buffers, step-by-4, no dynamic index / no swaps.
+    Variant {
+        name: "gemm_q4_0_i8_l2_axp4",
+        src: "gemm_q4_0_i8_l2_axp4",
+        defs: &[],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Minimal-fetch prefetch (PFW=5: prefetch block β only, inline-load β+1) on the
+    // best combo — hides the 0x124 weight-load stall at ~half the prefetch VGPR of
+    // full PF. A/B vs b4_b2 (no PF) and b4_pf_b2 (full PF).
+    Variant {
+        name: "gemm_q4_0_i8_l2_b4_b2_pf5",
+        src: "gemm_q4_0_i8_l2",
+        defs: &[("BN_SB", 4), ("PF", 1), ("PFW", 5), ("B2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // f16 scale staging on the best combo (BN_SB=4, β×2): stage dw2/da_l at native
     // f16 width instead of f32, convert per-fragment to f32 before the multiply. A/B
     // vs b4_b2 — LDS isn't the occupancy limiter here, so this probes whether it matters.
@@ -2456,8 +2515,14 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         substituted = substituted.replace("#{M_TILES}", "4");
         // gemm_q4_0_i8_l2 reads `#{PF}` (weight prefetch); default 0 (inline load).
         substituted = substituted.replace("#{PF}", "0");
+        // gemm_q4_0_i8_l2 reads `#{PFW}` (words prefetched/pair when PF=1); default 9
+        // (full pair). 5 = minimal-fetch (block β only, β+1 inline). Only 5..9 valid.
+        substituted = substituted.replace("#{PFW}", "9");
         // gemm_q4_0_i8_l2 reads `#{B2}` (β×2 WMMA-ILP interleave); default 0.
         substituted = substituted.replace("#{B2}", "0");
+        // gemm_q4_0_i8_l2 reads `#{AXP_L2}` (activation prefetch in the β×2 path);
+        // default 0 (inline a-loads). 1 = hoist all this-iter X loads before the MMAs.
+        substituted = substituted.replace("#{AXP_L2}", "0");
         // gemm_q4_0_i8_l2 scale-staging type: SF16=1 → stage the f16-sourced scales
         // as f16 in LDS and f32()-convert each fragment before the f32 multiply;
         // default (SF16 absent/0) keeps them f32 (SCALE_CVT empty — read is already

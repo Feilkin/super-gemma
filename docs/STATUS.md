@@ -66,11 +66,16 @@ effective BW 45 vs 169 GB/s) → the GEMM is **MLP/latency-bound, NOT byte-bound
 **β×2 is the dominant lever (2026-06-21).** On l2 (4×1, BN_SB=4, down M=256, gpu): b4 10.99 →
 +prefetch (`PF`) 11.39 (+5.7%) → **+β×2 (`B2`, no PF) 14.71 (+34%!)** → β×2+PF 12.97 (WORSE). So β×2
 WMMA-ILP is the biggest single lever, and prefetch SUBSTITUTES for it (hides the same latency → PF on
-top of β×2 just costs +12 VGPR/occupancy and hurts). Best l2 = `b4_b2` (β×2, no prefetch) = **14.71,
+top of β×2 hurts). ⚠ **CORRECTED 2026-06-21:** this is NOT an occupancy/VGPR cost — measured (ACO
+shaderstats) `b4_b2`, `b4_pf_b2`, `pf5` are **all 96 VGPR, 0 spill, identical occupancy** (the earlier
+"+12 VGPR" was β×2-vs-baseline, mis-applied to PF-on-top, which is +0). PF's slowdown is the
+`s_cbranch_execz` guard / scheduling, not occupancy. Best l2 = `b4_b2` (β×2, no prefetch) = **14.71,
 within 9% of deployed 16.21** (arc: 7.4 thrashing → 14.71). The high-occ + L2-schedule + β×2 path
-reaches deployed's neighborhood but doesn't beat it; the last 9% is deployed's low-occ(3/16)+β×2+PF+
-swizzle (PF helps it at 3/16, hurts us at 9/16). Prefetch's `lid<N_COLS && beta+2<NB` guard adds an
-`s_cbranch_execz` stall (~930K clk) — branchless prefetch is a parked lever.
+reaches deployed's neighborhood but doesn't beat it. Deployed differs on more than one axis
+(low-occ + β×2 + full PF + swizzle); measured VGPR: deployed **168** (→ low occupancy) vs l2 **96**, so
+the cross-kernel occupancy gap is real and VGPR-driven — but that does NOT explain PF hurting *within*
+l2 (all l2 variants 96 VGPR). Prefetch's `lid<N_COLS && beta+2<NB` guard adds an `s_cbranch_execz`
+stall (~930K clk) — the leading candidate for PF's l2 slowdown; branchless prefetch is a parked lever.
 
 **Pinned-clock verdict + next lever (2026-06-21).** At 2900 MHz: deployed **16.29** vs best l2
 `b4_b2` **14.36 (deployed +12%)**; BN_SB=4 stays optimal with β×2 (sb1/2/8 worse). Clock-crossing is
@@ -91,6 +96,34 @@ the execz stall was a red herring for throughput. **Lever is dead; code reverted
 note: u32 is already the right weight-load width (4-byte alignment → wide `b96`/`b128`); narrowing to
 u16/u8 only de-vectorizes. The real prologue lever, if any, is hiding the `s_waitcnt` (prefetch), not
 lane-count or element width. See [[prefill-gemm-is-mlp-bound-not-byte-bound]].
+
+**Activation prefetch — the lever that WORKS; best l2 now `axp4` +5.0% (2026-06-21).** RGP of l2_b4_b2
+showed the binding stall is the before-WMMA `s_waitcnt vmcnt` on the **X (activation)** global loads
+(weights are in LDS by then), NOT weights — which is why every weight-side lever above failed (wrong
+stall). Attacking X (β×2 path, down M=256, gpu-timestamp, all parity nrmse 0.0, vs b4_b2 ~14.7 / deployed
+~16.4):
+- `AXP=1` **within-iter hoist** (issue all 16 X coopLoadTs up front): **+3.5%**, 108 VGPR. ISA: the
+  before-WMMA stall is UNCHANGED; the real gain is a cleaner wmma stream (b4_b2 defers 3 X loads
+  mid-stream; hoist issues all 16 → uninterrupted MMAs). Cheap, affordable.
+- `AXP=2` cross-iter single-buffer (consume-then-reload same array): **−6%**, 144 VGPR. Removes the
+  pre-wmma X stall but ACO rotates reloaded frags into home regs via `v_swap_b32`, dragging the reload
+  `vmcnt` back onto the critical path.
+- `AXP=3` cross-iter double-buffer via **uniform dynamic index** (β-parity): **−43%**, 228 VGPR. Kills
+  the swaps (0) BUT registers aren't addressable → ACO materialized select-chains → **8× instructions
+  (4821 vs ~640)**. At 3/16 (deployed-equal) occupancy, so the killer is instruction count, not occupancy.
+- **`gemm_q4_0_i8_l2_axp4` = cross-iter double-buffer via STATIC UNROLL** (dedicated file; step β by 4,
+  two named buffers A/B swap current/next across two sub-iters → every index compile-time constant).
+  **+5.0% vs b4_b2, ~+1.9% over the hoist, within ~5.6% of deployed — the best l2 of the session.**
+  180 VGPR, 1510 instrs (no explosion), 46 residual swaps. So cross-iter X prefetch IS viable; axp3's
+  −43% was specifically the dynamic index, exactly as its trace showed.
+
+**Lever ladder, fully mapped:** weight-side (PF/cooperative-dequant/minimal-fetch) all dead → wrong stall;
+activation hoist +3.5%; activation cross-iter static-ping-pong **+5.0% (best)**; cross-iter single-buf
+(swaps) / dynamic-index (8× instrs) dead. f16 scale staging neutral [[scale-staging-width-neutral-vgpr-bound]].
+NB: I mis-asserted the *mechanism* repeatedly this session (cooperative-dequant "execz is bottleneck",
+PF "+12 VGPR occupancy", hoist "hides the stall", axp3 "occupancy collapse") — each falsified by Ada's
+trace/shaderstats reads. Outcomes are measured; trust the bench/ISA, not the causal story.
+See [[prefill-gemm-is-mlp-bound-not-byte-bound]], [[radv-shaderstats-vgpr-occupancy]].
 
 **PD/AXPF NOT flat — reproducibly ~+4% (2026-06-21).** The earlier "PD=2/AXPF flat" verdict (top of
 this section, and the multi-wave dead-end note) is **WRONG**. Re-A/B'd on the fixed bench (gpu

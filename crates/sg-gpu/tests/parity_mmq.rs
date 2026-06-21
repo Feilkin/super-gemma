@@ -362,6 +362,11 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         ("gemm_q4_0_i8_l2_b4_b2", 64u32), // β×2 interleave
         ("gemm_q4_0_i8_l2_b4_pf_b2", 64u32), // prefetch + β×2 (full combo)
         ("gemm_q4_0_i8_l2_b4_b2_sf16", 64u32), // f16 scale staging
+        ("gemm_q4_0_i8_l2_b4_b2_pf5", 64u32), // minimal-fetch prefetch (PFW=5)
+        ("gemm_q4_0_i8_l2_b4_b2_axp", 64u32), // activation prefetch (hoist)
+        ("gemm_q4_0_i8_l2_b4_b2_axp2", 64u32), // activation prefetch (cross-iter)
+        ("gemm_q4_0_i8_l2_b4_b2_axp3", 64u32), // activation prefetch (cross-iter, double-buffered)
+        ("gemm_q4_0_i8_l2_axp4", 64u32), // static-unroll ping-pong (dedicated file)
     ] {
         let got = run(variant, [nb_n * (m as u32 / m_rows), 1, 1]);
         let err = nrmse(&got, &want);
