@@ -105,6 +105,24 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     ("axpf2", "gemm_q4_0_i8_swz_m4n1_axpf2_k21504_n5376", 64),
     ("s1", "gemm_q4_0_i8_swz_m4n1_s1_k21504_n5376", 64),
     ("occ 1×1", "gemm_q4_0_i8_occ_k21504_n5376", 16),
+    // Full-occupancy small-tile family (gemm_q4_0_i8_fo): 0-stride scales + direct
+    // coopStore + minimal LDS → ~11/16 waves at 60 VGPR (the occ footprint) but
+    // with 2× weight reuse (m2) and no barrier-serializing LDS stage/epilogue. The
+    // occupancy-vs-deployed-ILP A/B; sweep tile height, ILP, prefetch, barriers.
+    ("fo m2", "gemm_q4_0_i8_fo", 32),
+    ("fo m1", "gemm_q4_0_i8_fo_m1", 16),
+    ("fo m4", "gemm_q4_0_i8_fo_m4", 64),
+    ("fo m2 b2", "gemm_q4_0_i8_fo_m2_b2", 32),
+    ("fo m1 b2", "gemm_q4_0_i8_fo_m1_b2", 16),
+    ("fo m2 pd1", "gemm_q4_0_i8_fo_m2_pd1", 32),
+    // d_a activation-scale hoist (SXP): the post-WMMA 16-bit x_scales load stalls
+    // ~2K clk (RGP); hoist it to the top of the β-iter to overlap with the WMMAs.
+    ("fo m2 sxp", "gemm_q4_0_i8_fo_m2_sxp", 32),
+    ("fo m2 b2 sxp", "gemm_q4_0_i8_fo_m2_b2_sxp", 32),
+    ("fo m1 b2 sxp", "gemm_q4_0_i8_fo_m1_b2_sxp", 16),
+    // "Bigboy": fully hand-unrolled, all loads batched → one stall/iter (low occ).
+    ("bb", "gemm_q4_0_i8_bb", 32),
+    ("bb pf", "gemm_q4_0_i8_bb_pf", 32),
 ];
 
 /// Up shape (FFN gate/up, K=5376 N=21504) — the occupancy/bytes confirmation set:

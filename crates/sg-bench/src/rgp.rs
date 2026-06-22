@@ -67,6 +67,21 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         // A/B against the deployed 4×1 down-gemm (mmq_variance −47.8%; this trace
         // confirms it reached high occupancy yet lost — STATUS rank #2).
         "gemm_q4_0_i8_occ_k21504_n5376" => (21504, 5376, 16, 16, true, true), // FFN down, 1×1
+        // Full-occupancy GEMM (gemm_q4_0_i8_fo) — small-tile, plain [M-blocks,
+        // N-blocks] dispatch (swz convention). mb = M_TILES·16; the occupancy A/B
+        // against the deployed 4×1 (read VGPR/waves here, time on mmq_variance).
+        "gemm_q4_0_i8_fo" => (21504, 5376, 16, 32, true, true),          // M_TILES=2
+        "gemm_q4_0_i8_fo_m1" => (21504, 5376, 16, 16, true, true),       // M_TILES=1
+        "gemm_q4_0_i8_fo_m4" => (21504, 5376, 16, 64, true, true),       // M_TILES=4
+        "gemm_q4_0_i8_fo_m1_b2" => (21504, 5376, 16, 16, true, true),
+        "gemm_q4_0_i8_fo_m2_b2" => (21504, 5376, 16, 32, true, true),
+        "gemm_q4_0_i8_fo_m2_pd1" => (21504, 5376, 16, 32, true, true),
+        "gemm_q4_0_i8_fo_m2_sxp" => (21504, 5376, 16, 32, true, true),    // d_a hoist
+        "gemm_q4_0_i8_fo_m2_b2_sxp" => (21504, 5376, 16, 32, true, true), // β×2 + d_a hoist
+        "gemm_q4_0_i8_fo_m1_b2_sxp" => (21504, 5376, 16, 16, true, true),
+        // "Bigboy" fully-unrolled FO (M_TILES=2): all loads in one batch, one stall/iter.
+        "gemm_q4_0_i8_bb" => (21504, 5376, 16, 32, true, true),
+        "gemm_q4_0_i8_bb_pf" => (21504, 5376, 16, 32, true, true), // bb + weight prefetch
         // Multi-wave occupancy GEMM (one 16×16 tile/wave, shared LDS weight strip).
         // n-block = BN, m-block = BM; swizzled like the deployed 4×1. The down-shape
         // family A/Bs the deployed m4n1 down-gemm; b41 up matches the gate/up site.

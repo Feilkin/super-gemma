@@ -375,6 +375,28 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         assert_close(&got, &want, 1e-4, 1e-4, variant);
     }
 
+    // Full-occupancy kernel (gemm_q4_0_i8_fo) — plain 2D [M-blocks, N-blocks] grid
+    // (wg.x = m_block, wg.y = n_block), tile height M_ROWS = M_TILES·16. Must
+    // reproduce basic_dir for every tiling / ILP / prefetch / barrier toggle.
+    for (variant, m_rows) in [
+        ("gemm_q4_0_i8_fo", 32u32),          // M_TILES=2 (headline)
+        ("gemm_q4_0_i8_fo_m1", 16u32),       // 1×1
+        ("gemm_q4_0_i8_fo_m4", 64u32),       // 4×1
+        ("gemm_q4_0_i8_fo_m1_b2", 16u32),    // β×2 ILP
+        ("gemm_q4_0_i8_fo_m2_b2", 32u32),    // β×2 ILP
+        ("gemm_q4_0_i8_fo_m2_pd1", 32u32),   // weight prefetch
+        ("gemm_q4_0_i8_fo_m2_sxp", 32u32),   // activation-scale hoist
+        ("gemm_q4_0_i8_fo_m2_b2_sxp", 32u32), // β×2 + scale hoist
+        ("gemm_q4_0_i8_fo_m1_b2_sxp", 16u32),
+        ("gemm_q4_0_i8_bb", 32u32),          // fully-unrolled bigboy
+        ("gemm_q4_0_i8_bb_pf", 32u32),       // bb + weight prefetch
+    ] {
+        let got = run(variant, [m as u32 / m_rows, nb_n, 1]);
+        let err = nrmse(&got, &want);
+        eprintln!("{variant} vs basic_dir nrmse {err:.8}");
+        assert_close(&got, &want, 1e-4, 1e-4, variant);
+    }
+
     // Deployed swz down (4×1, SWIZZLE=1 → 2D [M-blocks, N-blocks]) and its EPI=1
     // direct-coopStore epilogue: EPI only changes the y store path, so the epi
     // variant must be BIT-IDENTICAL to the deployed kernel.

@@ -1233,6 +1233,136 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // FULL-OCCUPANCY GEMM (gemm_q4_0_i8_fo) — FFN-down shape only (K=21504,
+    // N=5376), plain [M-blocks, N-blocks] dispatch (no swizzle). Lean small-tile
+    // design: 0-stride scale rescale + direct coopStore epilogue + minimal LDS →
+    // many waves/SIMD, the latency hidden by wave-switching instead of the
+    // deployed kernel's in-wave ILP. Sweep the occupancy↔ILP frontier:
+    // M_TILES (tile height) × B2 (β×2 ILP) × PD (weight prefetch). The headline
+    // `fo` is M_TILES=2, no ILP, no prefetch (pure occupancy). mb (M_ROWS) for the
+    // dispatch grid = M_TILES·16.
+    Variant {
+        name: "gemm_q4_0_i8_fo",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 2)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_fo_m1",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_fo_m4",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 4)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // β×2 ILP on each tile height (expected to regress once occupancy is high).
+    Variant {
+        name: "gemm_q4_0_i8_fo_m1_b2",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 1), ("B2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_fo_m2_b2",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 2), ("B2", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Single-ahead weight prefetch on the headline tile (cheap MLP A/B).
+    Variant {
+        name: "gemm_q4_0_i8_fo_m2_pd1",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 2), ("PD", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Activation-scale hoist (SXP=1): issue the per-block d_a load at the top of the
+    // β-iter so its ~2K-clk latency overlaps the WMMAs instead of stalling the
+    // rescale (RGP: the lone 16-bit x_scales load stalls as hard as the X loads).
+    Variant {
+        name: "gemm_q4_0_i8_fo_m2_sxp",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 2), ("SXP", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_fo_m2_b2_sxp",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 2), ("B2", 1), ("SXP", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_fo_m1_b2_sxp",
+        src: "gemm_q4_0_i8_fo",
+        defs: &[("M_TILES", 1), ("B2", 1), ("SXP", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // "BIGBOY" fully-unrolled FO (gemm_q4_0_i8_bb) — FFN-down shape, M_TILES=2, no
+    // knobs. Every inner loop hand-unrolled so all of an iteration's global loads
+    // (9 distinct-register weight words + 8 activation fragments + 2 d_a scales)
+    // issue as one batch → a single vmcnt stall/iter, paid for in occupancy.
+    Variant {
+        name: "gemm_q4_0_i8_bb",
+        src: "gemm_q4_0_i8_bb",
+        defs: &[],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // bb + weight prefetch (PF=1): the bb trace showed the lone remaining stall is
+    // the weight load — software-pipeline it (next pair's words issued in this
+    // iter's batch) so it lands behind the WMMAs. Tests "weights are now the stall".
+    Variant {
+        name: "gemm_q4_0_i8_bb_pf",
+        src: "gemm_q4_0_i8_bb",
+        defs: &[("PF", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // MULTI-WAVE occupancy GEMM (gemm_q4_0_i8_mw) — TESTED DEAD END (2026-06-21),
     // kept as documented A/B baselines like gemm_q4_0_i8_occ; NOT in any graph. A
     // workgroup of BM_TILES·BN_TILES waves, ONE 16×16 tile per wave, sharing the
@@ -2565,6 +2695,13 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         substituted = substituted.replace("#{SCALE_CVT}", scale_cvt);
         // gemm_q4_0_i8_l2_axp4 reads `#{WPF}` (weight prefetch on the ping-pong); default 0.
         substituted = substituted.replace("#{WPF}", "0");
+        // gemm_q4_0_i8_fo reads `#{PD}` (weight prefetch depth, 0/1); default 0
+        // (inline load). It also reuses `#{M_TILES}` (default 4, the occupancy knob)
+        // and `#{B2}` (default 0). It has no barriers (WG=64 single-wave).
+        substituted = substituted.replace("#{PD}", "0");
+        // gemm_q4_0_i8_fo reads `#{SXP}` (hoist the d_a activation-scale load to the
+        // top of the β-iter so its memory latency hides behind the WMMAs); default 0.
+        substituted = substituted.replace("#{SXP}", "0");
         naga::front::wgsl::parse_str(&substituted)
             .unwrap_or_else(|e| panic!("parse {display}: {}", e.emit_to_string(&substituted)))
     } else {

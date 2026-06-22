@@ -1,13 +1,72 @@
 # STATUS — read this first
 
-Last updated: **2026-06-21** (MALL probe → "86% BW-bound" is dead, GEMM is memory-latency-bound;
-occupancy→L2-thrash cleanly isolated; `mmq_variance` now GPU-timestamped + round-robin),
-working on the Framework Desktop target box. The conversation history that produced this repo is gone;
-everything needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
+Last updated: **2026-06-23** (full-occupancy GEMM family `fo` + fully-unrolled `bb` — documented
+negative, ceiling −15.5%; but surfaced the SXP d_a-scale hoist (+4–9%, transferable) and the
+stall-count-beats-wave-count result), working on the Framework Desktop target box. The conversation
+history that produced this repo is gone; everything needed to continue is in this file, `AGENTS.md`,
+and `docs/plans/`.
 
 **Perf-number rule (AGENTS.md):** every performance number here cites its benchmark + operating
 point, e.g. `(bench: gemm_variance, perf=high)`. Numbers are at `perf=high` unless noted; `auto`
 reads ~30 % low. When a benchmark changes, update the numbers (grep for the old value).
+
+## 2026-06-23 — full-occupancy GEMM (`fo`/`bb`): documented negative, but the SXP scale-hoist + stall-count>wave-count
+
+**Verdict: the occupancy family never overtakes the deployed low-occupancy kernel — but every gain
+came from FIXING STALLS, not adding waves, and two findings transfer.** New kernels (FFN-down only,
+K=21504 N=5376, plain `[M-blocks,N-blocks]` dispatch, no swizzle): `gemm_q4_0_i8_fo.wgsl` (lean
+small-tile: 0-stride scales + direct f16-coopStore epilogue + minimal LDS + no barriers, knobs
+M_TILES/B2/PD/SXP) and `gemm_q4_0_i8_bb.wgsl` ("bigboy" — every inner loop hand-unrolled so all of an
+iteration's global loads issue as one batch, `PF` weight-prefetch knob). All parity bit-exact vs
+`basic_dir` (`parity_mmq::gemm_q4_0_i8_l2_matches_basic_dir`). Bench `mmq_variance`, down M=256,
+gpu-timestamp column, pinned 2900 MHz (⚠ thermal-dips to ~2840 mid-run — the recurring throttle;
+absolute clk ~2% low, deltas hold). Deployed gpu base ≈ **16.4**; best l2 `b4_b2` 14.71.
+
+The climb (Δ vs deployed, gpu): `occ` 1×1 −47% → `fo m2` −34.6% (10.68) → `+β×2` −25.5% (12.05) →
+`+SXP` −19.6% (13.15) → `bb` −16.6% (13.82) → `bb_pf` −15.5% (13.94). Every step removed/relocated a
+stall; none added occupancy (most REDUCED it).
+
+- **SXP d_a-scale hoist — a real, transferable lever (+4–9%, VGPR-free).** RGP of `fo_m2_b2` showed the
+  per-block d_a (an f16 in `x_scales` → a 16-bit `buffer_load_d16_b16`) is issued right before the
+  rescale and stalls a full ~2K clk (memory latency is load-SIZE-independent). Hoisting both blocks'
+  d_a loads to the top of the β-iter (`SXP=1`, registers, consumed only after the WMMAs): `fo m2`
+  10.68→11.11 (+4.0%), `fo m2 b2` 12.05→13.15 (+9.1%, helps more under β×2 — 8 batched WMMAs give a
+  longer hide window). Zero VGPR cost. **This hoist is NOWHERE in the shipping `l2`/deployed kernels —
+  they both do the inline `da_l[i]=f32(x_scales[...])` in the rescale. PORTING IT IS THE NEXT MOVE
+  (next session).**
+
+- **Stall-count beats wave-count.** `bb` 13.82 at 96 VGPR / **8/16 waves** beats `fo_m2_b2_sxp` 13.15
+  at 60–72 VGPR / ~11/16 waves. Consolidating all loads (9 weight words in DISTINCT registers — kills
+  the `array<u32,9>` register-reuse serialization — + 8 activation fragments + 2 d_a scales) into one
+  batch → ONE `vmcnt` stall/iter beat the higher-occupancy kernel that pays several. So at this
+  memory-latency-bound operating point the lever is in-wave MLP structure, not wave count.
+
+- **β×2 ILP HELPS at full occupancy here (+14%), against the RDNA3 rule.** `fo m2`→`fo m2 b2` 10.68→
+  12.05. The "ILP regresses once occupancy is high" expectation
+  ([[rdna3-wmma-latency-hidden-by-ilp-not-occupancy]]) did NOT hold — β×2 batches the 8 WMMAs, which
+  is what gives the hoisted loads a window to hide under. ILP and occupancy aren't substitutes here.
+
+- **The stall reversal → and the actual floor (RGP + ISA).** Once `bb` batches the activations, the
+  OLD "weights aren't the binding stall, X-before-WMMA is" finding flips: the lone remaining stall is
+  now... still NOT weights. **Weight prefetch (`bb_pf`) is FLAT (+0.9%, 13.82→13.94)** because the
+  sole stall is the **d_a activation-SCALE load**: ISA (`RADV_DEBUG=asm`) line 139, one
+  `buffer_load_b64 v[26:27], v26, s[20:23]` — descriptor `s[20:23]` = binding 2 (`x_scales`), index
+  `×0x2a0`(=672=NB) = `(m0+lid)*NB`; the two adjacent f16 (`da0`,`da1`) coalesced into a b64, inside a
+  `lid<32` DIVERGENT branch, with `s_waitcnt vmcnt(0)` fused right after → the f16→f32 `v_fma_mix_f32`
+  converts consume it BEFORE the WMMAs, so the latency never rides through them. **Next levers: break
+  the fused load→vmcnt→convert (push the convert past the WMMAs), and/or cooperative-load the scale to
+  escape the divergent branch + `alignbyte` (the awkward unaligned-f16 read is exactly the
+  cooperative-load case — prior coop-load attempt didn't pan out, worth a retry here).**
+
+- **The competing wall: L2 bytes.** `bb` reads **1295 MB** local-video vs `fo_m2_b2_sxp` ~948 MB with
+  the **L2 hit rate dropping** — the small tile + lower occupancy cost weight reuse. So even with the
+  scale stall fixed, the FO family is gated by DRAM bytes; the deferred swizzle (or a taller tile)
+  would be the byte-side lever. The deployed 168-VGPR / ~3-wave kernel wins by keeping both stalls hid
+  AND weight reuse high — applying `bb`'s one-batch load structure THERE (not at low occupancy) is the
+  untested high-value direction.
+
+Kernels kept in-tree as documented negatives (like `occ`/`mw`); NOT graph-wired. Variants in
+`build.rs`, `mmq_variance`, `parity_mmq`, `rgp::shape`.
 
 ## 2026-06-21b — MALL probe kills the "86% BW-bound" claim; occupancy→L2-thrash cleanly isolated; bench methodology hardened
 
