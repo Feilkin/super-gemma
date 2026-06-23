@@ -1363,6 +1363,30 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // bb at the DEPLOYED tile height (M_TILES=4, M_ROWS=64): same one-batch body,
+    // 4 row-tiles → weight bytes/output halve and waves/SIMD roughly halve. The L2
+    // cache-locality A/B against bb's L2 thrash (occupancy raises concurrent working
+    // set). Watch for VGPR spill — 16 live a-fragments + 8 acc + 4 yacc.
+    Variant {
+        name: "gemm_q4_0_i8_bb_m4",
+        src: "gemm_q4_0_i8_bb_m4",
+        defs: &[],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_bb_m4_pf",
+        src: "gemm_q4_0_i8_bb_m4",
+        defs: &[("PF", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // MULTI-WAVE occupancy GEMM (gemm_q4_0_i8_mw) — TESTED DEAD END (2026-06-21),
     // kept as documented A/B baselines like gemm_q4_0_i8_occ; NOT in any graph. A
     // workgroup of BM_TILES·BN_TILES waves, ONE 16×16 tile per wave, sharing the

@@ -390,6 +390,8 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         ("gemm_q4_0_i8_fo_m1_b2_sxp", 16u32),
         ("gemm_q4_0_i8_bb", 32u32),          // fully-unrolled bigboy
         ("gemm_q4_0_i8_bb_pf", 32u32),       // bb + weight prefetch
+        ("gemm_q4_0_i8_bb_m4", 64u32),       // bb, M_TILES=4 (deployed tile height)
+        ("gemm_q4_0_i8_bb_m4_pf", 64u32),    // bb_m4 + weight prefetch
     ] {
         let got = run(variant, [m as u32 / m_rows, nb_n, 1]);
         let err = nrmse(&got, &want);

@@ -164,6 +164,9 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     // "Bigboy": fully hand-unrolled, all loads batched → one stall/iter (low occ).
     ("bb", "gemm_q4_0_i8_bb", 32),
     ("bb pf", "gemm_q4_0_i8_bb_pf", 32),
+    // bb at the deployed tile height (M_TILES=4): half the waves, 2× weight reuse.
+    ("bb m4", "gemm_q4_0_i8_bb_m4", 64),
+    ("bb m4 pf", "gemm_q4_0_i8_bb_m4_pf", 64),
 ];
 
 /// Up shape (FFN gate/up, K=5376 N=21504) — the occupancy/bytes confirmation set:
