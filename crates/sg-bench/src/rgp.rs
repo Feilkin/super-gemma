@@ -283,9 +283,75 @@ fn run_probe() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// bb_m4_split: NB_M separate M-block dispatches (the M-block chosen by a push
+/// constant, grid = the N-strips `[NB_N, 1, 1]`), barrier-serialized in ONE
+/// submit — the split-M concurrency experiment (docs: shaders/gemm_q4_0_i8_bb_m4_split.wgsl).
+/// Captured as one `.rgp` showing all NB_M dispatches and the recorder's
+/// execution barriers between them (so the trace contrasts directly with the
+/// single-dispatch `bb_m4` capture: ≤NB_N waves per dispatch, one M-block's
+/// X-slab L2-resident, vs bb_m4's ~400 co-resident waves spanning two slabs).
+fn run_split(kernel: &str) -> anyhow::Result<()> {
+    const K: usize = 21504;
+    const N: usize = 5376;
+    const M_ROWS: usize = 64; // M_TILES = 4
+    let m = rgp_m();
+    let nb_m = (m / M_ROWS) as u32; // M-blocks (4 at M=256)
+    let grid = [(N / 16) as u32, 1, 1]; // N-strips (N_COLS = 16)
+
+    let ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("gpu: {e}"))?;
+    let kern = ctx.load_kernel(kernel).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let u = BufferUsage::STORAGE_BUFFER;
+    let nb_err = |e: sg_gpu::GpuError| anyhow::anyhow!("{e}");
+    let w = ctx
+        .new_buffer::<u32>((N * K / 32 * 18 / 4) as u64, u)
+        .map_err(nb_err)?;
+    let y = ctx.new_buffer::<u16>((m * N) as u64, u).map_err(nb_err)?;
+    let x_i8 = ctx
+        .new_buffer::<u32>((m * K / 4) as u64, u)
+        .map_err(nb_err)?;
+    let xs = ctx
+        .new_buffer::<u16>((m * K / 32) as u64, u)
+        .map_err(nb_err)?;
+
+    // One submit = NB_M dispatches (push.mblock = 0..NB_M), barrier-serialized.
+    let graph = ctx
+        .record_graph(|rec| {
+            for mb in 0..nb_m {
+                rec.dispatch(
+                    &kern,
+                    vec![
+                        BufferBinding::buffer(0, w.clone()),
+                        BufferBinding::buffer(1, x_i8.clone()),
+                        BufferBinding::buffer(2, xs.clone()),
+                        BufferBinding::buffer(3, y.clone()),
+                    ],
+                    Some(mb),
+                    grid,
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    eprintln!(
+        "RGP capture target: {kernel}  (M={m} K={K} N={N})  {nb_m} M-block dispatches \
+         × grid {grid:?}, barrier-serialized in one submit\n\
+         {SUBMITS} submits — under MESA_VK_TRACE_PER_SUBMIT take the LAST .rgp."
+    );
+    for i in 0..SUBMITS {
+        ctx.submit_blocking(&graph)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        eprintln!("  submit {i}/{SUBMITS} done");
+    }
+    Ok(())
+}
+
 pub fn run(kernel: &str) -> anyhow::Result<()> {
     if kernel == "mall_probe" {
         return run_probe();
+    }
+    if kernel == "gemm_q4_0_i8_bb_m4_split" {
+        return run_split(kernel);
     }
     if let Some((k, n)) = gemv_shape(kernel) {
         return run_gemv(kernel, k, n);
