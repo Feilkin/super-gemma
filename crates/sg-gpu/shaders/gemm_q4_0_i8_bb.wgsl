@@ -130,14 +130,17 @@ fn main(
         let a1_10 = coopLoadT<coop_mat16x16<i8, A>>(&x[r1 + k0 + 32u], K);
         let a1_11 = coopLoadT<coop_mat16x16<i8, A>>(&x[r1 + k0 + 48u], K);
         // d_a pair: the two consecutive f16 (beta, beta+1) sit in ONE u32 (beta even,
-        // row stride NB even → u32-aligned). Issue the RAW u32 load NOW, as part of this
-        // batch — but do NOT unpack yet. unpack2x16float is the consumer that forces the
-        // vmcnt wait; deferring it to the rescale (past the 8 WMMAs) lets the load's
-        // latency overlap the WMMAs, so the word has landed by first-use → no dedicated
-        // stall in the lid<M_ROWS branch.
-        var da_raw = 0u;
+        // row stride NB even → u32-aligned), so one b32 load + unpack2x16float gives the
+        // two cvt_f32_f16 with NO v_alignbyte sub-dword extraction (the array<f16> tax).
+        // Load+unpack kept together here, inside the lid<M_ROWS branch. Hoisting the raw
+        // load into the front batch and deferring the unpack past the WMMAs measured
+        // −2.4% (mechanism unconfirmed); this placement is the faster one.
+        var da0 = 0.0;
+        var da1 = 0.0;
         if (lid < M_ROWS) {
-            da_raw = x_scales[(m0 + lid) * (NB / 2u) + (beta / 2u)];
+            let dpair = unpack2x16float(x_scales[(m0 + lid) * (NB / 2u) + (beta / 2u)]);
+            da0 = dpair.x;
+            da1 = dpair.y;
         }
 
         // ── Unpack the weights (VALU — hides the batch's vmcnt) into LDS.
@@ -169,17 +172,14 @@ fn main(
         acc1_1 = coopMultiplyAdd(a1_11, b1_1, acc1_1);
 
         // ── Rescale block β (d_a·d_w 0-stride broadcast) into yacc, then β+1.
-        // Unpack the scale word HERE (first use) — the load issued back in the batch has
-        // long since returned, so this is the convert only, no memory wait.
-        let dpair = unpack2x16float(da_raw);
-        if (lid < M_ROWS) { da_l[lid] = dpair.x; }
+        if (lid < M_ROWS) { da_l[lid] = da0; }
         let s0_0 = coopLoad<coop_mat16x16<f32, C>>(&da_l[0u], 0u)
             * coopLoadT<coop_mat16x16<f32, C>>(&dw2[0u], 0u);
         let s0_1 = coopLoad<coop_mat16x16<f32, C>>(&da_l[16u], 0u)
             * coopLoadT<coop_mat16x16<f32, C>>(&dw2[0u], 0u);
         yacc0 = yacc0 + s0_0 * f32(acc0_0);
         yacc1 = yacc1 + s0_1 * f32(acc0_1);
-        if (lid < M_ROWS) { da_l[lid] = dpair.y; }
+        if (lid < M_ROWS) { da_l[lid] = da1; }
         let s1_0 = coopLoad<coop_mat16x16<f32, C>>(&da_l[0u], 0u)
             * coopLoadT<coop_mat16x16<f32, C>>(&dw2[N_COLS], 0u);
         let s1_1 = coopLoad<coop_mat16x16<f32, C>>(&da_l[16u], 0u)
