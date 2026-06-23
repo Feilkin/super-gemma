@@ -6,14 +6,7 @@
 //! buffer with several dispatches to amortize submit/fence overhead.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
-};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::sync::GpuFuture;
+use sg_gpu::{BufferBinding, BufferUsage, GpuContext};
 
 const K: usize = 5376;
 const N: usize = 4 * 21504; // ~260 MB of Q4_0 — larger than the MALL
@@ -48,50 +41,31 @@ fn bench(c: &mut Criterion) {
         .new_buffer::<u16>(N as u64, BufferUsage::STORAGE_BUFFER)
         .expect("y");
 
-    let layout = kernel.layout().clone();
-    let set = DescriptorSet::new(
-        ctx.descriptor_set_allocator().clone(),
-        layout.set_layouts()[0].clone(),
-        vec![
-            WriteDescriptorSet::buffer(0, w_buf),
-            WriteDescriptorSet::buffer(1, x_buf),
-            WriteDescriptorSet::buffer(2, y_buf),
-        ],
-        [],
-    )
-    .expect("set");
+    // Record one graph of DISPATCHES gemv dispatches (the recorder inserts the
+    // write→write barrier between them) and re-submit it each iteration.
+    let graph = ctx
+        .record_graph(|rec| {
+            for _ in 0..DISPATCHES {
+                rec.dispatch(
+                    &kernel,
+                    vec![
+                        BufferBinding::buffer(0, w_buf.clone()),
+                        BufferBinding::buffer(1, x_buf.clone()),
+                        BufferBinding::buffer(2, y_buf.clone()),
+                    ],
+                    None::<u32>,
+                    [N as u32, 1, 1],
+                )?;
+            }
+            Ok(())
+        })
+        .expect("record");
 
     let weight_bytes = (weight_words * 4) as u64;
     let mut group = c.benchmark_group("gemv_q4_0");
     group.throughput(Throughput::Bytes(weight_bytes * DISPATCHES as u64));
     group.bench_function(format!("k{K}_n{N}"), |b| {
-        b.iter(|| {
-            let mut builder = AutoCommandBufferBuilder::primary(
-                ctx.command_buffer_allocator().clone(),
-                ctx.queue().queue_family_index(),
-                CommandBufferUsage::OneTimeSubmit,
-            )
-            .unwrap();
-            builder
-                .bind_pipeline_compute(kernel.pipeline().clone())
-                .unwrap()
-                .bind_descriptor_sets(PipelineBindPoint::Compute, layout.clone(), 0, set.clone())
-                .unwrap();
-            for _ in 0..DISPATCHES {
-                // SAFETY: N workgroups over N output rows, the kernel's
-                // contract; vulkano inserts the write-write barriers.
-                unsafe { builder.dispatch([N as u32, 1, 1]) }.unwrap();
-            }
-            builder
-                .build()
-                .unwrap()
-                .execute(ctx.queue().clone())
-                .unwrap()
-                .then_signal_fence_and_flush()
-                .unwrap()
-                .wait(None)
-                .unwrap();
-        })
+        b.iter(|| ctx.submit_blocking(&graph).unwrap())
     });
     group.finish();
 }

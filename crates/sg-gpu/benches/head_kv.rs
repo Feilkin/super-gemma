@@ -3,14 +3,7 @@
 //! kv_quant/kv_dequant throughput. Skips without a GPU.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
-};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::sync::GpuFuture;
+use sg_gpu::{BufferBinding, BufferUsage, GpuContext};
 
 const VOCAB: usize = 262_144;
 const K: usize = 5376;
@@ -45,51 +38,28 @@ fn bench(c: &mut Criterion) {
         let y_buf = ctx
             .new_buffer::<f32>(VOCAB as u64, BufferUsage::STORAGE_BUFFER)
             .expect("logits");
-        let layout = kernel.layout().clone();
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator().clone(),
-            layout.set_layouts()[0].clone(),
-            vec![
-                WriteDescriptorSet::buffer(0, w_buf),
-                WriteDescriptorSet::buffer(1, x_buf),
-                WriteDescriptorSet::buffer(2, y_buf),
-            ],
-            [],
-        )
-        .expect("set");
         let bytes = (weight_words * 4) as f64;
+        let graph = ctx
+            .record_graph(|rec| {
+                rec.dispatch(
+                    &kernel,
+                    vec![
+                        BufferBinding::buffer(0, w_buf.clone()),
+                        BufferBinding::buffer(1, x_buf.clone()),
+                        BufferBinding::buffer(2, y_buf.clone()),
+                    ],
+                    None::<u32>,
+                    [VOCAB as u32, 1, 1],
+                )?;
+                Ok(())
+            })
+            .expect("record");
 
         group.bench_function("lm_head_logits", |b| {
             b.iter_custom(|iters| {
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    let mut builder = AutoCommandBufferBuilder::primary(
-                        ctx.command_buffer_allocator().clone(),
-                        ctx.queue().queue_family_index(),
-                        CommandBufferUsage::OneTimeSubmit,
-                    )
-                    .unwrap();
-                    builder
-                        .bind_pipeline_compute(kernel.pipeline().clone())
-                        .unwrap()
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Compute,
-                            layout.clone(),
-                            0,
-                            set.clone(),
-                        )
-                        .unwrap();
-                    // SAFETY: one workgroup per vocab row, the kernel's contract.
-                    unsafe { builder.dispatch([VOCAB as u32, 1, 1]) }.unwrap();
-                    builder
-                        .build()
-                        .unwrap()
-                        .execute(ctx.queue().clone())
-                        .unwrap()
-                        .then_signal_fence_and_flush()
-                        .unwrap()
-                        .wait(None)
-                        .unwrap();
+                    ctx.submit_blocking(&graph).unwrap();
                 }
                 let elapsed = start.elapsed();
                 let secs = elapsed.as_secs_f64() / iters as f64;
@@ -129,61 +99,33 @@ fn bench(c: &mut Criterion) {
                 "kv_quant_q8_ring",
                 &quant_k,
                 vec![
-                    WriteDescriptorSet::buffer(0, src_buf.clone()),
-                    WriteDescriptorSet::buffer(1, scale_buf.clone()),
-                    WriteDescriptorSet::buffer(2, quant_buf.clone()),
+                    BufferBinding::buffer(0, src_buf.clone()),
+                    BufferBinding::buffer(1, scale_buf.clone()),
+                    BufferBinding::buffer(2, quant_buf.clone()),
                 ],
             ),
             (
                 "kv_dequant_q8_ring",
                 &dequant_k,
                 vec![
-                    WriteDescriptorSet::buffer(0, scale_buf.clone()),
-                    WriteDescriptorSet::buffer(1, quant_buf.clone()),
-                    WriteDescriptorSet::buffer(2, dst_buf.clone()),
+                    BufferBinding::buffer(0, scale_buf.clone()),
+                    BufferBinding::buffer(1, quant_buf.clone()),
+                    BufferBinding::buffer(2, dst_buf.clone()),
                 ],
             ),
         ] {
-            let layout = kernel.layout().clone();
-            let set = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                layout.set_layouts()[0].clone(),
-                writes,
-                [],
-            )
-            .unwrap();
             let groups = kernel.groups_for((n / 32) as u64);
+            let graph = ctx
+                .record_graph(|rec| {
+                    rec.dispatch(kernel, writes, None::<u32>, groups)?;
+                    Ok(())
+                })
+                .expect("record");
             group.bench_function(name, |b| {
                 b.iter_custom(|iters| {
                     let start = std::time::Instant::now();
                     for _ in 0..iters {
-                        let mut builder = AutoCommandBufferBuilder::primary(
-                            ctx.command_buffer_allocator().clone(),
-                            ctx.queue().queue_family_index(),
-                            CommandBufferUsage::OneTimeSubmit,
-                        )
-                        .unwrap();
-                        builder
-                            .bind_pipeline_compute(kernel.pipeline().clone())
-                            .unwrap()
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Compute,
-                                layout.clone(),
-                                0,
-                                set.clone(),
-                            )
-                            .unwrap();
-                        // SAFETY: one thread per block, the kernel's contract.
-                        unsafe { builder.dispatch(groups) }.unwrap();
-                        builder
-                            .build()
-                            .unwrap()
-                            .execute(ctx.queue().clone())
-                            .unwrap()
-                            .then_signal_fence_and_flush()
-                            .unwrap()
-                            .wait(None)
-                            .unwrap();
+                        ctx.submit_blocking(&graph).unwrap();
                     }
                     let elapsed = start.elapsed();
                     let secs = elapsed.as_secs_f64() / iters as f64;

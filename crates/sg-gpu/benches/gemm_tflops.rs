@@ -3,14 +3,7 @@
 //! coopmat GPU.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
-};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::sync::GpuFuture;
+use sg_gpu::{BufferBinding, BufferUsage, GpuContext};
 
 const M: usize = 512; // prefill chunk
 const K: usize = 5376;
@@ -57,55 +50,34 @@ fn bench(c: &mut Criterion) {
             continue;
         }
         let kernel = ctx.load_kernel(name).expect(name);
-        let layout = kernel.layout().clone();
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator().clone(),
-            layout.set_layouts()[0].clone(),
-            vec![
-                WriteDescriptorSet::buffer(0, w_buf.clone()),
-                WriteDescriptorSet::buffer(1, x_buf.clone()),
-                WriteDescriptorSet::buffer(2, y_buf.clone()),
-            ],
-            [],
-        )
-        .expect("set");
+        let grid = [(N / n_block) as u32, (M / m_block) as u32, 1];
+        // `dispatch_overlapping` (no inter-dispatch barrier) reproduces the
+        // historical vulkano behavior: a coopStore to `y` was invisible to its
+        // auto-sync, so the DISPATCHES dispatches overlapped. Use `dispatch`
+        // for a serialized per-dispatch rate.
+        let graph = ctx
+            .record_graph(|rec| {
+                for _ in 0..DISPATCHES {
+                    rec.dispatch_overlapping(
+                        &kernel,
+                        vec![
+                            BufferBinding::buffer(0, w_buf.clone()),
+                            BufferBinding::buffer(1, x_buf.clone()),
+                            BufferBinding::buffer(2, y_buf.clone()),
+                        ],
+                        None::<u32>,
+                        grid,
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("record");
 
         group.bench_function(format!("{name}_m{M}"), |b| {
             b.iter_custom(|iters| {
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    let mut builder = AutoCommandBufferBuilder::primary(
-                        ctx.command_buffer_allocator().clone(),
-                        ctx.queue().queue_family_index(),
-                        CommandBufferUsage::OneTimeSubmit,
-                    )
-                    .unwrap();
-                    builder
-                        .bind_pipeline_compute(kernel.pipeline().clone())
-                        .unwrap()
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Compute,
-                            layout.clone(),
-                            0,
-                            set.clone(),
-                        )
-                        .unwrap();
-                    for _ in 0..DISPATCHES {
-                        // SAFETY: tile grid covering M×N, the kernel's contract.
-                        unsafe {
-                            builder.dispatch([(N / n_block) as u32, (M / m_block) as u32, 1])
-                        }
-                        .unwrap();
-                    }
-                    builder
-                        .build()
-                        .unwrap()
-                        .execute(ctx.queue().clone())
-                        .unwrap()
-                        .then_signal_fence_and_flush()
-                        .unwrap()
-                        .wait(None)
-                        .unwrap();
+                    ctx.submit_blocking(&graph).unwrap();
                 }
                 let elapsed = start.elapsed();
                 let tflops = flops * iters as f64 / elapsed.as_secs_f64() / 1e12;

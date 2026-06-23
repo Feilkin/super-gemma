@@ -6,14 +6,7 @@
 //! policy.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use sg_gpu::{GpuContext, StepState};
-use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
-};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::sync::GpuFuture;
+use sg_gpu::{Buffer, BufferBinding, BufferUsage, GpuContext, StepState};
 
 const N_Q_HEADS: usize = 32;
 const SL_KV_HEADS: usize = 16;
@@ -26,7 +19,7 @@ const SL_PART_STRIDE: usize = SL_DIM + 2;
 const GL_PART_STRIDE: usize = GL_DIM + 2;
 const DISPATCHES: usize = 8;
 
-#[derive(BufferContents, Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct PushSplitScale {
     n_splits: u32,
@@ -38,7 +31,7 @@ fn f16_fill(n: usize) -> impl ExactSizeIterator<Item = u16> {
 }
 
 /// Step buffer holding the per-step dynamic state.
-fn step_buf(ctx: &GpuContext, state: StepState) -> Subbuffer<[u32]> {
+fn step_buf(ctx: &GpuContext, state: StepState) -> Buffer<u32> {
     let buf = ctx.new_step_buffer().unwrap();
     state.write_to(&buf).unwrap();
     buf
@@ -53,47 +46,27 @@ fn time_prefill(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     ctx: &GpuContext,
     kernel: &sg_gpu::Kernel,
-    set: std::sync::Arc<DescriptorSet>,
+    writes: Vec<BufferBinding>,
     grid: [u32; 3],
     name: String,
 ) {
     const CMP_DISPATCHES: usize = 4;
-    let layout = kernel.layout().clone();
+    // The CMP_DISPATCHES dispatches re-run the same kernel into the same `out`,
+    // so the recorder's pre-dispatch barrier serializes them (a clean per-chunk
+    // time, no overlap artifact). The global-prefill push is always GL_SCALE.
+    let graph = ctx
+        .record_graph(|rec| {
+            for _ in 0..CMP_DISPATCHES {
+                rec.dispatch(kernel, writes.clone(), Some(GL_SCALE), grid)?;
+            }
+            Ok(())
+        })
+        .expect("record");
     group.bench_function(name, |b| {
         b.iter_custom(|iters| {
             let start = std::time::Instant::now();
             for _ in 0..iters {
-                let mut builder = AutoCommandBufferBuilder::primary(
-                    ctx.command_buffer_allocator().clone(),
-                    ctx.queue().queue_family_index(),
-                    CommandBufferUsage::OneTimeSubmit,
-                )
-                .unwrap();
-                builder
-                    .bind_pipeline_compute(kernel.pipeline().clone())
-                    .unwrap()
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        layout.clone(),
-                        0,
-                        set.clone(),
-                    )
-                    .unwrap()
-                    .push_constants(layout.clone(), 0, GL_SCALE)
-                    .unwrap();
-                for _ in 0..CMP_DISPATCHES {
-                    // SAFETY: caller passes each kernel's documented grid.
-                    unsafe { builder.dispatch(grid) }.unwrap();
-                }
-                builder
-                    .build()
-                    .unwrap()
-                    .execute(ctx.queue().clone())
-                    .unwrap()
-                    .then_signal_fence_and_flush()
-                    .unwrap()
-                    .wait(None)
-                    .unwrap();
+                ctx.submit_blocking(&graph).unwrap();
             }
             let elapsed = start.elapsed();
             let us = elapsed.as_secs_f64() * 1e6 / (iters as usize * CMP_DISPATCHES) as f64;
@@ -143,97 +116,51 @@ fn bench(c: &mut Criterion) {
                     BufferUsage::STORAGE_BUFFER,
                 )
                 .unwrap();
-            let p_layout = part_k.layout().clone();
-            let p_set = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                p_layout.set_layouts()[0].clone(),
-                vec![
-                    WriteDescriptorSet::buffer(0, q.clone()),
-                    WriteDescriptorSet::buffer(1, k.clone()),
-                    WriteDescriptorSet::buffer(2, v.clone()),
-                    WriteDescriptorSet::buffer(3, part.clone()),
-                    WriteDescriptorSet::buffer(
-                        4,
-                        step_buf(
-                            &ctx,
-                            StepState {
-                                kv_len_sliding: kv_len as u32,
-                                ..Default::default()
-                            },
-                        ),
+            let p_writes = vec![
+                BufferBinding::buffer(0, q.clone()),
+                BufferBinding::buffer(1, k.clone()),
+                BufferBinding::buffer(2, v.clone()),
+                BufferBinding::buffer(3, part.clone()),
+                BufferBinding::buffer(
+                    4,
+                    step_buf(
+                        &ctx,
+                        StepState {
+                            kv_len_sliding: kv_len as u32,
+                            ..Default::default()
+                        },
                     ),
-                ],
-                [],
-            )
-            .unwrap();
-            let r_layout = red_k.layout().clone();
-            let r_set = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                r_layout.set_layouts()[0].clone(),
-                vec![
-                    WriteDescriptorSet::buffer(0, part.clone()),
-                    WriteDescriptorSet::buffer(1, out.clone()),
-                ],
-                [],
-            )
-            .unwrap();
+                ),
+            ];
+            let r_writes = vec![
+                BufferBinding::buffer(0, part.clone()),
+                BufferBinding::buffer(1, out.clone()),
+            ];
+            // Each step is partial→reduce (a real data dependency); the
+            // recorder barriers between every dispatch.
+            let graph = ctx
+                .record_graph(|rec| {
+                    for _ in 0..DISPATCHES {
+                        rec.dispatch(
+                            &part_k,
+                            p_writes.clone(),
+                            Some(PushSplitScale {
+                                n_splits,
+                                scale: SL_SCALE,
+                            }),
+                            [SL_KV_HEADS as u32, n_splits, 1],
+                        )?;
+                        rec.dispatch(&red_k, r_writes.clone(), Some(n_splits), [N_Q_HEADS as u32, 1, 1])?;
+                    }
+                    Ok(())
+                })
+                .expect("record");
 
             group.bench_function(format!("decode_sliding_ring1024_splits{n_splits}"), |b| {
                 b.iter_custom(|iters| {
                     let start = std::time::Instant::now();
                     for _ in 0..iters {
-                        let mut builder = AutoCommandBufferBuilder::primary(
-                            ctx.command_buffer_allocator().clone(),
-                            ctx.queue().queue_family_index(),
-                            CommandBufferUsage::OneTimeSubmit,
-                        )
-                        .unwrap();
-                        for _ in 0..DISPATCHES {
-                            builder
-                                .bind_pipeline_compute(part_k.pipeline().clone())
-                                .unwrap()
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Compute,
-                                    p_layout.clone(),
-                                    0,
-                                    p_set.clone(),
-                                )
-                                .unwrap()
-                                .push_constants(
-                                    p_layout.clone(),
-                                    0,
-                                    PushSplitScale {
-                                        n_splits,
-                                        scale: SL_SCALE,
-                                    },
-                                )
-                                .unwrap();
-                            // SAFETY: [kv_heads, splits] grid, the kernel's contract.
-                            unsafe { builder.dispatch([SL_KV_HEADS as u32, n_splits, 1]) }.unwrap();
-                            builder
-                                .bind_pipeline_compute(red_k.pipeline().clone())
-                                .unwrap()
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Compute,
-                                    r_layout.clone(),
-                                    0,
-                                    r_set.clone(),
-                                )
-                                .unwrap()
-                                .push_constants(r_layout.clone(), 0, n_splits)
-                                .unwrap();
-                            // SAFETY: one workgroup per query head.
-                            unsafe { builder.dispatch([N_Q_HEADS as u32, 1, 1]) }.unwrap();
-                        }
-                        builder
-                            .build()
-                            .unwrap()
-                            .execute(ctx.queue().clone())
-                            .unwrap()
-                            .then_signal_fence_and_flush()
-                            .unwrap()
-                            .wait(None)
-                            .unwrap();
+                        ctx.submit_blocking(&graph).unwrap();
                     }
                     let elapsed = start.elapsed();
                     let us = elapsed.as_secs_f64() * 1e6 / (iters as usize * DISPATCHES) as f64;
@@ -278,98 +205,54 @@ fn bench(c: &mut Criterion) {
                         BufferUsage::STORAGE_BUFFER,
                     )
                     .unwrap();
-                let p_layout = part_k.layout().clone();
-                let p_set = DescriptorSet::new(
-                    ctx.descriptor_set_allocator().clone(),
-                    p_layout.set_layouts()[0].clone(),
-                    vec![
-                        WriteDescriptorSet::buffer(0, q.clone()),
-                        WriteDescriptorSet::buffer(1, kv_k.clone()),
-                        WriteDescriptorSet::buffer(2, kv_v.clone()),
-                        WriteDescriptorSet::buffer(3, part.clone()),
-                        WriteDescriptorSet::buffer(
-                            4,
-                            step_buf(
-                                &ctx,
-                                StepState {
-                                    kv_len_global: kv_len as u32,
-                                    ..Default::default()
-                                },
-                            ),
+                let p_writes = vec![
+                    BufferBinding::buffer(0, q.clone()),
+                    BufferBinding::buffer(1, kv_k.clone()),
+                    BufferBinding::buffer(2, kv_v.clone()),
+                    BufferBinding::buffer(3, part.clone()),
+                    BufferBinding::buffer(
+                        4,
+                        step_buf(
+                            &ctx,
+                            StepState {
+                                kv_len_global: kv_len as u32,
+                                ..Default::default()
+                            },
                         ),
-                    ],
-                    [],
-                )
-                .unwrap();
-                let r_layout = red_k.layout().clone();
-                let r_set = DescriptorSet::new(
-                    ctx.descriptor_set_allocator().clone(),
-                    r_layout.set_layouts()[0].clone(),
-                    vec![
-                        WriteDescriptorSet::buffer(0, part.clone()),
-                        WriteDescriptorSet::buffer(1, out.clone()),
-                    ],
-                    [],
-                )
-                .unwrap();
+                    ),
+                ];
+                let r_writes = vec![
+                    BufferBinding::buffer(0, part.clone()),
+                    BufferBinding::buffer(1, out.clone()),
+                ];
+                let graph = ctx
+                    .record_graph(|rec| {
+                        for _ in 0..DISPATCHES {
+                            rec.dispatch(
+                                &part_k,
+                                p_writes.clone(),
+                                Some(PushSplitScale {
+                                    n_splits,
+                                    scale: GL_SCALE,
+                                }),
+                                [GL_KV_HEADS as u32, n_splits, 1],
+                            )?;
+                            rec.dispatch(
+                                &red_k,
+                                r_writes.clone(),
+                                Some(n_splits),
+                                [N_Q_HEADS as u32, 1, 1],
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .expect("record");
 
                 group.bench_function(format!("decode_global_ctx{kv_len}_splits{n_splits}"), |b| {
                     b.iter_custom(|iters| {
                         let start = std::time::Instant::now();
                         for _ in 0..iters {
-                            let mut builder = AutoCommandBufferBuilder::primary(
-                                ctx.command_buffer_allocator().clone(),
-                                ctx.queue().queue_family_index(),
-                                CommandBufferUsage::OneTimeSubmit,
-                            )
-                            .unwrap();
-                            for _ in 0..DISPATCHES {
-                                builder
-                                    .bind_pipeline_compute(part_k.pipeline().clone())
-                                    .unwrap()
-                                    .bind_descriptor_sets(
-                                        PipelineBindPoint::Compute,
-                                        p_layout.clone(),
-                                        0,
-                                        p_set.clone(),
-                                    )
-                                    .unwrap()
-                                    .push_constants(
-                                        p_layout.clone(),
-                                        0,
-                                        PushSplitScale {
-                                            n_splits,
-                                            scale: GL_SCALE,
-                                        },
-                                    )
-                                    .unwrap();
-                                // SAFETY: [kv_heads, splits] grid, the kernel's contract.
-                                unsafe { builder.dispatch([GL_KV_HEADS as u32, n_splits, 1]) }
-                                    .unwrap();
-                                builder
-                                    .bind_pipeline_compute(red_k.pipeline().clone())
-                                    .unwrap()
-                                    .bind_descriptor_sets(
-                                        PipelineBindPoint::Compute,
-                                        r_layout.clone(),
-                                        0,
-                                        r_set.clone(),
-                                    )
-                                    .unwrap()
-                                    .push_constants(r_layout.clone(), 0, n_splits)
-                                    .unwrap();
-                                // SAFETY: one workgroup per query head.
-                                unsafe { builder.dispatch([N_Q_HEADS as u32, 1, 1]) }.unwrap();
-                            }
-                            builder
-                                .build()
-                                .unwrap()
-                                .execute(ctx.queue().clone())
-                                .unwrap()
-                                .then_signal_fence_and_flush()
-                                .unwrap()
-                                .wait(None)
-                                .unwrap();
+                            ctx.submit_blocking(&graph).unwrap();
                         }
                         let elapsed = start.elapsed();
                         let us = elapsed.as_secs_f64() * 1e6 / (iters as usize * DISPATCHES) as f64;
@@ -409,64 +292,35 @@ fn bench(c: &mut Criterion) {
         let out = ctx
             .new_buffer::<u16>((m * N_Q_HEADS * SL_DIM) as u64, BufferUsage::STORAGE_BUFFER)
             .unwrap();
-        let layout = kernel.layout().clone();
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator().clone(),
-            layout.set_layouts()[0].clone(),
-            vec![
-                WriteDescriptorSet::buffer(0, q),
-                WriteDescriptorSet::buffer(1, k),
-                WriteDescriptorSet::buffer(2, v),
-                WriteDescriptorSet::buffer(3, out),
-                WriteDescriptorSet::buffer(
-                    4,
-                    step_buf(
-                        &ctx,
-                        StepState {
-                            q0: q0 as u32,
-                            ..Default::default()
-                        },
-                    ),
+        let writes = vec![
+            BufferBinding::buffer(0, q),
+            BufferBinding::buffer(1, k),
+            BufferBinding::buffer(2, v),
+            BufferBinding::buffer(3, out),
+            BufferBinding::buffer(
+                4,
+                step_buf(
+                    &ctx,
+                    StepState {
+                        q0: q0 as u32,
+                        ..Default::default()
+                    },
                 ),
-            ],
-            [],
-        )
-        .unwrap();
+            ),
+        ];
+        let graph = ctx
+            .record_graph(|rec| {
+                for _ in 0..DISPATCHES {
+                    rec.dispatch(&kernel, writes.clone(), Some(SL_SCALE), [SL_KV_HEADS as u32, m as u32, 1])?;
+                }
+                Ok(())
+            })
+            .expect("record");
         group.bench_function(format!("prefill_sliding_m{m}"), |b| {
             b.iter_custom(|iters| {
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    let mut builder = AutoCommandBufferBuilder::primary(
-                        ctx.command_buffer_allocator().clone(),
-                        ctx.queue().queue_family_index(),
-                        CommandBufferUsage::OneTimeSubmit,
-                    )
-                    .unwrap();
-                    builder
-                        .bind_pipeline_compute(kernel.pipeline().clone())
-                        .unwrap()
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Compute,
-                            layout.clone(),
-                            0,
-                            set.clone(),
-                        )
-                        .unwrap()
-                        .push_constants(layout.clone(), 0, SL_SCALE)
-                        .unwrap();
-                    for _ in 0..DISPATCHES {
-                        // SAFETY: [kv_heads, M] grid, the kernel's contract.
-                        unsafe { builder.dispatch([SL_KV_HEADS as u32, m as u32, 1]) }.unwrap();
-                    }
-                    builder
-                        .build()
-                        .unwrap()
-                        .execute(ctx.queue().clone())
-                        .unwrap()
-                        .then_signal_fence_and_flush()
-                        .unwrap()
-                        .wait(None)
-                        .unwrap();
+                    ctx.submit_blocking(&graph).unwrap();
                 }
                 let elapsed = start.elapsed();
                 let us = elapsed.as_secs_f64() * 1e6 / (iters as usize * DISPATCHES) as f64;
@@ -500,64 +354,35 @@ fn bench(c: &mut Criterion) {
         let out = ctx
             .new_buffer::<u16>((m * N_Q_HEADS * GL_DIM) as u64, BufferUsage::STORAGE_BUFFER)
             .unwrap();
-        let layout = kernel.layout().clone();
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator().clone(),
-            layout.set_layouts()[0].clone(),
-            vec![
-                WriteDescriptorSet::buffer(0, q),
-                WriteDescriptorSet::buffer(1, kv_k),
-                WriteDescriptorSet::buffer(2, kv_v),
-                WriteDescriptorSet::buffer(3, out),
-                WriteDescriptorSet::buffer(
-                    4,
-                    step_buf(
-                        &ctx,
-                        StepState {
-                            q0: q0 as u32,
-                            ..Default::default()
-                        },
-                    ),
+        let writes = vec![
+            BufferBinding::buffer(0, q),
+            BufferBinding::buffer(1, kv_k),
+            BufferBinding::buffer(2, kv_v),
+            BufferBinding::buffer(3, out),
+            BufferBinding::buffer(
+                4,
+                step_buf(
+                    &ctx,
+                    StepState {
+                        q0: q0 as u32,
+                        ..Default::default()
+                    },
                 ),
-            ],
-            [],
-        )
-        .unwrap();
+            ),
+        ];
+        let graph = ctx
+            .record_graph(|rec| {
+                for _ in 0..DISPATCHES {
+                    rec.dispatch(&kernel, writes.clone(), Some(GL_SCALE), [GL_KV_HEADS as u32, m as u32, 1])?;
+                }
+                Ok(())
+            })
+            .expect("record");
         group.bench_function(format!("prefill_global_m{m}_ctx{l}"), |b| {
             b.iter_custom(|iters| {
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    let mut builder = AutoCommandBufferBuilder::primary(
-                        ctx.command_buffer_allocator().clone(),
-                        ctx.queue().queue_family_index(),
-                        CommandBufferUsage::OneTimeSubmit,
-                    )
-                    .unwrap();
-                    builder
-                        .bind_pipeline_compute(kernel.pipeline().clone())
-                        .unwrap()
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Compute,
-                            layout.clone(),
-                            0,
-                            set.clone(),
-                        )
-                        .unwrap()
-                        .push_constants(layout.clone(), 0, GL_SCALE)
-                        .unwrap();
-                    for _ in 0..DISPATCHES {
-                        // SAFETY: [kv_heads, M] grid, the kernel's contract.
-                        unsafe { builder.dispatch([GL_KV_HEADS as u32, m as u32, 1]) }.unwrap();
-                    }
-                    builder
-                        .build()
-                        .unwrap()
-                        .execute(ctx.queue().clone())
-                        .unwrap()
-                        .then_signal_fence_and_flush()
-                        .unwrap()
-                        .wait(None)
-                        .unwrap();
+                    ctx.submit_blocking(&graph).unwrap();
                 }
                 let elapsed = start.elapsed();
                 let us = elapsed.as_secs_f64() * 1e6 / (iters as usize * DISPATCHES) as f64;
@@ -637,34 +462,16 @@ fn bench(c: &mut Criterion) {
             );
             let writes = || {
                 vec![
-                    WriteDescriptorSet::buffer(0, q.clone()),
-                    WriteDescriptorSet::buffer(1, kv_k.clone()),
-                    WriteDescriptorSet::buffer(2, kv_v.clone()),
-                    WriteDescriptorSet::buffer(3, out.clone()),
-                    WriteDescriptorSet::buffer(4, step.clone()),
+                    BufferBinding::buffer(0, q.clone()),
+                    BufferBinding::buffer(1, kv_k.clone()),
+                    BufferBinding::buffer(2, kv_v.clone()),
+                    BufferBinding::buffer(3, out.clone()),
+                    BufferBinding::buffer(4, step.clone()),
                 ]
             };
-            let set_naive = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                naive.layout().set_layouts()[0].clone(),
-                writes(),
-                [],
-            )
-            .unwrap();
-            let set_flash = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                flash.layout().set_layouts()[0].clone(),
-                writes(),
-                [],
-            )
-            .unwrap();
-            let set_flash_sp = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                flash_sp.layout().set_layouts()[0].clone(),
-                writes(),
-                [],
-            )
-            .unwrap();
+            let set_naive = writes();
+            let set_flash = writes();
+            let set_flash_sp = writes();
             // Q8 KV buffers (dummy: timing is data-independent). Blocks of 32
             // over the [l × GL_KV_HEADS × GL_DIM] cache → l·64 blocks each.
             let blocks = l * GL_KV_HEADS * GL_DIM / 32;
@@ -692,68 +499,44 @@ fn bench(c: &mut Criterion) {
                     BufferUsage::STORAGE_BUFFER,
                 )
                 .unwrap();
-            let set_flash_sp_iq = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                flash_sp_iq.layout().set_layouts()[0].clone(),
-                vec![
-                    WriteDescriptorSet::buffer(0, q_i8.clone()),
-                    WriteDescriptorSet::buffer(1, q_sc.clone()),
-                    WriteDescriptorSet::buffer(2, kq.clone()),
-                    WriteDescriptorSet::buffer(3, ks.clone()),
-                    WriteDescriptorSet::buffer(4, kv_v.clone()),
-                    WriteDescriptorSet::buffer(5, out.clone()),
-                    WriteDescriptorSet::buffer(6, step.clone()),
-                ],
-                [],
-            )
-            .unwrap();
-            let set_flash_sp_ipv = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                flash_sp_ipv.layout().set_layouts()[0].clone(),
-                vec![
-                    WriteDescriptorSet::buffer(0, q_i8.clone()),
-                    WriteDescriptorSet::buffer(1, q_sc.clone()),
-                    WriteDescriptorSet::buffer(2, kq.clone()),
-                    WriteDescriptorSet::buffer(3, ks.clone()),
-                    WriteDescriptorSet::buffer(4, vq.clone()),
-                    WriteDescriptorSet::buffer(5, vs.clone()),
-                    WriteDescriptorSet::buffer(6, out.clone()),
-                    WriteDescriptorSet::buffer(7, step.clone()),
-                ],
-                [],
-            )
-            .unwrap();
-            let set_flash_sp_ipv_bcast = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                flash_sp_ipv_bcast.layout().set_layouts()[0].clone(),
-                vec![
-                    WriteDescriptorSet::buffer(0, q_i8.clone()),
-                    WriteDescriptorSet::buffer(1, q_sc.clone()),
-                    WriteDescriptorSet::buffer(2, kq.clone()),
-                    WriteDescriptorSet::buffer(3, ks.clone()),
-                    WriteDescriptorSet::buffer(4, vq.clone()),
-                    WriteDescriptorSet::buffer(5, vs.clone()),
-                    WriteDescriptorSet::buffer(6, out.clone()),
-                    WriteDescriptorSet::buffer(7, step.clone()),
-                ],
-                [],
-            )
-            .unwrap();
-            let set_flash_sp_q8 = DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                flash_sp_q8.layout().set_layouts()[0].clone(),
-                vec![
-                    WriteDescriptorSet::buffer(0, q.clone()),
-                    WriteDescriptorSet::buffer(1, kq.clone()),
-                    WriteDescriptorSet::buffer(2, ks.clone()),
-                    WriteDescriptorSet::buffer(3, vq.clone()),
-                    WriteDescriptorSet::buffer(4, vs.clone()),
-                    WriteDescriptorSet::buffer(5, out.clone()),
-                    WriteDescriptorSet::buffer(6, step.clone()),
-                ],
-                [],
-            )
-            .unwrap();
+            let set_flash_sp_iq = vec![
+                BufferBinding::buffer(0, q_i8.clone()),
+                BufferBinding::buffer(1, q_sc.clone()),
+                BufferBinding::buffer(2, kq.clone()),
+                BufferBinding::buffer(3, ks.clone()),
+                BufferBinding::buffer(4, kv_v.clone()),
+                BufferBinding::buffer(5, out.clone()),
+                BufferBinding::buffer(6, step.clone()),
+            ];
+            let set_flash_sp_ipv = vec![
+                BufferBinding::buffer(0, q_i8.clone()),
+                BufferBinding::buffer(1, q_sc.clone()),
+                BufferBinding::buffer(2, kq.clone()),
+                BufferBinding::buffer(3, ks.clone()),
+                BufferBinding::buffer(4, vq.clone()),
+                BufferBinding::buffer(5, vs.clone()),
+                BufferBinding::buffer(6, out.clone()),
+                BufferBinding::buffer(7, step.clone()),
+            ];
+            let set_flash_sp_ipv_bcast = vec![
+                BufferBinding::buffer(0, q_i8.clone()),
+                BufferBinding::buffer(1, q_sc.clone()),
+                BufferBinding::buffer(2, kq.clone()),
+                BufferBinding::buffer(3, ks.clone()),
+                BufferBinding::buffer(4, vq.clone()),
+                BufferBinding::buffer(5, vs.clone()),
+                BufferBinding::buffer(6, out.clone()),
+                BufferBinding::buffer(7, step.clone()),
+            ];
+            let set_flash_sp_q8 = vec![
+                BufferBinding::buffer(0, q.clone()),
+                BufferBinding::buffer(1, kq.clone()),
+                BufferBinding::buffer(2, ks.clone()),
+                BufferBinding::buffer(3, vq.clone()),
+                BufferBinding::buffer(4, vs.clone()),
+                BufferBinding::buffer(5, out.clone()),
+                BufferBinding::buffer(6, step.clone()),
+            ];
             // naive grid [kv_heads, M]; flash grids [q_heads, M/M_Q] (M_Q=16).
             time_prefill(
                 &mut cmp,

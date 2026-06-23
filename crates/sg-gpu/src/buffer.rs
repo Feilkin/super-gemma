@@ -229,6 +229,7 @@ impl<T> Drop for WriteGuard<'_, T> {
 /// A buffer bound at a descriptor-set binding for one dispatch (was
 /// `WriteDescriptorSet`). Type-erased over `T`; carries an `Arc` to the
 /// allocation so a recorded graph keeps it alive.
+#[derive(Clone)]
 pub struct BufferBinding {
     pub(crate) binding: u32,
     pub(crate) keep: Arc<BufferInner>,

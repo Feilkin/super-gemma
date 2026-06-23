@@ -5,14 +5,7 @@
 //! LDS (docs/naga-int8-coopmat-patch.md). Skips without a coopmat GPU.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
-};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::sync::GpuFuture;
+use sg_gpu::{BufferBinding, BufferUsage, GpuContext};
 
 const M: usize = 512;
 const DISPATCHES: usize = 4;
@@ -74,29 +67,29 @@ fn bench(c: &mut Criterion) {
 
     // (name, descriptor writes, n_block, m_block).
     let f16_writes = vec![
-        WriteDescriptorSet::buffer(0, w_f16.clone()),
-        WriteDescriptorSet::buffer(1, x_f16.clone()),
-        WriteDescriptorSet::buffer(2, y.clone()),
+        BufferBinding::buffer(0, w_f16.clone()),
+        BufferBinding::buffer(1, x_f16.clone()),
+        BufferBinding::buffer(2, y.clone()),
     ];
     // int8 MMQ now reads the SAME Q4_0 packed weights the f16 gemm does (it
     // unpacks nibbles → i8 in LDS in-kernel) — apples-to-apples, no repack.
     let i8_writes = vec![
-        WriteDescriptorSet::buffer(0, w_f16.clone()),
-        WriteDescriptorSet::buffer(1, x_i8.clone()),
-        WriteDescriptorSet::buffer(2, x_sc.clone()),
-        WriteDescriptorSet::buffer(3, y.clone()),
+        BufferBinding::buffer(0, w_f16.clone()),
+        BufferBinding::buffer(1, x_i8.clone()),
+        BufferBinding::buffer(2, x_sc.clone()),
+        BufferBinding::buffer(3, y.clone()),
     ];
     let raw_writes = vec![
-        WriteDescriptorSet::buffer(0, w_i8.clone()),
-        WriteDescriptorSet::buffer(1, x_i8.clone()),
-        WriteDescriptorSet::buffer(2, y.clone()),
+        BufferBinding::buffer(0, w_i8.clone()),
+        BufferBinding::buffer(1, x_i8.clone()),
+        BufferBinding::buffer(2, y.clone()),
     ];
     // (name, writes, n_block, m_block, swizzle, k, n). `swizzle` transposes the
     // dispatch to [M/m_block, N/n_block] for the M-fast-varying L2 lever; (k, n)
     // give the shape so flops + grid are computed per case.
     type Case = (
         &'static str,
-        Vec<WriteDescriptorSet>,
+        Vec<BufferBinding>,
         u32,
         u32,
         bool,
@@ -495,48 +488,22 @@ fn bench(c: &mut Criterion) {
         } else {
             [n / n_block, m / m_block, 1]
         };
-        let layout = kernel.layout().clone();
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator().clone(),
-            layout.set_layouts()[0].clone(),
-            writes,
-            [],
-        )
-        .expect("set");
+        // `dispatch_overlapping` (no inter-dispatch barrier) reproduces the
+        // historical vulkano behavior for these coopStore kernels.
+        let graph = ctx
+            .record_graph(|rec| {
+                for _ in 0..DISPATCHES {
+                    rec.dispatch_overlapping(&kernel, writes.clone(), None::<u32>, grid)?;
+                }
+                Ok(())
+            })
+            .expect("record");
 
         group.bench_function(name, |b| {
             b.iter_custom(|iters| {
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
-                    let mut builder = AutoCommandBufferBuilder::primary(
-                        ctx.command_buffer_allocator().clone(),
-                        ctx.queue().queue_family_index(),
-                        CommandBufferUsage::OneTimeSubmit,
-                    )
-                    .unwrap();
-                    builder
-                        .bind_pipeline_compute(kernel.pipeline().clone())
-                        .unwrap()
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Compute,
-                            layout.clone(),
-                            0,
-                            set.clone(),
-                        )
-                        .unwrap();
-                    for _ in 0..DISPATCHES {
-                        // SAFETY: tile grid covering M×N, the kernel's contract.
-                        unsafe { builder.dispatch(grid) }.unwrap();
-                    }
-                    builder
-                        .build()
-                        .unwrap()
-                        .execute(ctx.queue().clone())
-                        .unwrap()
-                        .then_signal_fence_and_flush()
-                        .unwrap()
-                        .wait(None)
-                        .unwrap();
+                    ctx.submit_blocking(&graph).unwrap();
                 }
                 let elapsed = start.elapsed();
                 let tflops = flops * iters as f64 / elapsed.as_secs_f64() / 1e12;

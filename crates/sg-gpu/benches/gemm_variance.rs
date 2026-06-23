@@ -7,14 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
-};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::sync::GpuFuture;
+use sg_gpu::{BufferBinding, BufferUsage, GpuContext};
 
 const M: usize = 512;
 const K: usize = 5376;
@@ -47,7 +40,6 @@ fn main() {
         return;
     }
     let kernel = ctx.load_kernel("gemm_q4_0_k5376_n21504").expect("kernel");
-    let layout = kernel.layout().clone();
 
     let weight_words = N * K / 32 * 18 / 4;
     let w = ctx
@@ -65,44 +57,27 @@ fn main() {
     let y = ctx
         .new_buffer::<u16>((M * N) as u64, BufferUsage::STORAGE_BUFFER)
         .unwrap();
-    let set = DescriptorSet::new(
-        ctx.descriptor_set_allocator().clone(),
-        layout.set_layouts()[0].clone(),
-        vec![
-            WriteDescriptorSet::buffer(0, w.clone()),
-            WriteDescriptorSet::buffer(1, x.clone()),
-            WriteDescriptorSet::buffer(2, y.clone()),
-        ],
-        [],
-    )
-    .unwrap();
-
-    let run_batch = || {
-        let mut builder = AutoCommandBufferBuilder::primary(
-            ctx.command_buffer_allocator().clone(),
-            ctx.queue().queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-        builder
-            .bind_pipeline_compute(kernel.pipeline().clone())
-            .unwrap()
-            .bind_descriptor_sets(PipelineBindPoint::Compute, layout.clone(), 0, set.clone())
-            .unwrap();
-        for _ in 0..DISPATCHES {
-            // SAFETY: tile grid covering M×N, the kernel's contract.
-            unsafe { builder.dispatch([(N / 64) as u32, (M / 64) as u32, 1]) }.unwrap();
-        }
-        builder
-            .build()
-            .unwrap()
-            .execute(ctx.queue().clone())
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap();
-    };
+    // One pre-recorded batch of DISPATCHES dispatches. `dispatch_overlapping`
+    // (no inter-dispatch barrier) reproduces the historical no-barrier overlap
+    // of the coopStore kernel under vulkano's auto-sync.
+    let graph = ctx
+        .record_graph(|rec| {
+            for _ in 0..DISPATCHES {
+                rec.dispatch_overlapping(
+                    &kernel,
+                    vec![
+                        BufferBinding::buffer(0, w.clone()),
+                        BufferBinding::buffer(1, x.clone()),
+                        BufferBinding::buffer(2, y.clone()),
+                    ],
+                    None::<u32>,
+                    [(N / 64) as u32, (M / 64) as u32, 1],
+                )?;
+            }
+            Ok(())
+        })
+        .expect("record");
+    let run_batch = || ctx.submit_blocking(&graph).unwrap();
 
     // Warm up to the boost clock.
     let t0 = Instant::now();

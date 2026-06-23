@@ -6,9 +6,7 @@
 //! (wall − GPU) per submit. Skips without a GPU.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage, GpuContext};
 
 const LAYERS: usize = 60;
 const MATMULS_PER_LAYER: usize = 4;
@@ -58,9 +56,9 @@ fn bench(c: &mut Criterion) {
                     rec.dispatch(
                         &kernel,
                         vec![
-                            WriteDescriptorSet::buffer(0, w_buf.clone()),
-                            WriteDescriptorSet::buffer(1, src),
-                            WriteDescriptorSet::buffer(2, dst),
+                            BufferBinding::buffer(0, w_buf.clone()),
+                            BufferBinding::buffer(1, src),
+                            BufferBinding::buffer(2, dst),
                         ],
                         Some(K as u32),
                         [N as u32, 1, 1],

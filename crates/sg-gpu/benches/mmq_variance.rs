@@ -9,14 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use sg_gpu::{GpuContext, Kernel};
-use vulkano::buffer::{BufferUsage, Subbuffer};
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
-};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::PipelineBindPoint;
-use vulkano::sync::{GpuFuture, PipelineStage};
+use sg_gpu::{Buffer, BufferBinding, BufferUsage, CommandGraph, GpuContext, Kernel};
 
 const N_BLOCK: u32 = 16;
 const BATCHES: usize = 50;
@@ -217,7 +210,7 @@ fn main() {
 
     // int8 operands: Q4_0 weights (u32 words), Q8 activations (i8 packed u32),
     // f16 scales, f16 out. Dummy-filled — steady-state timing is data-independent.
-    let w: Subbuffer<[u32]> = ctx
+    let w: Buffer<u32> = ctx
         .buffer_from_iter(
             (0..(ndim * kdim / 32 * 18 / 4) as u32).map(|i| i.wrapping_mul(0x9E37_79B9)),
             BufferUsage::STORAGE_BUFFER,
@@ -254,61 +247,41 @@ fn main() {
             }
         })
         .collect();
-    let sets: Vec<_> = kernels
+    // GPU timestamps bracket the dispatches (BottomOfPipe→BottomOfPipe), so we
+    // can compare PURE on-GPU execution against the CPU wall clock and confirm the
+    // CB-build/submit overhead isn't in the number. One pre-recorded graph per
+    // variant; `run` re-submits it and returns the GPU ns. `dispatch_overlapping`
+    // (no inter-dispatch barrier) preserves the historical n_disp>1 overlap
+    // semantics this harness is built around (default n_disp=1 → no overlap).
+    let timer = ctx.new_timer(2).expect("timer");
+    let graphs: Vec<CommandGraph> = kernels
         .iter()
-        .map(|k| {
-            DescriptorSet::new(
-                ctx.descriptor_set_allocator().clone(),
-                k.layout().set_layouts()[0].clone(),
-                vec![
-                    WriteDescriptorSet::buffer(0, w.clone()),
-                    WriteDescriptorSet::buffer(1, x.clone()),
-                    WriteDescriptorSet::buffer(2, xs.clone()),
-                    WriteDescriptorSet::buffer(3, y.clone()),
-                ],
-                [],
-            )
+        .zip(&grids)
+        .map(|(k, &grid)| {
+            ctx.record_graph(|rec| {
+                rec.reset_timer(&timer)?;
+                rec.timestamp(&timer, 0)?;
+                for _ in 0..n_disp {
+                    rec.dispatch_overlapping(
+                        k,
+                        vec![
+                            BufferBinding::buffer(0, w.clone()),
+                            BufferBinding::buffer(1, x.clone()),
+                            BufferBinding::buffer(2, xs.clone()),
+                            BufferBinding::buffer(3, y.clone()),
+                        ],
+                        None::<u32>,
+                        grid,
+                    )?;
+                }
+                rec.timestamp(&timer, 1)?;
+                Ok(())
+            })
             .unwrap()
         })
         .collect();
-
-    // GPU timestamps bracket the dispatches (BottomOfPipe→BottomOfPipe), so we
-    // can compare PURE on-GPU execution against the CPU wall clock and confirm the
-    // CB-build/submit overhead isn't in the number. `run` returns the GPU ns.
-    let timer = ctx.new_timer(2).expect("timer");
-    let run = |k: &Kernel, set: &std::sync::Arc<DescriptorSet>, grid: [u32; 3]| -> f64 {
-        let mut b = AutoCommandBufferBuilder::primary(
-            ctx.command_buffer_allocator().clone(),
-            ctx.queue().queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-        // SAFETY: pool not in use by a prior submit (we wait() below before reuse);
-        // BottomOfPipe orders the writes after all prior commands.
-        unsafe { b.reset_query_pool(timer.pool().clone(), 0..2) }.unwrap();
-        b.bind_pipeline_compute(k.pipeline().clone())
-            .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                k.layout().clone(),
-                0,
-                set.clone(),
-            )
-            .unwrap();
-        unsafe { b.write_timestamp(timer.pool().clone(), 0, PipelineStage::BottomOfPipe) }.unwrap();
-        for _ in 0..n_disp {
-            // SAFETY: swizzled [M-blocks, N-blocks] grid, the kernel's contract.
-            unsafe { b.dispatch(grid) }.unwrap();
-        }
-        unsafe { b.write_timestamp(timer.pool().clone(), 1, PipelineStage::BottomOfPipe) }.unwrap();
-        b.build()
-            .unwrap()
-            .execute(ctx.queue().clone())
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap();
+    let run = |g: &CommandGraph| -> f64 {
+        ctx.submit_blocking(g).unwrap();
         let ts = timer.read_ns().unwrap();
         ts[1] - ts[0]
     };
@@ -316,8 +289,8 @@ fn main() {
     // Warm up to the boost clock (round-robin so no variant is favoured).
     let t0 = Instant::now();
     while t0.elapsed() < WARMUP {
-        for ((k, s), &g) in kernels.iter().zip(&sets).zip(&grids) {
-            run(k, s, g);
+        for g in &graphs {
+            run(g);
         }
     }
     eprintln!("warmed up, sclk={}", sclk_mhz());
@@ -328,9 +301,9 @@ fn main() {
     let mut wall: Vec<Vec<f64>> = vec![Vec::with_capacity(BATCHES); variants.len()];
     let mut gpu: Vec<Vec<f64>> = vec![Vec::with_capacity(BATCHES); variants.len()];
     for _ in 0..BATCHES {
-        for (i, ((k, s), &g)) in kernels.iter().zip(&sets).zip(&grids).enumerate() {
+        for (i, g) in graphs.iter().enumerate() {
             let start = Instant::now();
-            let gpu_ns = run(k, s, g);
+            let gpu_ns = run(g);
             wall[i].push(flops / start.elapsed().as_secs_f64() / 1e12);
             gpu[i].push(flops / (gpu_ns / 1e9) / 1e12);
         }

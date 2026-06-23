@@ -1,15 +1,25 @@
 # Why move the GPU layer from vulkano to ash
 
-**Status: DONE (core + tests, 2026-06-24).** The `sg-gpu` runtime is now raw `ash`;
-vulkano is gone from its normal dependencies (dev-only, for the 8 not-yet-ported
-microbenches whose `[[bench]]` targets are disabled). The recorder inserts a real
-compute→compute barrier before every dispatch, so the `touch.wgsl` shim and the
-split-kernel visibility shim were **removed**. Validated by the full sg-gpu kernel
-parity/coopmat suite and the sg-model e2e `gpu_parity` gate (worst per-layer nrmse
-0.02487 ≤ 0.045, logits argmax + top-20 agree, full pre-recorded decode graph
-bit-exact vs the per-layer path). **Follow-up:** port the microbenches to a small
-public ash recording API (re-enable their targets, drop the vulkano dev-dep), and
-explore finer barrier scoping / deliberate overlap for split-M.
+**Status: DONE (2026-06-24).** The `sg-gpu` runtime is now raw `ash`; vulkano is
+**gone entirely** from sg-gpu (the only remaining workspace user is `sg-probe`, the
+diagnostic tool). The recorder inserts a real compute→compute barrier before every
+dispatch, so the `touch.wgsl` shim and the split-kernel visibility shim were
+**removed**. Validated by the full sg-gpu kernel parity/coopmat suite and the
+sg-model e2e `gpu_parity` gate (worst per-layer nrmse 0.02487 ≤ 0.045, logits
+argmax + top-20 agree, full pre-recorded decode graph bit-exact vs the per-layer
+path).
+
+All 8 microbenches were also ported (no new public API needed — they use
+`record_graph` once + `submit_blocking` in the timing loop, with `BufferBinding`,
+`GpuTimer`, and `dispatch`/`dispatch_overlapping`). The coopmat throughput benches
+(`gemm_tflops`, `mmq_tflops`, `gemm_variance`, `mmq_variance`) use
+`dispatch_overlapping` to preserve the historical no-barrier overlap semantics;
+`attn_us` uses `dispatch` (serialized) since its multi-dispatch loops are real
+WAW/partial→reduce dependencies. `mmq_variance` confirmed back online at 2900 MHz,
+cv 0.6–1.9%, deltas matching history (deployed 18.6 TFLOPS, bb m4 +12%).
+
+**Follow-up (optional):** explore finer per-buffer barrier scoping vs the current
+blanket pre-dispatch barrier, and deliberate overlap for the split-M experiments.
 
 The rest of this file is the original rationale (why the move was needed and the
 dead-end workarounds), kept for history. Written 2026-06-23.

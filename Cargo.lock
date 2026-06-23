@@ -1431,7 +1431,6 @@ dependencies = [
  "naga_oil",
  "sg-gguf",
  "thiserror",
- "vulkano",
 ]
 
 [[package]]
