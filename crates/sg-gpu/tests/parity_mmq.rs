@@ -379,6 +379,37 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         assert_close(&got, &want, 1e-4, 1e-4, variant);
     }
 
+    // Split-M kernel: M-block from a push constant, grid = [N-strips, 1, 1]. The
+    // host issues NB_M=4 dispatches (push 0..3), each writing a disjoint M-block of
+    // Y, which together must reproduce basic_dir.
+    {
+        let kernel = ctx
+            .load_kernel("gemm_q4_0_i8_bb_m4_split")
+            .expect("split");
+        let y_buf = ctx
+            .new_buffer::<u16>((m * n) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        let nb_m = (m / 64) as u32;
+        for mb in 0..nb_m {
+            ctx.dispatch_blocking(
+                &kernel,
+                vec![
+                    WriteDescriptorSet::buffer(0, w_buf.clone()),
+                    WriteDescriptorSet::buffer(1, x_buf.clone()),
+                    WriteDescriptorSet::buffer(2, xs_buf.clone()),
+                    WriteDescriptorSet::buffer(3, y_buf.clone()),
+                ],
+                Some(mb),
+                [nb_n, 1, 1],
+            )
+            .unwrap();
+        }
+        let got = from_f16_bits(&y_buf.read().unwrap());
+        let err = nrmse(&got, &want);
+        eprintln!("gemm_q4_0_i8_bb_m4_split vs basic_dir nrmse {err:.8}");
+        assert_close(&got, &want, 1e-4, 1e-4, "gemm_q4_0_i8_bb_m4_split");
+    }
+
     // Full-occupancy kernel (gemm_q4_0_i8_fo) — plain 2D [M-blocks, N-blocks] grid
     // (wg.x = m_block, wg.y = n_block), tile height M_ROWS = M_TILES·16. Must
     // reproduce basic_dir for every tiling / ILP / prefetch / barrier toggle.

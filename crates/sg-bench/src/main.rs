@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 
 mod profile;
 mod rgp;
+mod splitbench;
 
 #[derive(Parser)]
 #[command(version, about = "super-gemma benchmark harness (JSON results)")]
@@ -48,6 +49,8 @@ enum Cmd {
     },
     /// Scripted coding-agent session composite (M7+).
     AgentLoop,
+    /// Split-M dispatch A/B: bb_m4 (1 dispatch) vs bb_m4_split (4 serialized).
+    SplitBench,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -56,6 +59,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Profile => profile::run(&args.model),
         Cmd::Rgp { kernel } => rgp::run(&kernel),
         Cmd::RgpPrefill { q0 } => rgp::run_prefill(&args.model, q0),
+        Cmd::SplitBench => splitbench::run(),
         cmd => anyhow::bail!(
             "`{cmd:?}` is not implemented yet; see the milestone map in this binary's docs"
         ),

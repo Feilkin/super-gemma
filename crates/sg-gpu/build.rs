@@ -1432,6 +1432,20 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // bb_m4 with the M-block chosen by a push constant, grid = N-strips only
+    // [NB_N,1,1]. The host issues NB_M=4 serialized dispatches so only ONE M-block
+    // (≤336 waves, one 1.31 MiB X-slab) is ever in flight → caps concurrency at the
+    // L2-friendly window instead of the ~400-wave occupancy lottery.
+    Variant {
+        name: "gemm_q4_0_i8_bb_m4_split",
+        src: "gemm_q4_0_i8_bb_m4_split",
+        defs: &[("PF", 0)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 4,
+        subgroup_size: 0,
+        raw: true,
+    },
     // MULTI-WAVE occupancy GEMM (gemm_q4_0_i8_mw) — TESTED DEAD END (2026-06-21),
     // kept as documented A/B baselines like gemm_q4_0_i8_occ; NOT in any graph. A
     // workgroup of BM_TILES·BN_TILES waves, ONE 16×16 tile per wave, sharing the

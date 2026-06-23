@@ -1,14 +1,60 @@
 # STATUS — read this first
 
-Last updated: **2026-06-23** (full-occupancy GEMM family `fo` + fully-unrolled `bb` — documented
-negative, ceiling −15.5%; but surfaced the SXP d_a-scale hoist (+4–9%, transferable) and the
-stall-count-beats-wave-count result), working on the Framework Desktop target box. The conversation
-history that produced this repo is gone; everything needed to continue is in this file, `AGENTS.md`,
-and `docs/plans/`.
+Last updated: **2026-06-23b** (bb_m4 tall-tile GEMM; super-block swizzle; split-M concurrency
+experiment; and a measurement-methodology correction — `pp_dpm_sclk` is the DPM *ceiling*, not the
+achieved clock; vulkano can't barrier coopmat dispatches → ash migration planned), Framework Desktop
+target box. The conversation history that produced this repo is gone; everything needed to continue
+is in this file, `AGENTS.md`, and `docs/plans/`.
 
 **Perf-number rule (AGENTS.md):** every performance number here cites its benchmark + operating
 point, e.g. `(bench: gemm_variance, perf=high)`. Numbers are at `perf=high` unless noted; `auto`
 reads ~30 % low. When a benchmark changes, update the numbers (grep for the old value).
+
+## 2026-06-23b — bb_m4 tall-tile, super-block swizzle, split-M, and a measurement correction
+
+**No perf verdicts in this section — only measured facts. Whether any of these wins is Ada's call.**
+
+**bb_m4 (`gemm_q4_0_i8_bb_m4.wgsl`, committed `b089e05`):** bb extended to M_TILES=4 / M_ROWS=64
+(the deployed `swz_m4n1` tile height), one-batch body unchanged. 144 VGPR, no spill (`RADV_DEBUG=
+shaderstats`). Measured (bench: mmq_variance, n_disp=1, cv ~0.3–0.6% GPU, verified-stable clock):
+**+11.6% over bb** (14.05→15.68 GPU TFLOPS) and **−4.6% vs deployed** (15.68 vs 16.44). `bb_m4_pf`
+(weight prefetch) measured slightly slower than `bb_m4` (15.41 vs 15.68).
+
+**Super-block swizzle (`gemm_q4_0_i8_bb_m4_swz.wgsl`, committed `56b1c20`):** bb_m4 + the `l2`
+family's `tile_index` BN_SB super-block decode (1D dispatch), BN_SB sweep 1/2/4/8. 144 VGPR, parity
+bit-exact. Measured (same bench): sb1 (plain transpose) ≈ bb_m4; sb2/sb4/sb8 measured **worse** than
+bb_m4. (Reasoning that the 4×1 tile already captures the weight reuse the swizzle targets is a
+hypothesis, not proven.)
+
+**Split-M dispatch experiment (`gemm_q4_0_i8_bb_m4_split.wgsl` + `sg-bench split-bench`,
+uncommitted→this commit):** M-block chosen by a push constant, grid = N-strips only `[NB_N,1,1]`, host
+issues NB_M=4 dispatches to cap concurrency at one M-block (≤336 waves). Parity bit-exact.
+**No trustworthy timing obtained** — the harness is bursty (15–45% busy), which destabilises the
+clock (cv 2–6.5%), so its split-vs-bb_m4 numbers are NOT reliable and **no performance conclusion is
+drawn**. Serializing the dispatches required a **visibility-shim hack** (see below); real barriers
+need the ash migration.
+
+**Measurement-methodology corrections (hard evidence):**
+- **The clock holds 2900 MHz under sustained load** — it does NOT droop/stretch. Evidence: `SG_BENCH_
+  DISPATCHES=40` pegged the GPU at 100% busy and rocm-smi read a solid 2900 MHz throughout (cv 0.13%).
+  (This *disproved* an in-session "dense load stretches the clock" hypothesis.)
+- **`pp_dpm_sclk` (the benches' `sclk=` print) is the DPM ceiling, not the achieved clock.** Under
+  bursty load it samples idle states (e.g. printed `1738` while dispatches ran near 2900). Read the
+  actual clock via **rocm-smi/`gpu_metrics`**. cv is the reliable proxy for clock stability: low cv
+  (~0.3%) = stable/trustworthy; high cv (2–6.5%) = bursty clock-ramp, untrustworthy.
+- **Dispatch overlap (`n_disp`>1) costs ~24% on bb_m4** at the same clock: n_disp=40 (overlapping, no
+  barrier) = 13.17 vs n_disp=1 (serial) = 16.32 GPU TFLOPS. Cause: coopStore writes are invisible to
+  vulkano auto-sync → no barrier → overlapping dispatches L2-thrash. Keep `n_disp=1`.
+
+**vulkano barrier limitation → ash migration (planned, see `docs/ash-migration-rationale.md`).**
+vulkano's auto-sync derives barriers from SPIR-V reflection, which can't see cooperative-matrix
+accesses, so it inserts no barrier between coopmat dispatches and gives no way to insert a controlled
+one. Workarounds tried: `touch.wgsl` (can't anchor to an invisible coopStore write); an in-kernel
+visibility shim (works but a hack — fake dead store, conservative buffer-granularity barrier, no scope
+control); 4 fenced submits (~250 µs CPU gap/boundary, bursty); raw `sys::RecordingCommandBuffer` +
+`pipeline_barrier` (blocked — `sys::CommandBuffer` doesn't impl `PrimaryCommandBufferAbstract`, so it
+can't be submitted without raw `ash` anyway). Decision: switch the GPU layer to **ash** for real,
+controllable barriers. Full rationale + scope in `docs/ash-migration-rationale.md`.
 
 ## 2026-06-23 — full-occupancy GEMM (`fo`/`bb`): documented negative, but the SXP scale-hoist + stall-count>wave-count
 
