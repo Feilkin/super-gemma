@@ -52,6 +52,47 @@ fn config() -> (usize, usize, usize, &'static [(&'static str, &'static str, u32)
     }
 }
 
+/// Pick which variants actually run. The full table is the historical A/B archive
+/// (mostly documented negatives); running all ~40 each pass sustains a lot of heat.
+/// Row 0 (the deployed reference) is ALWAYS kept — it's the Δ baseline.
+///   unset             → active set: deployed reference + the current line of work
+///                       (the `bb` family); falls back to the full table if that
+///                       selects nothing (e.g. the tiny `up` set).
+///   SG_BENCH_ONLY=all → the full table.
+///   SG_BENCH_ONLY=a,b → row 0 plus every other row whose label or kernel name
+///                       contains one of the comma-separated needles.
+fn select(
+    all: &'static [(&'static str, &'static str, u32)],
+) -> Vec<(&'static str, &'static str, u32)> {
+    match std::env::var("SG_BENCH_ONLY").ok().as_deref() {
+        Some("all") => all.to_vec(),
+        Some(list) => {
+            let needles: Vec<&str> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut out = vec![all[0]];
+            out.extend(all.iter().skip(1).copied().filter(|(label, kern, _)| {
+                needles.iter().any(|n| label.contains(n) || kern.contains(n))
+            }));
+            out
+        }
+        None => {
+            let active: Vec<_> = all
+                .iter()
+                .copied()
+                .filter(|(_, kern, _)| *kern == all[0].1 || kern.contains("bb"))
+                .collect();
+            if active.len() <= 1 {
+                all.to_vec()
+            } else {
+                active
+            }
+        }
+    }
+}
+
 /// Down-gemm variants under test — same shape/bindings, so the only difference
 /// is the kernel body + its tile decomposition (`m_block` = M-rows per
 /// workgroup). `deployed` carries the banked deep-prefetch (was +6.1% over the
@@ -157,8 +198,14 @@ fn main() {
         eprintln!("skipping: no VK_KHR_cooperative_matrix");
         return;
     }
-    let (mdim, kdim, ndim, variants) = config();
+    let (mdim, kdim, ndim, variants_all) = config();
+    let variants = select(variants_all);
     let n_disp = dispatches();
+    eprintln!(
+        "running {} / {} variants (SG_BENCH_ONLY to widen/narrow)",
+        variants.len(),
+        variants_all.len()
+    );
 
     // int8 operands: Q4_0 weights (u32 words), Q8 activations (i8 packed u32),
     // f16 scales, f16 out. Dummy-filled — steady-state timing is data-independent.
