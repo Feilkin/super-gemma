@@ -84,6 +84,10 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         "gemm_q4_0_i8_bb_pf" => (21504, 5376, 16, 32, true, true), // bb + weight prefetch
         "gemm_q4_0_i8_bb_m4" => (21504, 5376, 16, 64, true, true), // bb, M_TILES=4
         "gemm_q4_0_i8_bb_m4_pf" => (21504, 5376, 16, 64, true, true),
+        "gemm_q4_0_i8_bb_m4_swz_sb1" => (21504, 5376, 16, 64, true, false), // bb_m4 + super-block (1D)
+        "gemm_q4_0_i8_bb_m4_swz_sb2" => (21504, 5376, 16, 64, true, false),
+        "gemm_q4_0_i8_bb_m4_swz_sb4" => (21504, 5376, 16, 64, true, false),
+        "gemm_q4_0_i8_bb_m4_swz_sb8" => (21504, 5376, 16, 64, true, false),
         // Multi-wave occupancy GEMM (one 16×16 tile/wave, shared LDS weight strip).
         // n-block = BN, m-block = BM; swizzled like the deployed 4×1. The down-shape
         // family A/Bs the deployed m4n1 down-gemm; b41 up matches the gate/up site.
@@ -321,7 +325,7 @@ pub fn run(kernel: &str) -> anyhow::Result<()> {
     // Swizzled kernels expect [M-blocks, N-blocks]; the rest [N-blocks, M-blocks].
     // The l2 kernel is 1D (one workgroup per output tile, tile_index decode) — its
     // bench/winning config, so capture it that way.
-    let groups = if kernel.contains("_l2") {
+    let groups = if kernel.contains("_l2") || kernel.contains("bb_m4_swz") {
         [(n as u32 / nb) * (m as u32 / mb), 1, 1]
     } else if swz {
         [m as u32 / mb, n as u32 / nb, 1]

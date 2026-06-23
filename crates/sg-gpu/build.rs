@@ -1387,6 +1387,51 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // bb_m4 + the l2 super-block (BN_SB) swizzle (1D dispatch, tile_index decode):
+    // co-schedule BN_SB n-strips × all M-blocks so one X-block stays L2-hot while
+    // the BN_SB weight strips reuse down M. BN_SB=1 is the plain transpose; sweep
+    // 1/2/4/8 (4 was the proven l2 sweet spot). The L2-schedule attack on bb_m4's
+    // remaining 4.6% gap to deployed.
+    Variant {
+        name: "gemm_q4_0_i8_bb_m4_swz_sb1",
+        src: "gemm_q4_0_i8_bb_m4_swz",
+        defs: &[("PF", 0), ("BN_SB", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_bb_m4_swz_sb2",
+        src: "gemm_q4_0_i8_bb_m4_swz",
+        defs: &[("PF", 0), ("BN_SB", 2)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_bb_m4_swz_sb4",
+        src: "gemm_q4_0_i8_bb_m4_swz",
+        defs: &[("PF", 0), ("BN_SB", 4)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_bb_m4_swz_sb8",
+        src: "gemm_q4_0_i8_bb_m4_swz",
+        defs: &[("PF", 0), ("BN_SB", 8)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // MULTI-WAVE occupancy GEMM (gemm_q4_0_i8_mw) — TESTED DEAD END (2026-06-21),
     // kept as documented A/B baselines like gemm_q4_0_i8_occ; NOT in any graph. A
     // workgroup of BM_TILES·BN_TILES waves, ONE 16×16 tile per wave, sharing the

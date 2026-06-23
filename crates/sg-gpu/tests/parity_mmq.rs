@@ -368,6 +368,10 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         ("gemm_q4_0_i8_l2_b4_b2_axp3", 64u32), // activation prefetch (cross-iter, double-buffered)
         ("gemm_q4_0_i8_l2_axp4", 64u32), // static-unroll ping-pong (dedicated file)
         ("gemm_q4_0_i8_l2_axp4_pf", 64u32), // ping-pong + weight prefetch
+        ("gemm_q4_0_i8_bb_m4_swz_sb1", 64u32), // bb_m4 + super-block swizzle (1D)
+        ("gemm_q4_0_i8_bb_m4_swz_sb2", 64u32),
+        ("gemm_q4_0_i8_bb_m4_swz_sb4", 64u32),
+        ("gemm_q4_0_i8_bb_m4_swz_sb8", 64u32),
     ] {
         let got = run(variant, [nb_n * (m as u32 / m_rows), 1, 1]);
         let err = nrmse(&got, &want);

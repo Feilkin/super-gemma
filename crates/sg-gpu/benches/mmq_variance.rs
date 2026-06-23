@@ -167,6 +167,11 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     // bb at the deployed tile height (M_TILES=4): half the waves, 2× weight reuse.
     ("bb m4", "gemm_q4_0_i8_bb_m4", 64),
     ("bb m4 pf", "gemm_q4_0_i8_bb_m4_pf", 64),
+    // bb_m4 + super-block (BN_SB) swizzle — the L2-schedule sweep.
+    ("bb m4 swz sb1", "gemm_q4_0_i8_bb_m4_swz_sb1", 64),
+    ("bb m4 swz sb2", "gemm_q4_0_i8_bb_m4_swz_sb2", 64),
+    ("bb m4 swz sb4", "gemm_q4_0_i8_bb_m4_swz_sb4", 64),
+    ("bb m4 swz sb8", "gemm_q4_0_i8_bb_m4_swz_sb8", 64),
 ];
 
 /// Up shape (FFN gate/up, K=5376 N=21504) — the occupancy/bytes confirmation set:
@@ -239,8 +244,8 @@ fn main() {
     let grids: Vec<[u32; 3]> = variants
         .iter()
         .map(|(_, kern, mb)| {
-            if kern.contains("_l2") {
-                // 1D: one workgroup per output tile, decoded in-kernel.
+            if kern.contains("_l2") || kern.contains("bb_m4_swz") {
+                // 1D: one workgroup per output tile, decoded in-kernel (tile_index).
                 [(ndim as u32 / N_BLOCK) * (mdim as u32 / mb), 1, 1]
             } else if kern.contains("basic") {
                 [ndim as u32 / N_BLOCK, mdim as u32 / mb, 1]
