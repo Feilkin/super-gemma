@@ -11,7 +11,7 @@
 //! the (unavoidable, for now) serialization overhead. The wall-clock total — gaps
 //! included — is reported separately as the production-reality figure.
 
-use sg_gpu::{BufferUsage, GpuContext, WriteDescriptorSet};
+use sg_gpu::{BufferUsage, GpuContext, BufferBinding};
 
 const K: usize = 21504;
 const N: usize = 5376;
@@ -64,10 +64,10 @@ pub fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let writes = || {
         vec![
-            WriteDescriptorSet::buffer(0, w.clone()),
-            WriteDescriptorSet::buffer(1, x.clone()),
-            WriteDescriptorSet::buffer(2, xs.clone()),
-            WriteDescriptorSet::buffer(3, y.clone()),
+            BufferBinding::buffer(0, w.clone()),
+            BufferBinding::buffer(1, x.clone()),
+            BufferBinding::buffer(2, xs.clone()),
+            BufferBinding::buffer(3, y.clone()),
         ]
     };
 

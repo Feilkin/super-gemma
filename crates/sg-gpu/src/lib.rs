@@ -1,8 +1,11 @@
-//! Vulkan compute runtime: device/queue management (vulkano), build-time
+//! Vulkan compute runtime on raw `ash`: device/queue management, build-time
 //! WGSL→SPIR-V kernel library (naga-oil + naga, see `build.rs`), buffer and
 //! descriptor plumbing on unified memory, and command-graph recording.
 //!
 //! Scope and design: `docs/plans/02-gpu-runtime-and-kernels.md`. Lands in M2.
+//! The GPU layer is `ash` (not vulkano) so we own the pipeline barriers between
+//! dispatches — vulkano's auto-sync could not see cooperative-matrix accesses
+//! and so never barriered consecutive coopmat GEMMs (`docs/ash-migration-rationale.md`).
 //!
 //! GPU-dependent tests construct a [`GpuContext`] and skip when it errors
 //! (Tier 1 CI has no GPU); kernel SPIR-V is still compiled and validated by
@@ -14,23 +17,22 @@ mod exec;
 mod graph;
 mod kernel;
 
+pub use buffer::{Buffer, BufferBinding, BufferUsage};
 pub use context::GpuContext;
+// The element bound for [`Buffer`]/push constants, re-exported so consumers can
+// name it without taking a direct bytemuck dependency.
+pub use bytemuck::Pod;
 pub use graph::{CommandGraph, GpuTimer, GraphRecorder, STEP_WORDS, StepState};
 pub use kernel::{KERNELS, Kernel, KernelBlob, kernel_blob};
-// The buffer/descriptor currency of this crate's API, re-exported so graph
-// assembly (sg-model) names them without a direct vulkano dependency — one
-// place pins the vulkano version.
-pub use vulkano::buffer::{BufferUsage, Subbuffer};
-pub use vulkano::descriptor_set::WriteDescriptorSet;
 
 /// Runtime GPU errors. Off-target conditions (no Vulkan, no capable device)
 /// are ordinary variants so tests can skip rather than fail.
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
     #[error("Vulkan library unavailable: {0}")]
-    Library(#[from] vulkano::LoadingError),
+    Library(String),
     #[error("Vulkan: {0}")]
-    Runtime(#[from] vulkano::VulkanError),
+    Vk(String),
     #[error("no suitable GPU (need {0})")]
     NoDevice(&'static str),
     #[error("unknown kernel `{0}`")]
@@ -39,17 +41,6 @@ pub enum GpuError {
     Pipeline(String),
     #[error("{0}")]
     Validation(String),
-}
-
-impl GpuError {
-    /// Collapse vulkano's `Validated<E>` (runtime error vs validation error)
-    /// into our error type.
-    fn validated<E: std::fmt::Display>(err: vulkano::Validated<E>) -> Self {
-        match err {
-            vulkano::Validated::Error(e) => GpuError::Validation(e.to_string()),
-            vulkano::Validated::ValidationError(e) => GpuError::Validation(e.to_string()),
-        }
-    }
 }
 
 #[cfg(test)]

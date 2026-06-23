@@ -1,7 +1,18 @@
 # Why move the GPU layer from vulkano to ash
 
-**Status:** planned task (not started). This documents *why*, and the workarounds
-already tried, so the next agent doesn't re-walk the dead ends. Written 2026-06-23.
+**Status: DONE (core + tests, 2026-06-24).** The `sg-gpu` runtime is now raw `ash`;
+vulkano is gone from its normal dependencies (dev-only, for the 8 not-yet-ported
+microbenches whose `[[bench]]` targets are disabled). The recorder inserts a real
+compute→compute barrier before every dispatch, so the `touch.wgsl` shim and the
+split-kernel visibility shim were **removed**. Validated by the full sg-gpu kernel
+parity/coopmat suite and the sg-model e2e `gpu_parity` gate (worst per-layer nrmse
+0.02487 ≤ 0.045, logits argmax + top-20 agree, full pre-recorded decode graph
+bit-exact vs the per-layer path). **Follow-up:** port the microbenches to a small
+public ash recording API (re-enable their targets, drop the vulkano dev-dep), and
+explore finer barrier scoping / deliberate overlap for split-M.
+
+The rest of this file is the original rationale (why the move was needed and the
+dead-end workarounds), kept for history. Written 2026-06-23.
 
 ## The core limitation
 

@@ -175,15 +175,8 @@ fn main(
     coopStoreT(f16(yacc1), &y[(m0 + 16u) * N + n0], N);
     coopStoreT(f16(yacc2), &y[(m0 + 32u) * N + n0], N);
     coopStoreT(f16(yacc3), &y[(m0 + 48u) * N + n0], N);
-
-    // Visibility shim (see touch.wgsl): the coopStore writes above are invisible to
-    // vulkano's SPIR-V-reflection auto-sync, so consecutive split dispatches get NO
-    // write→write barrier and overlap. This never-true guarded NORMAL store is what
-    // reflection sees, marking y written → auto-sync serializes the M-block dispatches
-    // with a real GPU-side compute→compute barrier (no CPU fence gaps). The guard is
-    // never true (lid ≤ 63), so nothing is actually written; the runtime-dependent
-    // condition keeps naga/ACO from eliding it.
-    if (lid == 0xFFFFFFFFu) {
-        y[0] = 0.0h;
-    }
+    // (Removed the never-true `y` visibility shim: the ash recorder now emits a
+    // real compute→compute barrier between split-M dispatches, so the coopStore
+    // writes no longer need to be made reflection-visible to force one. See
+    // docs/ash-migration-rationale.md.)
 }

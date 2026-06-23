@@ -10,8 +10,7 @@ mod reference;
 
 use reference::{Rng, assert_close, attention_head, from_f16_bits, through_f16, to_f16_bits};
 use sg_gpu::{GpuContext, StepState};
-use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage};
 
 const N_Q_HEADS: usize = 32;
 const KV_HEADS: usize = 16;
@@ -23,7 +22,7 @@ const N_SPLITS: u32 = 2;
 const PART_STRIDE: usize = DIM + 2;
 const STEPS: usize = 3;
 
-#[derive(BufferContents, Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct PushSplitScale {
     n_splits: u32,
@@ -87,9 +86,9 @@ fn recorded_graph_follows_step_updates() {
                 .dispatch(
                     &append_k,
                     vec![
-                        WriteDescriptorSet::buffer(0, src_k.clone()),
-                        WriteDescriptorSet::buffer(1, ring_k.clone()),
-                        WriteDescriptorSet::buffer(2, step.clone()),
+                        BufferBinding::buffer(0, src_k.clone()),
+                        BufferBinding::buffer(1, ring_k.clone()),
+                        BufferBinding::buffer(2, step.clone()),
                     ],
                     None::<u32>,
                     append_k.groups_for(ROW as u64),
@@ -97,9 +96,9 @@ fn recorded_graph_follows_step_updates() {
                 .dispatch(
                     &append_k,
                     vec![
-                        WriteDescriptorSet::buffer(0, src_v.clone()),
-                        WriteDescriptorSet::buffer(1, ring_v.clone()),
-                        WriteDescriptorSet::buffer(2, step.clone()),
+                        BufferBinding::buffer(0, src_v.clone()),
+                        BufferBinding::buffer(1, ring_v.clone()),
+                        BufferBinding::buffer(2, step.clone()),
                     ],
                     None::<u32>,
                     append_k.groups_for(ROW as u64),
@@ -107,11 +106,11 @@ fn recorded_graph_follows_step_updates() {
                 .dispatch(
                     &attn_k,
                     vec![
-                        WriteDescriptorSet::buffer(0, q_buf.clone()),
-                        WriteDescriptorSet::buffer(1, ring_k.clone()),
-                        WriteDescriptorSet::buffer(2, ring_v.clone()),
-                        WriteDescriptorSet::buffer(3, part.clone()),
-                        WriteDescriptorSet::buffer(4, step.clone()),
+                        BufferBinding::buffer(0, q_buf.clone()),
+                        BufferBinding::buffer(1, ring_k.clone()),
+                        BufferBinding::buffer(2, ring_v.clone()),
+                        BufferBinding::buffer(3, part.clone()),
+                        BufferBinding::buffer(4, step.clone()),
                     ],
                     Some(PushSplitScale {
                         n_splits: N_SPLITS,
@@ -122,8 +121,8 @@ fn recorded_graph_follows_step_updates() {
                 .dispatch(
                     &red_k,
                     vec![
-                        WriteDescriptorSet::buffer(0, part.clone()),
-                        WriteDescriptorSet::buffer(1, out.clone()),
+                        BufferBinding::buffer(0, part.clone()),
+                        BufferBinding::buffer(1, out.clone()),
                     ],
                     Some(N_SPLITS),
                     [N_Q_HEADS as u32, 1, 1],

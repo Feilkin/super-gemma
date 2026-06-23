@@ -172,19 +172,6 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: false,
     },
-    // Synchronization shim for recorded graphs (see touch.wgsl): a no-op
-    // with a reflection-VISIBLE read_write on its binding, dispatched on a
-    // buffer that a following coopmat kernel reads invisibly.
-    Variant {
-        name: "touch",
-        src: "touch",
-        defs: &[],
-        workgroup: [1, 1, 1],
-        bindings: 1,
-        push_bytes: 0,
-        subgroup_size: 0,
-        raw: false,
-    },
     // Residual join: y = (a + b) * s; s carries layer_output_scale on the
     // FFN join, 1.0 on the attention join (M3 graph).
     Variant {

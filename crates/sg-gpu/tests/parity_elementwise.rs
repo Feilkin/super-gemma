@@ -5,8 +5,7 @@ mod reference;
 
 use reference::{Rng, assert_close, from_f16_bits, through_f16, to_f16_bits};
 use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage};
 
 fn ctx() -> Option<GpuContext> {
     match GpuContext::new() {
@@ -54,9 +53,9 @@ fn rmsnorm_matches_reference_for_all_row_lengths() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, x_buf),
-                WriteDescriptorSet::buffer(1, w_buf.clone()),
-                WriteDescriptorSet::buffer(2, y_buf.clone()),
+                BufferBinding::buffer(0, x_buf),
+                BufferBinding::buffer(1, w_buf.clone()),
+                BufferBinding::buffer(2, y_buf.clone()),
             ],
             None::<u32>,
             [rows as u32, 1, 1], // one workgroup per row
@@ -100,8 +99,8 @@ fn rope_matches_reference_for_all_sites() {
             ctx.dispatch_blocking(
                 &kernel,
                 vec![
-                    WriteDescriptorSet::buffer(0, buf.clone()),
-                    WriteDescriptorSet::buffer(1, cs_buf),
+                    BufferBinding::buffer(0, buf.clone()),
+                    BufferBinding::buffer(1, cs_buf),
                 ],
                 None::<u32>,
                 kernel.groups_for(pairs as u64),
@@ -159,9 +158,9 @@ fn geglu_matches_reference() {
     ctx.dispatch_blocking(
         &kernel,
         vec![
-            WriteDescriptorSet::buffer(0, g_buf),
-            WriteDescriptorSet::buffer(1, u_buf),
-            WriteDescriptorSet::buffer(2, y_buf.clone()),
+            BufferBinding::buffer(0, g_buf),
+            BufferBinding::buffer(1, u_buf),
+            BufferBinding::buffer(2, y_buf.clone()),
         ],
         None::<u32>,
         kernel.groups_for(n as u64),
@@ -197,9 +196,9 @@ fn add_scaled_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, a_buf),
-                WriteDescriptorSet::buffer(1, b_buf),
-                WriteDescriptorSet::buffer(2, y_buf.clone()),
+                BufferBinding::buffer(0, a_buf),
+                BufferBinding::buffer(1, b_buf),
+                BufferBinding::buffer(2, y_buf.clone()),
             ],
             Some(scale),
             kernel.groups_for(n as u64),
@@ -236,9 +235,9 @@ fn rmsnorm_is_bit_deterministic() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, x_buf),
-                WriteDescriptorSet::buffer(1, w_buf),
-                WriteDescriptorSet::buffer(2, y_buf.clone()),
+                BufferBinding::buffer(0, x_buf),
+                BufferBinding::buffer(1, w_buf),
+                BufferBinding::buffer(2, y_buf.clone()),
             ],
             None::<u32>,
             [rows as u32, 1, 1],

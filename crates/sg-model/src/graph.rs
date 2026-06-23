@@ -23,8 +23,8 @@ use std::ops::Range;
 use half::f16;
 use sg_gguf::{GgmlType, Gguf, LayerKind, ModelDesc, q6_k};
 use sg_gpu::{
-    BufferUsage, CommandGraph, GpuContext, GpuError, GraphRecorder, Kernel, StepState, Subbuffer,
-    WriteDescriptorSet,
+    BufferUsage, CommandGraph, GpuContext, GpuError, GraphRecorder, Kernel, StepState, Buffer,
+    BufferBinding,
 };
 
 use crate::reference::RefError;
@@ -75,11 +75,11 @@ pub struct GpuModel<'a> {
     b: Bufs,
     /// Per-layer KV stores: sliding = 1024-slot ring, global = linear.
     kv: Vec<KvStore>,
-    step: Subbuffer<[u32]>,
+    step: Buffer<u32>,
     /// (cos, sin) for the current position: 128 live pairs sliding.
-    cs_sliding: Subbuffer<[f32]>,
+    cs_sliding: Buffer<f32>,
     /// 64 live pairs global (the frozen 192 are identities, never stored).
-    cs_global: Subbuffer<[f32]>,
+    cs_global: Buffer<f32>,
     p: PrefillBufs,
     /// Prefill chunk capacity (multiple of the gemm M_BLOCK 64).
     max_chunk: usize,
@@ -91,7 +91,7 @@ pub struct GpuModel<'a> {
     prefill_graphs: std::collections::HashMap<(usize, usize, LogitsMode), Vec<CommandGraph>>,
     /// `[max_chunk × vocab]` f32, allocated on first all-logits prefill
     /// (the perplexity path); ~270 MB at the default chunk size.
-    logits_all: Option<Subbuffer<[f32]>>,
+    logits_all: Option<Buffer<f32>>,
     /// Final-norm-over-all-rows graphs (keyed by m_pad) and LM-head row
     /// batches (keyed by row range), for the all-logits path. Batched into
     /// SEPARATE submissions: a single graph carrying the whole 60-layer
@@ -111,10 +111,10 @@ pub struct GpuModel<'a> {
 /// on both kinds (its quant axis ≠ the PV contraction — see
 /// docs/q8-kv-flash-impl.md §6).
 struct KvStore {
-    k: Option<Subbuffer<[u16]>>,
-    k_quants: Option<Subbuffer<[u32]>>,
-    k_scales: Option<Subbuffer<[u16]>>,
-    v: Subbuffer<[u16]>,
+    k: Option<Buffer<u16>>,
+    k_quants: Option<Buffer<u32>>,
+    k_scales: Option<Buffer<u16>>,
+    v: Buffer<u16>,
 }
 
 struct Kernels {
@@ -163,42 +163,38 @@ struct Kernels {
     /// the graph (global K is Q8-only); the f16 kernel stays in build.rs as a
     /// bench baseline.
     prefill_gl_iq: Kernel,
-    /// Sync shim: the gemm kernels read `x` only via coopmat loads, which
-    /// vulkano's auto-sync cannot see — touch the buffer first so the
-    /// producer's write→read barrier is emitted (touch.wgsl).
-    touch: Kernel,
 }
 
 /// Activation buffers (single token). Sized per layer kind where the
 /// kind's geometry differs — kernels derive bounds from `arrayLength`.
 struct Bufs {
-    x: Subbuffer<[u16]>,
-    xn: Subbuffer<[u16]>,
-    q_raw_sl: Subbuffer<[u16]>,
-    q_sl: Subbuffer<[u16]>,
-    q_raw_gl: Subbuffer<[u16]>,
-    q_gl: Subbuffer<[u16]>,
-    kp_sl: Subbuffer<[u16]>,
-    k_sl: Subbuffer<[u16]>,
-    vp_sl: Subbuffer<[u16]>,
-    v_sl: Subbuffer<[u16]>,
-    kp_gl: Subbuffer<[u16]>,
-    k_gl: Subbuffer<[u16]>,
-    v_gl: Subbuffer<[u16]>,
-    attn_sl: Subbuffer<[u16]>,
-    attn_gl: Subbuffer<[u16]>,
-    part_sl: Subbuffer<[f32]>,
-    part_gl: Subbuffer<[f32]>,
-    o: Subbuffer<[u16]>,
-    on: Subbuffer<[u16]>,
-    x2: Subbuffer<[u16]>,
-    fin: Subbuffer<[u16]>,
-    g: Subbuffer<[u16]>,
-    u: Subbuffer<[u16]>,
-    gu: Subbuffer<[u16]>,
-    f: Subbuffer<[u16]>,
-    fn2: Subbuffer<[u16]>,
-    logits: Subbuffer<[f32]>,
+    x: Buffer<u16>,
+    xn: Buffer<u16>,
+    q_raw_sl: Buffer<u16>,
+    q_sl: Buffer<u16>,
+    q_raw_gl: Buffer<u16>,
+    q_gl: Buffer<u16>,
+    kp_sl: Buffer<u16>,
+    k_sl: Buffer<u16>,
+    vp_sl: Buffer<u16>,
+    v_sl: Buffer<u16>,
+    kp_gl: Buffer<u16>,
+    k_gl: Buffer<u16>,
+    v_gl: Buffer<u16>,
+    attn_sl: Buffer<u16>,
+    attn_gl: Buffer<u16>,
+    part_sl: Buffer<f32>,
+    part_gl: Buffer<f32>,
+    o: Buffer<u16>,
+    on: Buffer<u16>,
+    x2: Buffer<u16>,
+    fin: Buffer<u16>,
+    g: Buffer<u16>,
+    u: Buffer<u16>,
+    gu: Buffer<u16>,
+    f: Buffer<u16>,
+    fn2: Buffer<u16>,
+    logits: Buffer<f32>,
 }
 
 /// Prefill activation buffers, sized for `max_chunk` tokens. Separate from
@@ -210,51 +206,51 @@ struct Bufs {
 /// elementwise kernels merely process the stale tail rows (garbage in,
 /// garbage out — nothing reads them, and KV appends bind sliced sources).
 struct PrefillBufs {
-    x: Subbuffer<[u16]>,
-    xn: Subbuffer<[u16]>,
-    q_raw_sl: Subbuffer<[u16]>,
-    q_sl: Subbuffer<[u16]>,
-    q_raw_gl: Subbuffer<[u16]>,
-    q_gl: Subbuffer<[u16]>,
-    kp_sl: Subbuffer<[u16]>,
-    k_sl: Subbuffer<[u16]>,
-    vp_sl: Subbuffer<[u16]>,
-    v_sl: Subbuffer<[u16]>,
-    kp_gl: Subbuffer<[u16]>,
-    k_gl: Subbuffer<[u16]>,
-    v_gl: Subbuffer<[u16]>,
-    attn_sl: Subbuffer<[u16]>,
-    attn_gl: Subbuffer<[u16]>,
-    o: Subbuffer<[u16]>,
-    on: Subbuffer<[u16]>,
-    x2: Subbuffer<[u16]>,
-    fin: Subbuffer<[u16]>,
-    g: Subbuffer<[u16]>,
-    u: Subbuffer<[u16]>,
-    gu: Subbuffer<[u16]>,
-    f: Subbuffer<[u16]>,
-    fn2: Subbuffer<[u16]>,
+    x: Buffer<u16>,
+    xn: Buffer<u16>,
+    q_raw_sl: Buffer<u16>,
+    q_sl: Buffer<u16>,
+    q_raw_gl: Buffer<u16>,
+    q_gl: Buffer<u16>,
+    kp_sl: Buffer<u16>,
+    k_sl: Buffer<u16>,
+    vp_sl: Buffer<u16>,
+    v_sl: Buffer<u16>,
+    kp_gl: Buffer<u16>,
+    k_gl: Buffer<u16>,
+    v_gl: Buffer<u16>,
+    attn_sl: Buffer<u16>,
+    attn_gl: Buffer<u16>,
+    o: Buffer<u16>,
+    on: Buffer<u16>,
+    x2: Buffer<u16>,
+    fin: Buffer<u16>,
+    g: Buffer<u16>,
+    u: Buffer<u16>,
+    gu: Buffer<u16>,
+    f: Buffer<u16>,
+    fn2: Buffer<u16>,
     /// int8-ffn activation-quant scratch: Q8_0 quants (u32-packed, the format
     /// `kv_quant_q8` writes and the int8 gemm reads as `array<i8>`) + f16 scales,
     /// for the FFN input (`fin`, HIDDEN) and the gate⊙up product (`gu`, FFN).
-    fin_i8: Subbuffer<[u32]>,
-    fin_scales: Subbuffer<[u16]>,
-    gu_i8: Subbuffer<[u32]>,
-    gu_scales: Subbuffer<[u16]>,
+    fin_i8: Buffer<u32>,
+    fin_scales: Buffer<u16>,
+    gu_i8: Buffer<u32>,
+    gu_scales: Buffer<u16>,
     /// int8-ffn attention quant scratch: `xn` (HIDDEN) shared by Q/K/V, and the
     /// attention output (sized to the larger global `q_dim_gl`) for the O gemm.
-    xn_i8: Subbuffer<[u32]>,
-    xn_scales: Subbuffer<[u16]>,
-    ao_i8: Subbuffer<[u32]>,
-    ao_scales: Subbuffer<[u16]>,
+    xn_i8: Buffer<u32>,
+    xn_scales: Buffer<u16>,
+    ao_i8: Buffer<u32>,
+    ao_scales: Buffer<u16>,
     /// int8-QKᵀ flash Q-quant scratch (Piece A): the roped global Q
     /// (`q_gl`, q_dim_gl) quantized to Q8 once per chunk, shared by the
     /// flash kernel's per-head QKᵀ. Global only (sliding stays f16).
-    q_i8_gl: Subbuffer<[u32]>,
-    q_scales_gl: Subbuffer<[u16]>,
+    q_i8_gl: Buffer<u32>,
+    q_scales_gl: Buffer<u16>,
     /// Per-chunk rope tables: `[max_chunk × live_pairs × 2]` f32.
-    cs_sl: Subbuffer<[f32]>,
-    cs_gl: Subbuffer<[f32]>,
+    cs_sl: Buffer<f32>,
+    cs_gl: Buffer<f32>,
 }
 
 impl<'a> GpuModel<'a> {
@@ -426,9 +422,8 @@ impl<'a> GpuModel<'a> {
             prefill_sl: load("attn_prefill_sliding_ring")?,
             // int8-QKᵀ single-pass flash against the Q8 K cache (Piece A): K
             // streams i8 from the cache, Q pre-quantized, per-block rescale;
-            // f16 PV. Reads q/k/v via coopLoad → needs touch barriers.
+            // f16 PV. Reads q/k/v via coopLoad, ordered by the recorder barrier.
             prefill_gl_iq: load("attn_prefill_global_flash_sp_iq")?,
-            touch: load("touch")?,
         };
 
         let cs_sliding = ctx.new_buffer::<f32>((desc.sliding.head_dim / 2 * 2) as u64, usage)?;
@@ -942,7 +937,7 @@ impl<'a> GpuModel<'a> {
     /// match [`crate::CpuModel::forward`]'s tap points.
     pub fn read_prefill_tap(&self, name: &str, sliding: bool) -> Result<Vec<f32>, GpuError> {
         let p = &self.p;
-        let b: &Subbuffer<[u16]> = match (name, sliding) {
+        let b: &Buffer<u16> = match (name, sliding) {
             ("attn_norm", _) => &p.xn,
             ("q_rope", true) => &p.q_sl,
             ("q_rope", false) => &p.q_gl,
@@ -1017,22 +1012,12 @@ impl<'a> GpuModel<'a> {
         };
         let no_push = None::<u32>;
 
-        // The gemms read their activation input only via coopmat loads,
-        // invisible to vulkano's auto-sync: a `touch` of the buffer makes
-        // the producer's write→read barrier materialize (touch.wgsl).
-        let touch = |rec: &mut GraphRecorder<'_>, b: &Subbuffer<[u16]>| -> Result<(), GpuError> {
-            rec.dispatch(
-                &self.k.touch,
-                vec![buf(0, b.clone())],
-                None::<u32>,
-                [1, 1, 1],
-            )
-            .map(|_| ())
-        };
-
         // ── Attention block ──────────────────────────────────────────────
+        // The ash recorder inserts a compute→compute barrier before each
+        // dispatch, so a GEMM's coopLoad-only input is ordered after its
+        // producer with no `touch` shim (the dependency vulkano's auto-sync
+        // could not see — see docs/ash-migration-rationale.md).
         rms(rec, &self.k.rms5376, &p.x, &lw.attn_norm, &p.xn, m_pad)?;
-        touch(rec, &p.xn)?;
         // Q, K, V: Q8-quantize `xn` ONCE — shared by all three projections (the
         // int8 sweet spot) — then int8 gemm at 4×1.
         let vp = {
@@ -1045,12 +1030,6 @@ impl<'a> GpuModel<'a> {
                 ],
                 no_push,
                 self.k.quant_q8.groups_for((m_pad * HIDDEN / 32) as u64),
-            )?;
-            rec.dispatch(
-                &self.k.touch,
-                vec![buf(0, p.xn_i8.clone())],
-                no_push,
-                [1, 1, 1],
             )?;
             let (gq, gkv) = if sliding {
                 (&self.k.gemm_q_i8_sl, &self.k.gemm_kv_i8_sl)
@@ -1165,12 +1144,6 @@ impl<'a> GpuModel<'a> {
         };
 
         let attn_out = if sliding { &p.attn_sl } else { &p.attn_gl };
-        // Touch a u32 (i8-packed) coopLoad-only producer so vulkano emits its
-        // write→read barrier (the `touch` closure only types f16 buffers).
-        let touch_u32 = |rec: &mut GraphRecorder<'_>, b: &Subbuffer<[u32]>| -> Result<(), GpuError> {
-            rec.dispatch(&self.k.touch, vec![buf(0, b.clone())], None::<u32>, [1, 1, 1])
-                .map(|_| ())
-        };
         if sliding {
             rec.dispatch(
                 &self.k.prefill_sl,
@@ -1202,14 +1175,9 @@ impl<'a> GpuModel<'a> {
                 no_push,
                 self.k.quant_q8.groups_for((m_pad * q_dim / 32) as u64),
             )?;
-            // The int8 flash reads q_i8/k_quants/v via coopLoad (invisible to
-            // vulkano auto-sync) — touch every producer so the write→read
-            // barriers materialize (touch.wgsl). k_scales is plain-indexed but
-            // touched too (cheap). Grid [N_Q_HEADS=32, m_pad/M_Q], M_Q=16.
-            touch_u32(rec, &p.q_i8_gl)?;
-            touch_u32(rec, kv.k_quants.as_ref().unwrap())?;
-            touch(rec, kv.k_scales.as_ref().unwrap())?;
-            touch(rec, &kv.v)?;
+            // The int8 flash reads q_i8/k_quants/v via coopLoad; the recorder's
+            // pre-dispatch barrier orders them after their producers.
+            // Grid [N_Q_HEADS=32, m_pad/M_Q], M_Q=16.
             rec.dispatch(
                 &self.k.prefill_gl_iq,
                 vec![
@@ -1237,12 +1205,6 @@ impl<'a> GpuModel<'a> {
                 ],
                 no_push,
                 self.k.quant_q8.groups_for((m_pad * q_dim / 32) as u64),
-            )?;
-            rec.dispatch(
-                &self.k.touch,
-                vec![buf(0, p.ao_i8.clone())],
-                no_push,
-                [1, 1, 1],
             )?;
             let go = if sliding {
                 &self.k.gemm_o_i8_sl
@@ -1283,7 +1245,6 @@ impl<'a> GpuModel<'a> {
 
         // ── FFN block ────────────────────────────────────────────────────
         rms(rec, &self.k.rms5376, &p.x2, &lw.ffn_norm, &p.fin, m_pad)?;
-        touch(rec, &p.fin)?;
         // FFN gate+up: Q8-quantize `fin` once (shared by gate and up), then the
         // Q4_0-reading int8 gemm at 4×1.
         {
@@ -1296,13 +1257,6 @@ impl<'a> GpuModel<'a> {
                 ],
                 no_push,
                 self.k.quant_q8.groups_for((m_pad * HIDDEN / 32) as u64),
-            )?;
-            // The int8 gemm coopLoads its quants → invisible to auto-sync.
-            rec.dispatch(
-                &self.k.touch,
-                vec![buf(0, p.fin_i8.clone())],
-                no_push,
-                [1, 1, 1],
             )?;
             let mg2 = (m_pad / 64) as u32; // int8 4×1 M-block count (64 rows)
             for (w, dst) in [(&lw.ffn_gate, &p.g), (&lw.ffn_up, &p.u)] {
@@ -1340,12 +1294,6 @@ impl<'a> GpuModel<'a> {
                 ],
                 no_push,
                 self.k.quant_q8.groups_for((m_pad * FFN / 32) as u64),
-            )?;
-            rec.dispatch(
-                &self.k.touch,
-                vec![buf(0, p.gu_i8.clone())],
-                no_push,
-                [1, 1, 1],
             )?;
             let mg2 = (m_pad / 64) as u32; // int8 4×1 (64-row M-blocks)
             rec.dispatch(
@@ -1435,7 +1383,7 @@ impl<'a> GpuModel<'a> {
         .write_to(&self.step)?;
 
         let positions: Vec<u32> = (0..tokens.len() as u32).map(|i| self.pos + i).collect();
-        let write_cs = |buf: &Subbuffer<[f32]>, table: &[f32]| -> Result<(), GpuError> {
+        let write_cs = |buf: &Buffer<f32>, table: &[f32]| -> Result<(), GpuError> {
             let mut w = buf
                 .write()
                 .map_err(|e| GpuError::Validation(e.to_string()))?;
@@ -1525,7 +1473,7 @@ impl<'a> GpuModel<'a> {
         }
         .write_to(&self.step)?;
 
-        let write_cs = |buf: &Subbuffer<[f32]>, table: &[f32]| -> Result<(), GpuError> {
+        let write_cs = |buf: &Buffer<f32>, table: &[f32]| -> Result<(), GpuError> {
             let mut w = buf
                 .write()
                 .map_err(|e| GpuError::Validation(e.to_string()))?;
@@ -1615,27 +1563,27 @@ impl<'a> GpuModel<'a> {
     }
 }
 
-/// `WriteDescriptorSet::buffer`, kept generic (a `let` alias would
+/// `BufferBinding::buffer`, kept generic (a `let` alias would
 /// monomorphize to the first element type used).
-fn buf(binding: u32, buffer: Subbuffer<impl ?Sized>) -> WriteDescriptorSet {
-    WriteDescriptorSet::buffer(binding, buffer)
+fn buf<T: sg_gpu::Pod>(binding: u32, buffer: Buffer<T>) -> BufferBinding {
+    BufferBinding::buffer(binding, buffer)
 }
 
 /// Record one rmsnorm dispatch: `rows` rows of `w.len()` elements.
 fn rms(
     rec: &mut GraphRecorder<'_>,
     kernel: &Kernel,
-    x: &Subbuffer<[u16]>,
-    w: &Subbuffer<[f32]>,
-    y: &Subbuffer<[u16]>,
+    x: &Buffer<u16>,
+    w: &Buffer<f32>,
+    y: &Buffer<u16>,
     rows: usize,
 ) -> Result<(), GpuError> {
     rec.dispatch(
         kernel,
         vec![
-            WriteDescriptorSet::buffer(0, x.clone()),
-            WriteDescriptorSet::buffer(1, w.clone()),
-            WriteDescriptorSet::buffer(2, y.clone()),
+            BufferBinding::buffer(0, x.clone()),
+            BufferBinding::buffer(1, w.clone()),
+            BufferBinding::buffer(2, y.clone()),
         ],
         None::<u32>,
         [rows as u32, 1, 1],

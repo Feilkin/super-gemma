@@ -7,8 +7,7 @@ mod reference;
 use reference::{Rng, assert_close, through_f16, to_f16_bits};
 use sg_gguf::q6_k::{BLOCK_Q6_K_SIZE, QK6_K, blocks_from_bytes};
 use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage};
 
 const K: usize = 5376;
 const BLOCKS_PER_ROW: usize = K / QK6_K; // 21
@@ -74,9 +73,9 @@ fn gemv_q6_k_logits_matches_reference() {
     ctx.dispatch_blocking(
         &kernel,
         vec![
-            WriteDescriptorSet::buffer(0, w_buf),
-            WriteDescriptorSet::buffer(1, x_buf),
-            WriteDescriptorSet::buffer(2, y_buf.clone()),
+            BufferBinding::buffer(0, w_buf),
+            BufferBinding::buffer(1, x_buf),
+            BufferBinding::buffer(2, y_buf.clone()),
         ],
         None::<u32>,
         [n as u32, 1, 1],
@@ -127,9 +126,9 @@ fn logits_are_bit_deterministic() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, w_buf),
-                WriteDescriptorSet::buffer(1, x_buf),
-                WriteDescriptorSet::buffer(2, y_buf.clone()),
+                BufferBinding::buffer(0, w_buf),
+                BufferBinding::buffer(1, x_buf),
+                BufferBinding::buffer(2, y_buf.clone()),
             ],
             None::<u32>,
             [n as u32, 1, 1],

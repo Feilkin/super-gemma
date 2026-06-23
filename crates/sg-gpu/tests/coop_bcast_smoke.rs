@@ -5,8 +5,7 @@
 //! kernels can drop its 256-element LDS scale build. Skips without a coopmat GPU.
 
 use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage};
 
 #[test]
 fn coop_bcast_smoke_matches_reference() {
@@ -48,9 +47,9 @@ fn coop_bcast_smoke_matches_reference() {
     ctx.dispatch_blocking(
         &kernel,
         vec![
-            WriteDescriptorSet::buffer(0, p_buf),
-            WriteDescriptorSet::buffer(1, v_buf),
-            WriteDescriptorSet::buffer(2, out_buf.clone()),
+            BufferBinding::buffer(0, p_buf),
+            BufferBinding::buffer(1, v_buf),
+            BufferBinding::buffer(2, out_buf.clone()),
         ],
         None::<u32>,
         [1, 1, 1],

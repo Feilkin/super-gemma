@@ -15,8 +15,7 @@ use reference::{
     to_f16_bits,
 };
 use sg_gpu::{GpuContext, StepState};
-use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{Buffer, BufferBinding, BufferUsage};
 
 const N_Q_HEADS: usize = 32;
 /// Sliding layers: GQA 32:16, head_dim 256, 1/√256.
@@ -44,7 +43,7 @@ fn ctx() -> Option<GpuContext> {
     }
 }
 
-#[derive(BufferContents, Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 struct PushSplitScale {
     n_splits: u32,
@@ -52,7 +51,7 @@ struct PushSplitScale {
 }
 
 /// Step buffer holding the per-step dynamic state (kv lengths / q0).
-fn step_buf(ctx: &GpuContext, state: StepState) -> Subbuffer<[u32]> {
+fn step_buf(ctx: &GpuContext, state: StepState) -> Buffer<u32> {
     let buf = ctx.new_step_buffer().unwrap();
     state.write_to(&buf).unwrap();
     buf
@@ -95,11 +94,11 @@ fn attn_decode_sliding_matches_reference() {
         ctx.dispatch_blocking(
             &part_k,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, k_buf),
-                WriteDescriptorSet::buffer(2, v_buf),
-                WriteDescriptorSet::buffer(3, part_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, k_buf),
+                BufferBinding::buffer(2, v_buf),
+                BufferBinding::buffer(3, part_buf.clone()),
+                BufferBinding::buffer(
                     4,
                     step_buf(
                         &ctx,
@@ -120,8 +119,8 @@ fn attn_decode_sliding_matches_reference() {
         ctx.dispatch_blocking(
             &red_k,
             vec![
-                WriteDescriptorSet::buffer(0, part_buf),
-                WriteDescriptorSet::buffer(1, out_buf.clone()),
+                BufferBinding::buffer(0, part_buf),
+                BufferBinding::buffer(1, out_buf.clone()),
             ],
             Some(n_splits),
             [N_Q_HEADS as u32, 1, 1],
@@ -190,11 +189,11 @@ fn attn_decode_global_matches_reference() {
         ctx.dispatch_blocking(
             &part_k,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, k_buf),
-                WriteDescriptorSet::buffer(2, v_buf),
-                WriteDescriptorSet::buffer(3, part_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, k_buf),
+                BufferBinding::buffer(2, v_buf),
+                BufferBinding::buffer(3, part_buf.clone()),
+                BufferBinding::buffer(
                     4,
                     step_buf(
                         &ctx,
@@ -215,8 +214,8 @@ fn attn_decode_global_matches_reference() {
         ctx.dispatch_blocking(
             &red_k,
             vec![
-                WriteDescriptorSet::buffer(0, part_buf),
-                WriteDescriptorSet::buffer(1, out_buf.clone()),
+                BufferBinding::buffer(0, part_buf),
+                BufferBinding::buffer(1, out_buf.clone()),
             ],
             Some(n_splits),
             [N_Q_HEADS as u32, 1, 1],
@@ -282,11 +281,11 @@ fn attn_prefill_sliding_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, k_buf),
-                WriteDescriptorSet::buffer(2, v_buf),
-                WriteDescriptorSet::buffer(3, out_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, k_buf),
+                BufferBinding::buffer(2, v_buf),
+                BufferBinding::buffer(3, out_buf.clone()),
+                BufferBinding::buffer(
                     4,
                     step_buf(
                         &ctx,
@@ -380,13 +379,13 @@ fn attn_prefill_sliding_ring_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, buf16(&q)),
-                WriteDescriptorSet::buffer(1, buf16(&k_ring)),
-                WriteDescriptorSet::buffer(2, buf16(&v_ring)),
-                WriteDescriptorSet::buffer(3, buf16(k_chunk)),
-                WriteDescriptorSet::buffer(4, buf16(v_chunk)),
-                WriteDescriptorSet::buffer(5, out_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, buf16(&q)),
+                BufferBinding::buffer(1, buf16(&k_ring)),
+                BufferBinding::buffer(2, buf16(&v_ring)),
+                BufferBinding::buffer(3, buf16(k_chunk)),
+                BufferBinding::buffer(4, buf16(v_chunk)),
+                BufferBinding::buffer(5, out_buf.clone()),
+                BufferBinding::buffer(
                     6,
                     step_buf(
                         &ctx,
@@ -461,11 +460,11 @@ fn attn_prefill_global_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, k_buf),
-                WriteDescriptorSet::buffer(2, v_buf),
-                WriteDescriptorSet::buffer(3, out_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, k_buf),
+                BufferBinding::buffer(2, v_buf),
+                BufferBinding::buffer(3, out_buf.clone()),
+                BufferBinding::buffer(
                     4,
                     step_buf(
                         &ctx,
@@ -549,11 +548,11 @@ fn attn_prefill_global_flash_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, k_buf),
-                WriteDescriptorSet::buffer(2, v_buf),
-                WriteDescriptorSet::buffer(3, out_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, k_buf),
+                BufferBinding::buffer(2, v_buf),
+                BufferBinding::buffer(3, out_buf.clone()),
+                BufferBinding::buffer(
                     4,
                     step_buf(
                         &ctx,
@@ -634,11 +633,11 @@ fn attn_prefill_global_flash_sp_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, k_buf),
-                WriteDescriptorSet::buffer(2, v_buf),
-                WriteDescriptorSet::buffer(3, out_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, k_buf),
+                BufferBinding::buffer(2, v_buf),
+                BufferBinding::buffer(3, out_buf.clone()),
+                BufferBinding::buffer(
                     4,
                     step_buf(
                         &ctx,
@@ -729,13 +728,13 @@ fn attn_prefill_global_flash_sp_iq_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, qs_buf),
-                WriteDescriptorSet::buffer(2, k_buf),
-                WriteDescriptorSet::buffer(3, ks_buf),
-                WriteDescriptorSet::buffer(4, v_buf),
-                WriteDescriptorSet::buffer(5, out_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, qs_buf),
+                BufferBinding::buffer(2, k_buf),
+                BufferBinding::buffer(3, ks_buf),
+                BufferBinding::buffer(4, v_buf),
+                BufferBinding::buffer(5, out_buf.clone()),
+                BufferBinding::buffer(
                     6,
                     step_buf(
                         &ctx,
@@ -830,14 +829,14 @@ fn attn_prefill_global_flash_sp_ipv_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, qs_buf),
-                WriteDescriptorSet::buffer(2, k_buf),
-                WriteDescriptorSet::buffer(3, ks_buf),
-                WriteDescriptorSet::buffer(4, vq_buf),
-                WriteDescriptorSet::buffer(5, vs_buf),
-                WriteDescriptorSet::buffer(6, out_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, qs_buf),
+                BufferBinding::buffer(2, k_buf),
+                BufferBinding::buffer(3, ks_buf),
+                BufferBinding::buffer(4, vq_buf),
+                BufferBinding::buffer(5, vs_buf),
+                BufferBinding::buffer(6, out_buf.clone()),
+                BufferBinding::buffer(
                     7,
                     step_buf(
                         &ctx,
@@ -922,14 +921,14 @@ fn attn_prefill_global_flash_sp_ipv_bcast_matches_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, qs_buf),
-                WriteDescriptorSet::buffer(2, k_buf),
-                WriteDescriptorSet::buffer(3, ks_buf),
-                WriteDescriptorSet::buffer(4, vq_buf),
-                WriteDescriptorSet::buffer(5, vs_buf),
-                WriteDescriptorSet::buffer(6, out_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, qs_buf),
+                BufferBinding::buffer(2, k_buf),
+                BufferBinding::buffer(3, ks_buf),
+                BufferBinding::buffer(4, vq_buf),
+                BufferBinding::buffer(5, vs_buf),
+                BufferBinding::buffer(6, out_buf.clone()),
+                BufferBinding::buffer(
                     7,
                     step_buf(&ctx, StepState { q0: q0 as u32, ..Default::default() }),
                 ),
@@ -1039,12 +1038,12 @@ fn attn_decode_global_q8k_matches_reference() {
         ctx.dispatch_blocking(
             &part_k,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, kq_buf),
-                WriteDescriptorSet::buffer(2, ks_buf),
-                WriteDescriptorSet::buffer(3, v_buf),
-                WriteDescriptorSet::buffer(4, part_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, kq_buf),
+                BufferBinding::buffer(2, ks_buf),
+                BufferBinding::buffer(3, v_buf),
+                BufferBinding::buffer(4, part_buf.clone()),
+                BufferBinding::buffer(
                     5,
                     step_buf(
                         &ctx,
@@ -1065,8 +1064,8 @@ fn attn_decode_global_q8k_matches_reference() {
         ctx.dispatch_blocking(
             &red_k,
             vec![
-                WriteDescriptorSet::buffer(0, part_buf),
-                WriteDescriptorSet::buffer(1, out_buf.clone()),
+                BufferBinding::buffer(0, part_buf),
+                BufferBinding::buffer(1, out_buf.clone()),
             ],
             Some(n_splits),
             [N_Q_HEADS as u32, 1, 1],
@@ -1140,11 +1139,11 @@ fn attn_is_bit_deterministic() {
         ctx.dispatch_blocking(
             &part_k,
             vec![
-                WriteDescriptorSet::buffer(0, q_buf),
-                WriteDescriptorSet::buffer(1, k_buf),
-                WriteDescriptorSet::buffer(2, v_buf),
-                WriteDescriptorSet::buffer(3, part_buf.clone()),
-                WriteDescriptorSet::buffer(
+                BufferBinding::buffer(0, q_buf),
+                BufferBinding::buffer(1, k_buf),
+                BufferBinding::buffer(2, v_buf),
+                BufferBinding::buffer(3, part_buf.clone()),
+                BufferBinding::buffer(
                     4,
                     step_buf(
                         &ctx,
@@ -1165,8 +1164,8 @@ fn attn_is_bit_deterministic() {
         ctx.dispatch_blocking(
             &red_k,
             vec![
-                WriteDescriptorSet::buffer(0, part_buf),
-                WriteDescriptorSet::buffer(1, out_buf.clone()),
+                BufferBinding::buffer(0, part_buf),
+                BufferBinding::buffer(1, out_buf.clone()),
             ],
             Some(n_splits),
             [N_Q_HEADS as u32, 1, 1],
@@ -1188,11 +1187,11 @@ fn attn_is_bit_deterministic() {
         ctx.dispatch_blocking(
             &pre_k,
             vec![
-                WriteDescriptorSet::buffer(0, pq_buf),
-                WriteDescriptorSet::buffer(1, pk_buf),
-                WriteDescriptorSet::buffer(2, pv_buf),
-                WriteDescriptorSet::buffer(3, pout_buf.clone()),
-                WriteDescriptorSet::buffer(4, step_buf(&ctx, StepState::default())),
+                BufferBinding::buffer(0, pq_buf),
+                BufferBinding::buffer(1, pk_buf),
+                BufferBinding::buffer(2, pv_buf),
+                BufferBinding::buffer(3, pout_buf.clone()),
+                BufferBinding::buffer(4, step_buf(&ctx, StepState::default())),
             ],
             Some(SL_SCALE),
             [SL_KV_HEADS as u32, m as u32, 1],

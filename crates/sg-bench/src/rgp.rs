@@ -5,7 +5,7 @@
 //! dispatch's wave/stall/occupancy behavior, not the result (a GEMM has no
 //! data-dependent control flow, so the trace is representative).
 
-use sg_gpu::{BufferUsage, GpuContext, WriteDescriptorSet};
+use sg_gpu::{BufferUsage, GpuContext, BufferBinding};
 
 const SUBMITS: usize = 8;
 
@@ -219,9 +219,9 @@ fn run_gemv(kernel: &str, k: usize, n: usize) -> anyhow::Result<()> {
         ctx.dispatch_blocking(
             &kern,
             vec![
-                WriteDescriptorSet::buffer(0, w.clone()),
-                WriteDescriptorSet::buffer(1, x.clone()),
-                WriteDescriptorSet::buffer(2, y.clone()),
+                BufferBinding::buffer(0, w.clone()),
+                BufferBinding::buffer(1, x.clone()),
+                BufferBinding::buffer(2, y.clone()),
             ],
             None::<u32>,
             groups,
@@ -271,8 +271,8 @@ fn run_probe() -> anyhow::Result<()> {
         ctx.dispatch_blocking(
             &kern,
             vec![
-                WriteDescriptorSet::buffer(0, src.clone()),
-                WriteDescriptorSet::buffer(1, dst.clone()),
+                BufferBinding::buffer(0, src.clone()),
+                BufferBinding::buffer(1, dst.clone()),
             ],
             Some(push),
             [1024, 1, 1],
@@ -339,16 +339,16 @@ pub fn run(kernel: &str) -> anyhow::Result<()> {
     for i in 0..SUBMITS {
         let writes = if int8 {
             vec![
-                WriteDescriptorSet::buffer(0, w.clone()),
-                WriteDescriptorSet::buffer(1, x_i8.clone()),
-                WriteDescriptorSet::buffer(2, xs.clone()),
-                WriteDescriptorSet::buffer(3, y.clone()),
+                BufferBinding::buffer(0, w.clone()),
+                BufferBinding::buffer(1, x_i8.clone()),
+                BufferBinding::buffer(2, xs.clone()),
+                BufferBinding::buffer(3, y.clone()),
             ]
         } else {
             vec![
-                WriteDescriptorSet::buffer(0, w.clone()),
-                WriteDescriptorSet::buffer(1, x_f16.clone()),
-                WriteDescriptorSet::buffer(2, y.clone()),
+                BufferBinding::buffer(0, w.clone()),
+                BufferBinding::buffer(1, x_f16.clone()),
+                BufferBinding::buffer(2, y.clone()),
             ]
         };
         ctx.dispatch_blocking(&kern, writes, None::<u32>, groups)

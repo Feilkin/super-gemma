@@ -5,8 +5,7 @@
 //! Skips without a GPU. See docs/naga-int8-coopmat-patch.md.
 
 use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage};
 
 const N: usize = 16;
 
@@ -57,9 +56,9 @@ fn coop_i8_smoke_matches_reference() {
     ctx.dispatch_blocking(
         &kernel,
         vec![
-            WriteDescriptorSet::buffer(0, a_buf),
-            WriteDescriptorSet::buffer(1, b_buf),
-            WriteDescriptorSet::buffer(2, out_buf.clone()),
+            BufferBinding::buffer(0, a_buf),
+            BufferBinding::buffer(1, b_buf),
+            BufferBinding::buffer(2, out_buf.clone()),
         ],
         None::<u32>,
         [1, 1, 1],

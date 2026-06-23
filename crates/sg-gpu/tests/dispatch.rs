@@ -2,8 +2,7 @@
 //! push constants. Skips when no capable Vulkan device is present (Tier 1).
 
 use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage};
 
 fn ctx() -> Option<GpuContext> {
     match GpuContext::new() {
@@ -36,7 +35,7 @@ fn stub_kernel_increments_a_buffer() {
 
     ctx.dispatch_blocking(
         &kernel,
-        vec![WriteDescriptorSet::buffer(0, buf.clone())],
+        vec![BufferBinding::buffer(0, buf.clone())],
         Some(StubPush { add: 7 }),
         kernel.groups_for(n),
     )

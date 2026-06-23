@@ -17,8 +17,7 @@ use reference::{
 };
 use sg_gguf::q4_0::{BLOCK_Q4_0_SIZE, QK4_0, blocks_from_bytes};
 use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage};
 
 /// Q4_0 weight bytes, `n_blocks` blocks (matches parity_gemm's generator:
 /// small f16 scale, random nibbles).
@@ -148,9 +147,9 @@ fn gemm_q4_0_i8_ffn_shapes_with_gpu_quant() {
         ctx.dispatch_blocking(
             &quant,
             vec![
-                WriteDescriptorSet::buffer(0, x_f16),
-                WriteDescriptorSet::buffer(1, x_scales.clone()),
-                WriteDescriptorSet::buffer(2, x_i8.clone()),
+                BufferBinding::buffer(0, x_f16),
+                BufferBinding::buffer(1, x_scales.clone()),
+                BufferBinding::buffer(2, x_i8.clone()),
             ],
             None::<u32>,
             quant.groups_for((m * nb) as u64),
@@ -171,10 +170,10 @@ fn gemm_q4_0_i8_ffn_shapes_with_gpu_quant() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, w_buf),
-                WriteDescriptorSet::buffer(1, x_i8.clone()),
-                WriteDescriptorSet::buffer(2, x_scales.clone()),
-                WriteDescriptorSet::buffer(3, y_buf.clone()),
+                BufferBinding::buffer(0, w_buf),
+                BufferBinding::buffer(1, x_i8.clone()),
+                BufferBinding::buffer(2, x_scales.clone()),
+                BufferBinding::buffer(3, y_buf.clone()),
             ],
             None::<u32>,
             [(n / 32) as u32, (m / 32) as u32, 1],
@@ -277,10 +276,10 @@ fn gemm_q4_0_i8_matches_mmq_reference() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, w_buf),
-                WriteDescriptorSet::buffer(1, x_buf),
-                WriteDescriptorSet::buffer(2, xs_buf),
-                WriteDescriptorSet::buffer(3, y_buf.clone()),
+                BufferBinding::buffer(0, w_buf),
+                BufferBinding::buffer(1, x_buf),
+                BufferBinding::buffer(2, xs_buf),
+                BufferBinding::buffer(3, y_buf.clone()),
             ],
             None::<u32>,
             [(n / n_cols) as u32, (m / m_rows) as u32, 1],
@@ -340,10 +339,10 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, w_buf.clone()),
-                WriteDescriptorSet::buffer(1, x_buf.clone()),
-                WriteDescriptorSet::buffer(2, xs_buf.clone()),
-                WriteDescriptorSet::buffer(3, y_buf.clone()),
+                BufferBinding::buffer(0, w_buf.clone()),
+                BufferBinding::buffer(1, x_buf.clone()),
+                BufferBinding::buffer(2, xs_buf.clone()),
+                BufferBinding::buffer(3, y_buf.clone()),
             ],
             None::<u32>,
             grid,
@@ -394,10 +393,10 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
             ctx.dispatch_blocking(
                 &kernel,
                 vec![
-                    WriteDescriptorSet::buffer(0, w_buf.clone()),
-                    WriteDescriptorSet::buffer(1, x_buf.clone()),
-                    WriteDescriptorSet::buffer(2, xs_buf.clone()),
-                    WriteDescriptorSet::buffer(3, y_buf.clone()),
+                    BufferBinding::buffer(0, w_buf.clone()),
+                    BufferBinding::buffer(1, x_buf.clone()),
+                    BufferBinding::buffer(2, xs_buf.clone()),
+                    BufferBinding::buffer(3, y_buf.clone()),
                 ],
                 Some(mb),
                 [nb_n, 1, 1],
@@ -498,10 +497,10 @@ fn gemm_q4_0_i8_basic_barrier_probe() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, w_buf.clone()),
-                WriteDescriptorSet::buffer(1, x_buf.clone()),
-                WriteDescriptorSet::buffer(2, xs_buf.clone()),
-                WriteDescriptorSet::buffer(3, y_buf.clone()),
+                BufferBinding::buffer(0, w_buf.clone()),
+                BufferBinding::buffer(1, x_buf.clone()),
+                BufferBinding::buffer(2, xs_buf.clone()),
+                BufferBinding::buffer(3, y_buf.clone()),
             ],
             None::<u32>,
             [(n / n_cols) as u32, (m / m_rows) as u32, 1],

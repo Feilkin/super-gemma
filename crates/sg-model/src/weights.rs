@@ -14,7 +14,7 @@
 //! optimization for M4+ — correctness and layout are what M3 needs.
 
 use sg_gguf::{GgmlType, Gguf, LayerKind, ModelDesc, q6_k};
-use sg_gpu::{BufferUsage, GpuContext, GpuError, Subbuffer};
+use sg_gpu::{BufferUsage, GpuContext, GpuError, Buffer};
 
 use crate::reference::RefError;
 
@@ -35,21 +35,21 @@ pub enum UploadError {
 /// Per-layer GPU-resident weights. Field names mirror the GGUF tensor names.
 pub struct LayerWeights {
     pub kind: LayerKind,
-    pub attn_norm: Subbuffer<[f32]>,
-    pub attn_q_norm: Subbuffer<[f32]>,
-    pub attn_k_norm: Subbuffer<[f32]>,
-    pub post_attention_norm: Subbuffer<[f32]>,
-    pub ffn_norm: Subbuffer<[f32]>,
-    pub post_ffw_norm: Subbuffer<[f32]>,
-    pub attn_q: Subbuffer<[u32]>,
-    pub attn_k: Subbuffer<[u32]>,
+    pub attn_norm: Buffer<f32>,
+    pub attn_q_norm: Buffer<f32>,
+    pub attn_k_norm: Buffer<f32>,
+    pub post_attention_norm: Buffer<f32>,
+    pub ffn_norm: Buffer<f32>,
+    pub post_ffw_norm: Buffer<f32>,
+    pub attn_q: Buffer<u32>,
+    pub attn_k: Buffer<u32>,
     /// `None` on global layers: K and V share the `attn_k` projection
     /// (they still diverge through their norms + rope downstream).
-    pub attn_v: Option<Subbuffer<[u32]>>,
-    pub attn_output: Subbuffer<[u32]>,
-    pub ffn_gate: Subbuffer<[u32]>,
-    pub ffn_up: Subbuffer<[u32]>,
-    pub ffn_down: Subbuffer<[u32]>,
+    pub attn_v: Option<Buffer<u32>>,
+    pub attn_output: Buffer<u32>,
+    pub ffn_gate: Buffer<u32>,
+    pub ffn_up: Buffer<u32>,
+    pub ffn_down: Buffer<u32>,
     /// Scalar applied by the FFN-join `add_scaled` at record time.
     pub layer_output_scale: f32,
 }
@@ -59,11 +59,11 @@ pub struct LayerWeights {
 pub struct GpuWeights {
     pub layers: Vec<LayerWeights>,
     /// Q6_K embeddings / tied LM head, repacked to [`Q6K_ROW_WORDS`] stride.
-    pub token_embd: Subbuffer<[u32]>,
-    pub output_norm: Subbuffer<[f32]>,
+    pub token_embd: Buffer<u32>,
+    pub output_norm: Buffer<f32>,
     /// `[512]` of 1.0: the weight of the weightless V-norm (`x̂·1.0` is
     /// exact). Serves both head_dims — the 256 variant reads a prefix.
-    pub norm_ones: Subbuffer<[f32]>,
+    pub norm_ones: Buffer<f32>,
     /// `rope_freqs.weight`, validated; input to the cos/sin table builder.
     pub rope_factors: Vec<f32>,
 }
@@ -76,7 +76,7 @@ impl GpuWeights {
     ) -> Result<Self, UploadError> {
         let usage = BufferUsage::STORAGE_BUFFER;
 
-        let words = |name: &str| -> Result<Subbuffer<[u32]>, UploadError> {
+        let words = |name: &str| -> Result<Buffer<u32>, UploadError> {
             let bytes = tensor_bytes(gguf, name, GgmlType::Q4_0)?;
             Ok(ctx.buffer_from_iter(
                 bytes
@@ -85,7 +85,7 @@ impl GpuWeights {
                 usage,
             )?)
         };
-        let f32s = |name: &str| -> Result<Subbuffer<[f32]>, UploadError> {
+        let f32s = |name: &str| -> Result<Buffer<f32>, UploadError> {
             let bytes = tensor_bytes(gguf, name, GgmlType::F32)?;
             Ok(ctx.buffer_from_iter(
                 bytes
@@ -149,7 +149,7 @@ fn upload_q6k_repacked(
     ctx: &GpuContext,
     gguf: &Gguf<'_>,
     desc: &ModelDesc,
-) -> Result<Subbuffer<[u32]>, UploadError> {
+) -> Result<Buffer<u32>, UploadError> {
     let src = tensor_bytes(gguf, "token_embd.weight", GgmlType::Q6_K)?;
     let row_blocks = desc.hidden_size / q6_k::QK6_K; // 21
     let row_bytes = row_blocks * q6_k::BLOCK_Q6_K_SIZE; // 4410

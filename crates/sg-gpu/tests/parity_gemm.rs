@@ -8,8 +8,7 @@ mod reference;
 use reference::{Rng, assert_close, from_f16_bits, through_f16, to_f16_bits};
 use sg_gguf::q4_0::{BLOCK_Q4_0_SIZE, QK4_0, blocks_from_bytes};
 use sg_gpu::GpuContext;
-use vulkano::buffer::BufferUsage;
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{BufferBinding, BufferUsage};
 
 fn ctx() -> Option<GpuContext> {
     match GpuContext::new() {
@@ -108,9 +107,9 @@ fn gemm_q4_0_matches_reference_on_all_shapes() {
             ctx.dispatch_blocking(
                 &kernel,
                 vec![
-                    WriteDescriptorSet::buffer(0, w_buf),
-                    WriteDescriptorSet::buffer(1, x_buf),
-                    WriteDescriptorSet::buffer(2, y_buf.clone()),
+                    BufferBinding::buffer(0, w_buf),
+                    BufferBinding::buffer(1, x_buf),
+                    BufferBinding::buffer(2, y_buf.clone()),
                 ],
                 None::<u32>,
                 [(n / n_block) as u32, (m / m_block) as u32, 1],
@@ -173,9 +172,9 @@ fn gemm_q4_0_swizzle_matches_plain() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, w_buf.clone()),
-                WriteDescriptorSet::buffer(1, x_buf.clone()),
-                WriteDescriptorSet::buffer(2, y.clone()),
+                BufferBinding::buffer(0, w_buf.clone()),
+                BufferBinding::buffer(1, x_buf.clone()),
+                BufferBinding::buffer(2, y.clone()),
             ],
             None::<u32>,
             grid,
@@ -225,9 +224,9 @@ fn gemm_is_bit_deterministic() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, w_buf),
-                WriteDescriptorSet::buffer(1, x_buf),
-                WriteDescriptorSet::buffer(2, y_buf.clone()),
+                BufferBinding::buffer(0, w_buf),
+                BufferBinding::buffer(1, x_buf),
+                BufferBinding::buffer(2, y_buf.clone()),
             ],
             None::<u32>,
             [(n / N_BLOCK) as u32, (m / M_BLOCK) as u32, 1],

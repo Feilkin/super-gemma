@@ -8,8 +8,7 @@ mod reference;
 
 use reference::{Rng, dequant_q8_0, from_f16_bits, quant_q8_0, through_f16, to_f16_bits};
 use sg_gpu::{GpuContext, StepState};
-use vulkano::buffer::{BufferUsage, Subbuffer};
-use vulkano::descriptor_set::WriteDescriptorSet;
+use sg_gpu::{Buffer, BufferBinding, BufferUsage};
 
 fn ctx() -> Option<GpuContext> {
     match GpuContext::new() {
@@ -22,7 +21,7 @@ fn ctx() -> Option<GpuContext> {
 }
 
 /// Step buffer carrying the append position.
-fn step_buf(ctx: &GpuContext, pos: u32) -> Subbuffer<[u32]> {
+fn step_buf(ctx: &GpuContext, pos: u32) -> Buffer<u32> {
     let buf = ctx.new_step_buffer().unwrap();
     StepState {
         pos,
@@ -60,9 +59,9 @@ fn kv_append_sliding_wraps_the_ring() {
     ctx.dispatch_blocking(
         &kernel,
         vec![
-            WriteDescriptorSet::buffer(0, src_buf),
-            WriteDescriptorSet::buffer(1, ring_buf.clone()),
-            WriteDescriptorSet::buffer(2, step_buf(&ctx, pos)),
+            BufferBinding::buffer(0, src_buf),
+            BufferBinding::buffer(1, ring_buf.clone()),
+            BufferBinding::buffer(2, step_buf(&ctx, pos)),
         ],
         None::<u32>,
         kernel.groups_for((n_tokens * ROW) as u64),
@@ -103,9 +102,9 @@ fn kv_append_global_is_linear() {
     ctx.dispatch_blocking(
         &kernel,
         vec![
-            WriteDescriptorSet::buffer(0, src_buf),
-            WriteDescriptorSet::buffer(1, dst_buf.clone()),
-            WriteDescriptorSet::buffer(2, step_buf(&ctx, pos)),
+            BufferBinding::buffer(0, src_buf),
+            BufferBinding::buffer(1, dst_buf.clone()),
+            BufferBinding::buffer(2, step_buf(&ctx, pos)),
         ],
         None::<u32>,
         kernel.groups_for((n_tokens * ROW) as u64),
@@ -157,9 +156,9 @@ fn kv_quant_q8_matches_reference_bit_exactly() {
     ctx.dispatch_blocking(
         &quant_k,
         vec![
-            WriteDescriptorSet::buffer(0, src_buf),
-            WriteDescriptorSet::buffer(1, scale_buf.clone()),
-            WriteDescriptorSet::buffer(2, quant_buf.clone()),
+            BufferBinding::buffer(0, src_buf),
+            BufferBinding::buffer(1, scale_buf.clone()),
+            BufferBinding::buffer(2, quant_buf.clone()),
         ],
         None::<u32>,
         quant_k.groups_for((n / 32) as u64),
@@ -198,9 +197,9 @@ fn kv_quant_q8_matches_reference_bit_exactly() {
     ctx.dispatch_blocking(
         &dequant_k,
         vec![
-            WriteDescriptorSet::buffer(0, scale_buf),
-            WriteDescriptorSet::buffer(1, quant_buf),
-            WriteDescriptorSet::buffer(2, deq_buf.clone()),
+            BufferBinding::buffer(0, scale_buf),
+            BufferBinding::buffer(1, quant_buf),
+            BufferBinding::buffer(2, deq_buf.clone()),
         ],
         None::<u32>,
         dequant_k.groups_for((n / 32) as u64),
@@ -234,9 +233,9 @@ fn kv_quant_q8_is_bit_deterministic() {
         ctx.dispatch_blocking(
             &kernel,
             vec![
-                WriteDescriptorSet::buffer(0, src_buf),
-                WriteDescriptorSet::buffer(1, scale_buf.clone()),
-                WriteDescriptorSet::buffer(2, quant_buf.clone()),
+                BufferBinding::buffer(0, src_buf),
+                BufferBinding::buffer(1, scale_buf.clone()),
+                BufferBinding::buffer(2, quant_buf.clone()),
             ],
             None::<u32>,
             kernel.groups_for((n / 32) as u64),

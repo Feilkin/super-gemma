@@ -1,44 +1,90 @@
-//! Device and queue setup: one instance, one device, one compute queue, with
-//! the features the plans assert (plan 02 — all confirmed present on the
-//! target box by the M0 probe).
+//! Device and queue setup on raw `ash`: one instance, one device, one compute
+//! queue, with the features the plans assert (plan 02 — all confirmed present
+//! on the target box by the M0 probe).
+//!
+//! [`DeviceCtx`] owns the Vulkan objects whose lifetime everything else hangs
+//! off (instance, device, queue). It is `Arc`-shared into every [`Buffer`],
+//! [`Kernel`], [`CommandGraph`] and [`GpuTimer`] so the device outlives them and
+//! their `Drop`s can destroy their own handles; `DeviceCtx::drop` tears the
+//! device/instance down last. This is the lifetime discipline vulkano gave us
+//! for free.
 
+use std::ffi::{CStr, c_char};
 use std::sync::Arc;
 
-use vulkano::VulkanLibrary;
-use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
-use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::{
-    Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
-};
-use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
-use vulkano::memory::allocator::StandardMemoryAllocator;
+use ash::vk;
 
 use crate::GpuError;
 
-/// The device features every kernel relies on; absence is a startup error,
-/// not a fallback (this server targets exactly one machine).
-fn required_features() -> DeviceFeatures {
-    DeviceFeatures {
-        shader_float16: true,
-        storage_buffer16_bit_access: true,
-        uniform_and_storage_buffer16_bit_access: true,
-        timeline_semaphore: true,
-        shader_int8: true,
-        // int8 coopmat operands load from array<i8> storage buffers.
-        storage_buffer8_bit_access: true,
-        ..Default::default()
+/// The Vulkan objects shared (via `Arc`) by every GPU resource in this crate.
+/// Dropping the last `Arc` waits for the device to idle and destroys the
+/// device then the instance.
+pub(crate) struct DeviceCtx {
+    /// Loaded Vulkan library; kept alive for the instance/device.
+    _entry: ash::Entry,
+    pub instance: ash::Instance,
+    pub device: ash::Device,
+    pub physical: vk::PhysicalDevice,
+    pub queue: vk::Queue,
+    pub queue_family: u32,
+    pub mem_props: vk::PhysicalDeviceMemoryProperties,
+    /// Debug-utils device loader for per-dispatch label regions (RGP/SQTT
+    /// markers); `None` when `VK_EXT_debug_utils` was unavailable.
+    pub debug_utils: Option<ash::ext::debug_utils::Device>,
+    pub timestamp_period: f32,
+    pub subgroup_size: u32,
+    pub cooperative_matrix: bool,
+}
+
+impl DeviceCtx {
+    /// Pick a memory type satisfying `required` from a buffer's `type_bits`,
+    /// preferring `HOST_COHERENT` (no manual flush/invalidate). Returns the
+    /// type index and whether it is coherent.
+    pub fn find_mem_type(
+        &self,
+        type_bits: u32,
+        required: vk::MemoryPropertyFlags,
+    ) -> Option<(u32, bool)> {
+        let types = &self.mem_props.memory_types[..self.mem_props.memory_type_count as usize];
+        // Prefer a coherent match, then any match.
+        for prefer_coherent in [true, false] {
+            for (i, mt) in types.iter().enumerate() {
+                if type_bits & (1 << i) == 0 {
+                    continue;
+                }
+                if !mt.property_flags.contains(required) {
+                    continue;
+                }
+                let coherent = mt
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+                if coherent == prefer_coherent {
+                    return Some((i as u32, coherent));
+                }
+            }
+        }
+        None
+    }
+}
+
+impl Drop for DeviceCtx {
+    fn drop(&mut self) {
+        // SAFETY: all per-resource handles (buffers, pipelines, graphs, timers)
+        // hold an Arc<DeviceCtx>, so this runs only after every one of them has
+        // been dropped and destroyed its own objects. Wait for the GPU to go
+        // idle before tearing the device down.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
     }
 }
 
 /// The Vulkan compute context: one device, one compute queue (the dedicated
-/// GPU thread in plan 00 owns the `Queue`; nothing else submits).
+/// GPU thread in plan 00 owns this; nothing else submits).
 pub struct GpuContext {
-    device: Arc<Device>,
-    queue: Arc<Queue>,
-    memory_allocator: Arc<StandardMemoryAllocator>,
-    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    pub(crate) ctx: Arc<DeviceCtx>,
     /// Default subgroup size reported by the driver (64 on the target's RDNA
     /// 3.5 per the M0 probe). Kernel variants bake this in via defines.
     pub subgroup_size: u32,
@@ -55,125 +101,219 @@ impl GpuContext {
     /// panics) when no Vulkan or no capable GPU is present, so off-target
     /// tests can skip gracefully.
     pub fn new() -> Result<Self, GpuError> {
-        let library = VulkanLibrary::new()?;
-        // `ext_debug_utils` lets us name each dispatch with a command-buffer
-        // label region (`GraphRecorder::dispatch`); RADV emits those as SQTT
-        // markers so RGP captures show which kernel each event is. Optional —
-        // absence just means unlabelled traces, never a failure.
-        let debug_utils = library.supported_extensions().ext_debug_utils;
-        let instance = Instance::new(
-            library,
-            InstanceCreateInfo {
-                enabled_extensions: InstanceExtensions {
-                    ext_debug_utils: debug_utils,
-                    ..InstanceExtensions::empty()
-                },
-                ..Default::default()
-            },
-        )
-        .map_err(GpuError::validated)?;
+        // SAFETY: loads the system Vulkan loader; no outstanding handles yet.
+        let entry = unsafe { ash::Entry::load() }
+            .map_err(|e| GpuError::Library(format!("loading Vulkan: {e}")))?;
 
-        let required = required_features();
-        let mut candidates: Vec<Arc<PhysicalDevice>> = instance
-            .enumerate_physical_devices()?
-            .filter(|pd| pd.supported_features().contains(&required))
-            .filter(|pd| find_compute_family(pd).is_some())
-            .collect();
-        candidates.sort_by_key(|pd| match pd.properties().device_type {
-            PhysicalDeviceType::IntegratedGpu => 0, // the target's 8060S
-            PhysicalDeviceType::DiscreteGpu => 1,
-            _ => 2,
-        });
-        let physical = candidates
+        // `ext_debug_utils` lets us name each dispatch with a command-buffer
+        // label region; RADV emits those as SQTT markers so RGP captures show
+        // which kernel each event is. Optional — absence just means unlabelled
+        // traces, never a failure.
+        let want_debug_utils = instance_has_extension(&entry, ash::ext::debug_utils::NAME)?;
+
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+        let mut instance_exts: Vec<*const c_char> = Vec::new();
+        if want_debug_utils {
+            instance_exts.push(ash::ext::debug_utils::NAME.as_ptr());
+        }
+        let instance_ci = vk::InstanceCreateInfo::default()
+            .application_info(&app)
+            .enabled_extension_names(&instance_exts);
+        // SAFETY: `entry` is valid; the create info borrows live locals.
+        let instance = unsafe { entry.create_instance(&instance_ci, None) }
+            .map_err(|e| GpuError::Vk(format!("create_instance: {e}")))?;
+
+        // SAFETY: valid instance.
+        let physicals = unsafe { instance.enumerate_physical_devices() }
+            .map_err(|e| GpuError::Vk(format!("enumerate_physical_devices: {e}")))?;
+
+        // Each capable candidate, tagged with its type rank (integrated GPU =
+        // the target's 8060S sorts first).
+        let mut candidates: Vec<(u32, vk::PhysicalDevice, Caps)> = Vec::new();
+        for pd in physicals {
+            if let Some(caps) = device_caps(&instance, pd) {
+                // SAFETY: valid physical device.
+                let props = unsafe { instance.get_physical_device_properties(pd) };
+                let rank = match props.device_type {
+                    vk::PhysicalDeviceType::INTEGRATED_GPU => 0,
+                    vk::PhysicalDeviceType::DISCRETE_GPU => 1,
+                    _ => 2,
+                };
+                candidates.push((rank, pd, caps));
+            }
+        }
+        candidates.sort_by_key(|(rank, ..)| *rank);
+        let (_, physical, caps) = candidates
             .into_iter()
             .next()
             .ok_or(GpuError::NoDevice("f16/16-bit-storage compute GPU"))?;
 
-        let queue_family_index = find_compute_family(&physical).expect("filtered above");
+        // Build the enabled-feature pNext chain. Cooperative matrix is
+        // optional so dev machines without it still run non-coopmat tests.
+        let mut features11 = vk::PhysicalDeviceVulkan11Features::default()
+            .storage_buffer16_bit_access(true)
+            .uniform_and_storage_buffer16_bit_access(true);
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_float16(true)
+            .shader_int8(true)
+            .storage_buffer8_bit_access(true)
+            .timeline_semaphore(true)
+            .vulkan_memory_model(true);
+        let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
+            .cooperative_matrix(true);
 
-        // Cooperative matrix needs the extension, its feature bit, and the
-        // Vulkan memory model (SPIR-V requirement). All present on target;
-        // optional so dev machines without them still run non-coopmat tests.
-        // (No kernel currently pins a subgroup size; a variant that sets
-        // `subgroup_size` in build.rs needs `subgroup_size_control` enabled
-        // here.)
-        let supports_coopmat = physical.supported_extensions().khr_cooperative_matrix
-            && physical.supported_features().cooperative_matrix
-            && physical.supported_features().vulkan_memory_model;
-        let mut features = required;
-        let mut extensions = DeviceExtensions::empty();
-        if supports_coopmat {
-            extensions.khr_cooperative_matrix = true;
-            features.cooperative_matrix = true;
-            features.vulkan_memory_model = true;
+        let mut device_exts: Vec<*const c_char> = Vec::new();
+        if caps.cooperative_matrix {
+            device_exts.push(ash::khr::cooperative_matrix::NAME.as_ptr());
         }
 
-        let subgroup_size = physical.properties().subgroup_size.unwrap_or(64);
-        let (device, mut queues) = Device::new(
+        let priorities = [1.0f32];
+        let queue_ci = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(caps.compute_family)
+            .queue_priorities(&priorities);
+        let queue_cis = [queue_ci];
+
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut features11)
+            .push_next(&mut features12);
+        if caps.cooperative_matrix {
+            features2 = features2.push_next(&mut coopmat);
+        }
+        let device_ci = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_cis)
+            .enabled_extension_names(&device_exts)
+            .push_next(&mut features2);
+
+        // SAFETY: valid instance + physical device; create info borrows live
+        // locals (the feature chain is not moved before this call returns).
+        let device = unsafe { instance.create_device(physical, &device_ci, None) }
+            .map_err(|e| GpuError::Vk(format!("create_device: {e}")))?;
+
+        // SAFETY: the family/index were just created above.
+        let queue = unsafe { device.get_device_queue(caps.compute_family, 0) };
+        // SAFETY: valid physical device.
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical) };
+
+        let debug_utils =
+            want_debug_utils.then(|| ash::ext::debug_utils::Device::new(&instance, &device));
+
+        let ctx = Arc::new(DeviceCtx {
+            _entry: entry,
+            instance,
+            device,
             physical,
-            DeviceCreateInfo {
-                queue_create_infos: vec![QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
-                enabled_features: features,
-                enabled_extensions: extensions,
-                ..Default::default()
-            },
-        )
-        .map_err(GpuError::validated)?;
-        let queue = queues.next().expect("one queue requested");
+            queue,
+            queue_family: caps.compute_family,
+            mem_props,
+            debug_utils,
+            timestamp_period: caps.timestamp_period,
+            subgroup_size: caps.subgroup_size,
+            cooperative_matrix: caps.cooperative_matrix,
+        });
 
         Ok(Self {
-            memory_allocator: Arc::new(StandardMemoryAllocator::new_default(device.clone())),
-            descriptor_set_allocator: Arc::new(StandardDescriptorSetAllocator::new(
-                device.clone(),
-                Default::default(),
-            )),
-            command_buffer_allocator: Arc::new(StandardCommandBufferAllocator::new(
-                device.clone(),
-                Default::default(),
-            )),
-            device,
-            queue,
-            subgroup_size,
-            cooperative_matrix: supports_coopmat,
-            debug_utils,
+            subgroup_size: ctx.subgroup_size,
+            cooperative_matrix: ctx.cooperative_matrix,
+            debug_utils: ctx.debug_utils.is_some(),
+            ctx,
         })
     }
 
-    pub fn device(&self) -> &Arc<Device> {
-        &self.device
-    }
-
-    pub fn queue(&self) -> &Arc<Queue> {
-        &self.queue
-    }
-
-    pub fn memory_allocator(&self) -> &Arc<StandardMemoryAllocator> {
-        &self.memory_allocator
-    }
-
-    pub fn descriptor_set_allocator(&self) -> &Arc<StandardDescriptorSetAllocator> {
-        &self.descriptor_set_allocator
-    }
-
-    pub fn command_buffer_allocator(&self) -> &Arc<StandardCommandBufferAllocator> {
-        &self.command_buffer_allocator
+    pub(crate) fn device(&self) -> &ash::Device {
+        &self.ctx.device
     }
 
     pub fn device_name(&self) -> String {
-        self.device
-            .physical_device()
-            .properties()
-            .device_name
-            .clone()
+        // SAFETY: valid physical device.
+        let props = unsafe {
+            self.ctx
+                .instance
+                .get_physical_device_properties(self.ctx.physical)
+        };
+        let name = props.device_name_as_c_str().unwrap_or(c"<unknown>");
+        name.to_string_lossy().into_owned()
     }
 }
 
-fn find_compute_family(pd: &PhysicalDevice) -> Option<u32> {
-    pd.queue_family_properties()
+/// Capabilities of a candidate device that passed the feature gate.
+struct Caps {
+    compute_family: u32,
+    subgroup_size: u32,
+    timestamp_period: f32,
+    cooperative_matrix: bool,
+}
+
+/// Return `Some(Caps)` if `pd` has a compute queue and every required feature;
+/// `None` otherwise (so the device is filtered out). Cooperative matrix is not
+/// required — its presence is recorded in `Caps`.
+fn device_caps(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<Caps> {
+    // SAFETY: valid instance + physical device throughout.
+    let compute_family = unsafe { instance.get_physical_device_queue_family_properties(pd) }
         .iter()
-        .position(|q| q.queue_flags.intersects(QueueFlags::COMPUTE))
-        .map(|i| i as u32)
+        .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))? as u32;
+
+    let mut features11 = vk::PhysicalDeviceVulkan11Features::default();
+    let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+    let mut features2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut features11)
+        .push_next(&mut features12)
+        .push_next(&mut coopmat);
+    // SAFETY: valid physical device; the chain outlives the call.
+    unsafe { instance.get_physical_device_features2(pd, &mut features2) };
+
+    let required = features11.storage_buffer16_bit_access == vk::TRUE
+        && features11.uniform_and_storage_buffer16_bit_access == vk::TRUE
+        && features12.shader_float16 == vk::TRUE
+        && features12.shader_int8 == vk::TRUE
+        && features12.storage_buffer8_bit_access == vk::TRUE
+        && features12.timeline_semaphore == vk::TRUE;
+    if !required {
+        return None;
+    }
+
+    // Cooperative matrix needs the extension, its feature bit, and the Vulkan
+    // memory model (a SPIR-V requirement for the coopmat ops).
+    let has_coopmat_ext = device_has_extension(instance, pd, ash::khr::cooperative_matrix::NAME);
+    let cooperative_matrix = has_coopmat_ext
+        && coopmat.cooperative_matrix == vk::TRUE
+        && features12.vulkan_memory_model == vk::TRUE;
+
+    let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup);
+    // SAFETY: valid physical device; chain outlives the call.
+    unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
+    // Read out of `props2` before touching `subgroup` (props2 borrows it mutably).
+    let timestamp_period = props2.properties.limits.timestamp_period;
+    let subgroup_size = if subgroup.subgroup_size > 0 {
+        subgroup.subgroup_size
+    } else {
+        64
+    };
+
+    Some(Caps {
+        compute_family,
+        subgroup_size,
+        timestamp_period,
+        cooperative_matrix,
+    })
+}
+
+fn instance_has_extension(entry: &ash::Entry, name: &CStr) -> Result<bool, GpuError> {
+    // SAFETY: valid entry; `None` layer queries the implementation extensions.
+    let props = unsafe { entry.enumerate_instance_extension_properties(None) }
+        .map_err(|e| GpuError::Vk(format!("enumerate_instance_extension_properties: {e}")))?;
+    Ok(props
+        .iter()
+        .any(|p| p.extension_name_as_c_str() == Ok(name)))
+}
+
+fn device_has_extension(instance: &ash::Instance, pd: vk::PhysicalDevice, name: &CStr) -> bool {
+    // SAFETY: valid instance + physical device.
+    let Ok(props) = (unsafe { instance.enumerate_device_extension_properties(pd) }) else {
+        return false;
+    };
+    props
+        .iter()
+        .any(|p| p.extension_name_as_c_str() == Ok(name))
 }
