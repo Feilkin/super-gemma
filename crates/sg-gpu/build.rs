@@ -1379,10 +1379,11 @@ const VARIANTS: &[Variant] = &[
     // pair/iter → the weight-load vmcnt is paid once per PFD pairs, hidden behind PFD
     // pairs of MMA. Targets bb_m4's exposed weight stall at low occupancy. Sweep depth
     // 1/2/4 (4 = 576 in-flight loads, the saturation/spill edge).
+    // Down shape (FFN down, K=21504 N=5376).
     Variant {
         name: "gemm_q4_0_i8_bb_pfd1",
         src: "gemm_q4_0_i8_bb_pfd",
-        defs: &[("PFD", 1)],
+        defs: &[("PFD", 1), ("K_DIM", 21504), ("N_DIM", 5376)],
         workgroup: [64, 1, 1],
         bindings: 4,
         push_bytes: 0,
@@ -1392,7 +1393,7 @@ const VARIANTS: &[Variant] = &[
     Variant {
         name: "gemm_q4_0_i8_bb_pfd2",
         src: "gemm_q4_0_i8_bb_pfd",
-        defs: &[("PFD", 2)],
+        defs: &[("PFD", 2), ("K_DIM", 21504), ("N_DIM", 5376)],
         workgroup: [64, 1, 1],
         bindings: 4,
         push_bytes: 0,
@@ -1402,7 +1403,40 @@ const VARIANTS: &[Variant] = &[
     Variant {
         name: "gemm_q4_0_i8_bb_pfd4",
         src: "gemm_q4_0_i8_bb_pfd",
-        defs: &[("PFD", 4)],
+        defs: &[("PFD", 4), ("K_DIM", 21504), ("N_DIM", 5376)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    // Up shape (FFN gate/up, K=5376 N=21504). Same kernel; PFD evenly divides PAIRS=84
+    // (84/1/2/4 all exact). Whether the prefetch wins here is its own bench — short K
+    // (168 blocks vs 672) amortizes the prologue fill over fewer iterations.
+    Variant {
+        name: "gemm_q4_0_i8_bb_pfd1_up",
+        src: "gemm_q4_0_i8_bb_pfd",
+        defs: &[("PFD", 1), ("K_DIM", 5376), ("N_DIM", 21504)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_bb_pfd2_up",
+        src: "gemm_q4_0_i8_bb_pfd",
+        defs: &[("PFD", 2), ("K_DIM", 5376), ("N_DIM", 21504)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_bb_pfd4_up",
+        src: "gemm_q4_0_i8_bb_pfd",
+        defs: &[("PFD", 4), ("K_DIM", 5376), ("N_DIM", 21504)],
         workgroup: [64, 1, 1],
         bindings: 4,
         push_bytes: 0,

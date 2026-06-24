@@ -178,6 +178,10 @@ const VARIANTS_UP: &[(&str, &str, u32)] = &[
     ("deployed (s2+pf)", "gemm_q4_0_i8_swz_m4n1_k5376_n21504", 64),
     ("basic", "gemm_q4_0_i8_basic_k5376_n21504", 64),
     ("basic dir", "gemm_q4_0_i8_basic_dir_k5376_n21504", 64),
+    // bb_m4 + depth-D cooperative-LDS weight prefetch on the up shape (down won +21.5%).
+    ("bb pfd1 up", "gemm_q4_0_i8_bb_pfd1_up", 64),
+    ("bb pfd2 up", "gemm_q4_0_i8_bb_pfd2_up", 64),
+    ("bb pfd4 up", "gemm_q4_0_i8_bb_pfd4_up", 64),
 ];
 
 fn sclk_mhz() -> String {

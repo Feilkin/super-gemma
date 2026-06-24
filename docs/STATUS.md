@@ -70,9 +70,12 @@ synchronizing the activation loads (which are to the same addresses) → keeping
 outcome (memory saturated + L2 stays warm + fewer VRAM bytes) is solid; the synchronization story is
 the unproven explanation. Don't promote it to fact without a trace that isolates it.
 
-**Status:** committed. Not yet wired into the model graph (`graph.rs` still loads `swz_m4n1`) — the
-deploy swap is the follow-up, along with the up-shape (K=5376 N=21504) port (this kernel is down-shape
-hardcoded). Next perf lever: the 57K pre-last-4-WMMA stall.
+**Status:** committed. The shader is now parameterized on `#{K_DIM}/#{N_DIM}` (one file, both
+shapes); **up-shape variants `bb_pfd{1,2,4}_up` (K=5376 N=21504) are built, bit-exact (nrmse 0.0 vs
+basic_dir), 144 VGPR/0 spill — up-shape TIMING not yet run** (its own bench: short K = 168 blocks vs
+672 amortizes the prologue fill over fewer iters, so the down +21.5% does not transfer by assumption).
+Not yet wired into the model graph (`graph.rs` still loads `swz_m4n1`) — the deploy swap is the
+follow-up. Next perf lever: the 57K pre-last-4-WMMA stall.
 
 ## 2026-06-23b — bb_m4 tall-tile, super-block swizzle, split-M, and a measurement correction
 

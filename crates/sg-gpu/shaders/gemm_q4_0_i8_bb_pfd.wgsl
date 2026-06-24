@@ -1,5 +1,6 @@
 // "BIGBOY PFD" — bb_m4 with DEPTH-D COOPERATIVE LDS WEIGHT PREFETCH.
-// FFN-down shape ONLY (K=21504, N=5376), M_TILES=4, single wave (WG=64).
+// Both FFN shapes via #{K_DIM}/#{N_DIM} (down K=21504 N=5376, up K=5376 N=21504),
+// M_TILES=4, single wave (WG=64).
 //
 // Premise (bb_m4 RGP, 2026-06-24, [[bb-m4-binding-stall-is-weight-load]]): bb_m4's
 // first & biggest K-loop stall is the WEIGHT-load vmcnt before the WMMAs — exposed
@@ -32,8 +33,8 @@ enable wgpu_cooperative_matrix;
 @group(0) @binding(2) var<storage, read> x_scales: array<u32>;  // [M×(K/32)] d_a, two f16 packed/word
 @group(0) @binding(3) var<storage, read_write> y: array<f16>;   // [M×N]
 
-const K: u32 = 21504u;
-const N: u32 = 5376u;
+const K: u32 = #{K_DIM}u;
+const N: u32 = #{N_DIM}u;
 const N_COLS: u32 = 16u;               // N_TILES = 1
 const M_ROWS: u32 = 64u;               // M_TILES = 4 (hand-unrolled)
 const NB: u32 = K / 32u;               // 672 32-blocks per row

@@ -447,6 +447,75 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
     assert_close(&epi, &dep, 1e-6, 1e-6, "swz_m4n1_epi");
 }
 
+/// bb_pfd UP shape (FFN gate/up, K=5376 N=21504): the depth-D cooperative-LDS
+/// weight-prefetch kernel must compute the same output as the oracle-verified
+/// `basic_dir` for the up shape (the down shape is covered above). M=256.
+#[test]
+fn gemm_q4_0_i8_bb_pfd_up_matches_basic_dir() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.cooperative_matrix {
+        eprintln!("skipping: no VK_KHR_cooperative_matrix");
+        return;
+    }
+    let (m, k, n) = (256usize, 5376usize, 21504usize);
+    let nb = k / QK4_0;
+    let mut rng = Rng::new(0x6D);
+    let weights = random_q4_0(&mut rng, n * k / QK4_0);
+    let x = through_f16(&rng.f32_vec(m * k));
+    let mut x_i8 = Vec::with_capacity(m * k);
+    let mut x_scales = Vec::with_capacity(m * nb);
+    for mi in 0..m {
+        let (sc, q) = quant_q8_0(&x[mi * k..][..k]);
+        x_scales.extend_from_slice(&sc);
+        x_i8.extend(q.iter().map(|&b| b as i8));
+    }
+    let w_buf = ctx
+        .buffer_from_iter(
+            weights
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap())),
+            BufferUsage::STORAGE_BUFFER,
+        )
+        .unwrap();
+    let x_buf = ctx.buffer_from_iter(x_i8, BufferUsage::STORAGE_BUFFER).unwrap();
+    let xs_buf = ctx
+        .buffer_from_iter(x_scales, BufferUsage::STORAGE_BUFFER)
+        .unwrap();
+    let run = |variant: &str, grid: [u32; 3]| -> Vec<f32> {
+        let kernel = ctx.load_kernel(variant).expect(variant);
+        let y_buf = ctx
+            .new_buffer::<u16>((m * n) as u64, BufferUsage::STORAGE_BUFFER)
+            .unwrap();
+        ctx.dispatch_blocking(
+            &kernel,
+            vec![
+                BufferBinding::buffer(0, w_buf.clone()),
+                BufferBinding::buffer(1, x_buf.clone()),
+                BufferBinding::buffer(2, xs_buf.clone()),
+                BufferBinding::buffer(3, y_buf.clone()),
+            ],
+            None::<u32>,
+            grid,
+        )
+        .unwrap();
+        from_f16_bits(&y_buf.read().unwrap())
+    };
+    let nb_n = (n / 16) as u32;
+    // basic_dir is SWIZZLE=0 → transposed [N-blocks, M-blocks]; bb_pfd is plain
+    // [M-blocks, N-blocks].
+    let want = run("gemm_q4_0_i8_basic_dir_k5376_n21504", [nb_n, (m / 64) as u32, 1]);
+    for variant in [
+        "gemm_q4_0_i8_bb_pfd1_up",
+        "gemm_q4_0_i8_bb_pfd2_up",
+        "gemm_q4_0_i8_bb_pfd4_up",
+    ] {
+        let got = run(variant, [(m / 64) as u32, nb_n, 1]);
+        let err = nrmse(&got, &want);
+        eprintln!("{variant} vs basic_dir nrmse {err:.8}");
+        assert_close(&got, &want, 1e-4, 1e-4, variant);
+    }
+}
+
 /// Barrier probe (STATUS 2026-06-21): which of the basic 4×1 kernel's three
 /// workgroupBarriers are actually required? Runs the all-on baseline and each
 /// single-barrier-dropped variant and PRINTS nrmse — non-asserting (a dropped
