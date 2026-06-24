@@ -1374,6 +1374,41 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
+    // bb_m4 + DEPTH-D cooperative-LDS weight prefetch (bb_pfd). All 64 lanes fetch
+    // PFD pairs of weights at once into double-buffered packed LDS, consume one
+    // pair/iter → the weight-load vmcnt is paid once per PFD pairs, hidden behind PFD
+    // pairs of MMA. Targets bb_m4's exposed weight stall at low occupancy. Sweep depth
+    // 1/2/4 (4 = 576 in-flight loads, the saturation/spill edge).
+    Variant {
+        name: "gemm_q4_0_i8_bb_pfd1",
+        src: "gemm_q4_0_i8_bb_pfd",
+        defs: &[("PFD", 1)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_bb_pfd2",
+        src: "gemm_q4_0_i8_bb_pfd",
+        defs: &[("PFD", 2)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
+    Variant {
+        name: "gemm_q4_0_i8_bb_pfd4",
+        src: "gemm_q4_0_i8_bb_pfd",
+        defs: &[("PFD", 4)],
+        workgroup: [64, 1, 1],
+        bindings: 4,
+        push_bytes: 0,
+        subgroup_size: 0,
+        raw: true,
+    },
     // bb_m4 + the l2 super-block (BN_SB) swizzle (1D dispatch, tile_index decode):
     // co-schedule BN_SB n-strips × all M-blocks so one X-block stays L2-hot while
     // the BN_SB weight strips reuse down M. BN_SB=1 is the plain transpose; sweep
@@ -2747,6 +2782,9 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         substituted = substituted.replace("#{M_TILES}", "4");
         // gemm_q4_0_i8_l2 reads `#{PF}` (weight prefetch); default 0 (inline load).
         substituted = substituted.replace("#{PF}", "0");
+        // gemm_q4_0_i8_bb_pfd reads `#{PFD}` (cooperative-LDS weight-prefetch depth in
+        // pairs); default 1 (1-deep). Variants sweep 2/4.
+        substituted = substituted.replace("#{PFD}", "1");
         // gemm_q4_0_i8_l2 reads `#{PFW}` (words prefetched/pair when PF=1); default 9
         // (full pair). 5 = minimal-fetch (block β only, β+1 inline). Only 5..9 valid.
         substituted = substituted.replace("#{PFW}", "9");

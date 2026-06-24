@@ -160,6 +160,10 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     // bb at the deployed tile height (M_TILES=4): half the waves, 2× weight reuse.
     ("bb m4", "gemm_q4_0_i8_bb_m4", 64),
     ("bb m4 pf", "gemm_q4_0_i8_bb_m4_pf", 64),
+    // bb_m4 + depth-D cooperative-LDS weight prefetch — the weight-stall sweep.
+    ("bb pfd1", "gemm_q4_0_i8_bb_pfd1", 64),
+    ("bb pfd2", "gemm_q4_0_i8_bb_pfd2", 64),
+    ("bb pfd4", "gemm_q4_0_i8_bb_pfd4", 64),
     // bb_m4 + super-block (BN_SB) swizzle — the L2-schedule sweep.
     ("bb m4 swz sb1", "gemm_q4_0_i8_bb_m4_swz_sb1", 64),
     ("bb m4 swz sb2", "gemm_q4_0_i8_bb_m4_swz_sb2", 64),

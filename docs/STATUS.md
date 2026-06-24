@@ -1,14 +1,78 @@
 # STATUS — read this first
 
-Last updated: **2026-06-23b** (bb_m4 tall-tile GEMM; super-block swizzle; split-M concurrency
-experiment; and a measurement-methodology correction — `pp_dpm_sclk` is the DPM *ceiling*, not the
-achieved clock; vulkano can't barrier coopmat dispatches → ash migration planned), Framework Desktop
-target box. The conversation history that produced this repo is gone; everything needed to continue
-is in this file, `AGENTS.md`, and `docs/plans/`.
+Last updated: **2026-06-24** (depth-D cooperative-LDS weight prefetch `bb_pfd` — pfd4 is the new
+fastest down-gemm, **+21.5% over deployed**, by keeping memory 100% busy and L2 warm). Prior:
+2026-06-23b (bb_m4 tall-tile GEMM; super-block swizzle; split-M concurrency experiment; measurement
+corrections — `pp_dpm_sclk` is the DPM *ceiling*; vulkano can't barrier coopmat → ash migration).
+Framework Desktop target box. The conversation history that produced this repo is gone; everything
+needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
 
 **Perf-number rule (AGENTS.md):** every performance number here cites its benchmark + operating
 point, e.g. `(bench: gemm_variance, perf=high)`. Numbers are at `perf=high` unless noted; `auto`
 reads ~30 % low. When a benchmark changes, update the numbers (grep for the old value).
+
+## 2026-06-24 — depth-D cooperative-LDS weight prefetch (`bb_pfd`): the new fastest down-gemm
+
+**Verdict (Ada's call): pfd4 ships-worthy — the new fastest down-gemm, beating bb_m4.** All numbers
+post-ash-migration (the trustworthy baseline; the 2026-06-23b table below is pre-migration and its
+bb_m4-vs-deployed *sign flipped* — bb_m4 is now **+11.9%** over deployed, not −4.6%).
+
+**Premise (Ada's RGP read of bb_m4):** bb_m4's first & biggest K-loop stall is the WEIGHT-load
+`vmcnt` before the WMMAs — exposed because the 4×row footprint runs at low occupancy, too few waves
+to hide it cross-wave. bb_m4 only uses lanes 0–15 (N_COLS=16) for weights; the other 48 idle. (This
+*scopes* the prior bb/fo "weights are already hidden, weight prefetch is FLAT" finding to the 2×row
+kernel — it does NOT hold on the 4×row bb_m4.)
+
+**The kernel (`gemm_q4_0_i8_bb_pfd.wgsl`, `PFD` = depth in pairs):** all 64 lanes cooperatively
+prefetch `PFD` pairs of weights at once into double-buffered **packed** LDS, then consume one
+pair/iter (unpacking from LDS) — so the weight-load `vmcnt` is paid once per `PFD` pairs and hidden
+behind `PFD` pairs of MMA. Static-unrolled group loop (no dynamic slot index); the prefetched group
+lives in 9 regs/lane across the inner loop then stores to LDS, so per-lane register carry is constant
+in `PFD`. No workgroupBarriers (WG=64 single wave). **D=4 is the ceiling of the 64-lane 1:1 mapping**
+(D·N_COLS = 64 at D=4; D=8 would need 128 lanes / 2 pairs-per-lane — a different design).
+
+**Measured (bench: mmq_variance, n_disp=1, down M=256 K=21504 N=5376, 50×1, sclk 2900, GPU
+timestamps):**
+
+| variant | GPU TFLOPS | Δ vs deployed | cv |
+|---|---|---|---|
+| deployed (swz_m4n1 s2+pf) | 19.64 | +0.0% | 1.25% |
+| bb_m4 | 21.97 | +11.9% | 0.68% |
+| bb_m4_pf (1-deep, registers) | 21.21 | +8.0% | 0.62% |
+| bb pfd1 (1-deep, LDS) | 21.22 | +8.1% | 0.47% |
+| bb pfd2 | 22.32 | +13.7% | 0.61% |
+| **bb pfd4** | **23.86** | **+21.5%** | 0.91% |
+
+- **Monotone in depth through D=4; the ~576-in-flight load wall I worried about did NOT materialize.**
+- **1-deep prefetch REGRESSES** vs no-prefetch bb_m4 (pfd1/bb_m4_pf ≈ +8% vs bb_m4's +11.9%), and
+  LDS-vs-register staging is neutral at 1-deep (pfd1 ≈ bb_m4_pf). The win is the *depth* (≥2), not the
+  staging. (Hypothesis for the 1-deep dip: the store→next-iter-load dependency sits on the critical
+  path; ≥2-deep gives enough slack to hide it. Unproven.)
+- **VGPR/occupancy identical** to bb_m4 at every depth: 144 VGPR, 0 spill, 0 scratch
+  (`RADV_DEBUG=shaderstats`). No register/occupancy confound — the gain is purely the memory schedule.
+- Parity bit-exact (nrmse 0.0) vs basic_dir at all depths (parity_mmq `..._matches_basic_dir`).
+
+**pfd4 RGP vs bb_m4 (Ada's read, instruction-timing on, submit7, sclk 2900):**
+- **First kernel to keep memory 100% busy / ~82% stalled the ENTIRE run.** bb_m4 starts strong
+  (100%/85%) but degrades to 100%/95% once the second batch of waves launches.
+- **L2 hit rate holds ~87–89% throughout** vs bb_m4 slowly degrading to ~75%. L0 82% vs 80%; L1 also
+  degrades slightly slower.
+- **Fewer bytes moved as a consequence of the warm cache:** fetch 1793 MB / local (VRAM/MALL) 219 MB
+  vs bb_m4's 2920 / 456 MB. (Consistent with `prefill-gemm-is-mlp-bound-not-byte-bound`: the win is
+  memory *staying busy*, and the byte reduction follows from L2 staying warm — not the cause.)
+- Prologue stall ~3366 clk is **per-wave, not aggregate** — not a concern. Big spread in stall clks
+  (200–4000).
+- **New biggest stall: ~57K clk (per-wavefront normalized) before the last 4 WMMAs** — the next lever.
+
+**Mechanism — HYPOTHESIS (Ada's, explicitly speculative):** the deeper prefetch lets later-launched
+waves' loads merge and catch up with earlier tiles, effectively *synchronizing* the loop starts →
+synchronizing the activation loads (which are to the same addresses) → keeping L2 warm. The MEASURED
+outcome (memory saturated + L2 stays warm + fewer VRAM bytes) is solid; the synchronization story is
+the unproven explanation. Don't promote it to fact without a trace that isolates it.
+
+**Status:** committed. Not yet wired into the model graph (`graph.rs` still loads `swz_m4n1`) — the
+deploy swap is the follow-up, along with the up-shape (K=5376 N=21504) port (this kernel is down-shape
+hardcoded). Next perf lever: the 57K pre-last-4-WMMA stall.
 
 ## 2026-06-23b — bb_m4 tall-tile, super-block swizzle, split-M, and a measurement correction
 

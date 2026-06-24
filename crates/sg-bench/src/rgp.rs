@@ -84,6 +84,9 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         "gemm_q4_0_i8_bb_pf" => (21504, 5376, 16, 32, true, true), // bb + weight prefetch
         "gemm_q4_0_i8_bb_m4" => (21504, 5376, 16, 64, true, true), // bb, M_TILES=4
         "gemm_q4_0_i8_bb_m4_pf" => (21504, 5376, 16, 64, true, true),
+        "gemm_q4_0_i8_bb_pfd1" => (21504, 5376, 16, 64, true, true), // bb_m4 + depth-D coop-LDS weight prefetch
+        "gemm_q4_0_i8_bb_pfd2" => (21504, 5376, 16, 64, true, true),
+        "gemm_q4_0_i8_bb_pfd4" => (21504, 5376, 16, 64, true, true),
         "gemm_q4_0_i8_bb_m4_swz_sb1" => (21504, 5376, 16, 64, true, false), // bb_m4 + super-block (1D)
         "gemm_q4_0_i8_bb_m4_swz_sb2" => (21504, 5376, 16, 64, true, false),
         "gemm_q4_0_i8_bb_m4_swz_sb4" => (21504, 5376, 16, 64, true, false),
