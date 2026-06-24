@@ -70,12 +70,22 @@ synchronizing the activation loads (which are to the same addresses) → keeping
 outcome (memory saturated + L2 stays warm + fewer VRAM bytes) is solid; the synchronization story is
 the unproven explanation. Don't promote it to fact without a trace that isolates it.
 
-**Status:** committed. The shader is now parameterized on `#{K_DIM}/#{N_DIM}` (one file, both
-shapes); **up-shape variants `bb_pfd{1,2,4}_up` (K=5376 N=21504) are built, bit-exact (nrmse 0.0 vs
-basic_dir), 144 VGPR/0 spill — up-shape TIMING not yet run** (its own bench: short K = 168 blocks vs
-672 amortizes the prologue fill over fewer iters, so the down +21.5% does not transfer by assumption).
-Not yet wired into the model graph (`graph.rs` still loads `swz_m4n1`) — the deploy swap is the
-follow-up. Next perf lever: the 57K pre-last-4-WMMA stall.
+**Status:** committed. The shader is parameterized on `#{K_DIM}/#{N_DIM}` (one file, both shapes);
+up-shape variants `bb_pfd{1,2,4}_up` (K=5376 N=21504) built, bit-exact (nrmse 0.0 vs basic_dir),
+144 VGPR/0 spill.
+
+**Up-shape timing — FLAT, not a win** (bench: mmq_variance `SG_BENCH_SHAPE=up`, M=256, 50×1,
+sclk 2572 — within-run Δ valid; absolute TFLOPS not comparable to the 2900 down table). pfd1_up
+**−5.4%**, pfd2_up **−0.6%**, pfd4_up **+0.8%** vs deployed (GPU timestamps; +0.8% is run-consistent
+but inside noise, NOT a win). **The weight-prefetch lever is down-specific** — exactly the
+per-kernel-occupancy scoping this arc kept finding. Up has short K (168 blocks vs 672), so the
+prologue fill amortizes over far fewer iters and the down-shape weight-stall regime doesn't hold.
+**The up shape wants its own kernel** (next-gen, separate session).
+
+**Deploy NOT swapped yet** (deliberate — `graph.rs` still loads `swz_m4n1`). The down win `bb_pfd4`
+is real (+21.5%) but the deploy swap is deferred pending the up-kernel work, so both FFN gemms move
+together. Next down perf lever: the 57K pre-last-4-WMMA stall. **Consolidated arc:
+`docs/down-gemm-optimization.md`.**
 
 ## 2026-06-23b — bb_m4 tall-tile, super-block swizzle, split-M, and a measurement correction
 

@@ -1,6 +1,9 @@
 // "BIGBOY PFD" — bb_m4 with DEPTH-D COOPERATIVE LDS WEIGHT PREFETCH.
 // Both FFN shapes via #{K_DIM}/#{N_DIM} (down K=21504 N=5376, up K=5376 N=21504),
 // M_TILES=4, single wave (WG=64).
+// WIN ON DOWN ONLY: PFD=4 = +21.5% over deployed on the down shape; on up it's FLAT
+// (pfd4 +0.8% noise) — the lever is down-specific (up's short K doesn't expose the
+// weight stall). Up wants its own kernel. See docs/down-gemm-optimization.md.
 //
 // Premise (bb_m4 RGP, 2026-06-24, [[bb-m4-binding-stall-is-weight-load]]): bb_m4's
 // first & biggest K-loop stall is the WEIGHT-load vmcnt before the WMMAs — exposed

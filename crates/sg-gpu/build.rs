@@ -1411,8 +1411,10 @@ const VARIANTS: &[Variant] = &[
         raw: true,
     },
     // Up shape (FFN gate/up, K=5376 N=21504). Same kernel; PFD evenly divides PAIRS=84
-    // (84/1/2/4 all exact). Whether the prefetch wins here is its own bench — short K
-    // (168 blocks vs 672) amortizes the prologue fill over fewer iterations.
+    // (84/1/2/4 all exact). MEASURED FLAT (not a win): pfd4_up +0.8% (noise), pfd1_up
+    // −5.4% (bench mmq_variance SG_BENCH_SHAPE=up). The prefetch lever is down-specific
+    // — short K (168 blocks vs 672) doesn't expose the weight stall. Up wants its own
+    // kernel; these are kept as the A/B baseline. See docs/down-gemm-optimization.md.
     Variant {
         name: "gemm_q4_0_i8_bb_pfd1_up",
         src: "gemm_q4_0_i8_bb_pfd",
