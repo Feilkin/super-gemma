@@ -1,15 +1,47 @@
 # STATUS — read this first
 
-Last updated: **2026-06-24** (depth-D cooperative-LDS weight prefetch `bb_pfd` — pfd4 is the new
-fastest down-gemm, **+21.5% over deployed**, by keeping memory 100% busy and L2 warm). Prior:
-2026-06-23b (bb_m4 tall-tile GEMM; super-block swizzle; split-M concurrency experiment; measurement
-corrections — `pp_dpm_sclk` is the DPM *ceiling*; vulkano can't barrier coopmat → ash migration).
+Last updated: **2026-06-25** (`bb_pfd4` WIRED to the FFN-down prefill site — new post-ash baseline
+**322 / 227 / 148 tok/s @ q0 0 / 8K / 32K**; the kernel swap alone is +3.6% e2e @ q0 0 by a
+controlled A/B). Prior: 2026-06-24 (depth-D cooperative-LDS weight prefetch `bb_pfd` — pfd4 is the new
+fastest down-gemm, **+21.5% over deployed**, by keeping memory 100% busy and L2 warm); 2026-06-23b
+(bb_m4 tall-tile GEMM; super-block swizzle; split-M concurrency experiment; measurement corrections —
+`pp_dpm_sclk` is the DPM *ceiling*; vulkano can't barrier coopmat → ash migration).
 Framework Desktop target box. The conversation history that produced this repo is gone; everything
 needed to continue is in this file, `AGENTS.md`, and `docs/plans/`.
 
 **Perf-number rule (AGENTS.md):** every performance number here cites its benchmark + operating
 point, e.g. `(bench: gemm_variance, perf=high)`. Numbers are at `perf=high` unless noted; `auto`
 reads ~30 % low. When a benchmark changes, update the numbers (grep for the old value).
+
+## 2026-06-25 — `bb_pfd4` WIRED + new post-ash prefill baseline
+
+`bb_pfd4` now serves the FFN-down prefill site (`graph.rs` `gemm_down_i8`, commit f25097f),
+replacing `swz_m4n1_k21504_n5376`. Drop-in: identical bindings + swizzled grid `[m_pad/64, 336, 1]`
++ WG=64. Its direct `coopStoreT` to `y` is ordered by the ash recorder's compute→compute barrier
+(emitted before every dispatch), so no `touch` shim — the old vulkano-auto-sync race that blocked
+direct-coopStore epilogues no longer applies. `prefill_single_chunk_per_layer_parity` unchanged
+(worst nrmse 0.03916; bb_pfd4 is bit-exact vs basic_dir, same as swz_m4n1). The up gemm stays
+`swz_m4n1` — the prefetch lever is down-specific (short K doesn't amortize the prologue).
+
+**New post-ash trustworthy prefill baseline: 322 / 227 / 148 tok/s @ q0 0 / 8K / 32K**
+(bench: `sg-bench profile`, perf=high). This SUPERSEDES the pre-ash `315 / 223 / 146` headline below
+(2026-06-20) — those numbers predate the vulkano→ash migration and are not comparable.
+
+**Controlled A/B isolates the kernel from the migration** (same post-ash code, only the `gemm_down_i8`
+`load()` line toggled, q0=0, back-to-back same session, bench: `sg-bench profile`, `SG_PREFILL_Q0S=0`):
+`swz_m4n1` **311.5** → `bb_pfd4` **322.7 tok/s = +3.6% e2e @ q0 0**. The expected dilution of the
+isolated **+21.5%** kernel A/B — down-gemm is one of six gemms (+ attention/rms/residuals) per layer.
+The ash migration's own share can't be isolated without reverting the whole GPU layer, but `315` sits
+between the two arms, so at q0 0 the migration was **~neutral** and the visible gain over `315` is
+essentially all `bb_pfd4` (caveat: `315` was a different day/thermal state — the +3.6% is the only
+clock-controlled number; trust that one). The +3.6% is q0-0-specific (FFN-bound); at 8K/32K the
+down-gemm is a shrinking share of an attention-dominated layer, so its e2e contribution tapers.
+
+⚠ The `mmq_variance` `SG_BENCH_M` sweep is only valid for grid-read kernels (`bb_pfd*`, `bb_m4`,
+`basic`, `fo*`, `swz_m4n1`): the `l2*`/`bb_m4_swz*` family bakes `NB_M=4` (M=256) into its in-kernel
+`tile_index` decode, so at M≠256 it computes garbage (nrmse 0.9995 vs basic_dir at M=1024) at a
+fixed cache-friendly ~20 TFLOPS — a "M-robust" artifact, not a real property. Parity for that family
+is pinned to M=256 for exactly this reason.
 
 ## 2026-06-24 — depth-D cooperative-LDS weight prefetch (`bb_pfd`): the new fastest down-gemm
 
@@ -82,9 +114,9 @@ per-kernel-occupancy scoping this arc kept finding. Up has short K (168 blocks v
 prologue fill amortizes over far fewer iters and the down-shape weight-stall regime doesn't hold.
 **The up shape wants its own kernel** (next-gen, separate session).
 
-**Deploy NOT swapped yet** (deliberate — `graph.rs` still loads `swz_m4n1`). The down win `bb_pfd4`
-is real (+21.5%) but the deploy swap is deferred pending the up-kernel work, so both FFN gemms move
-together. **Consolidated arc: `docs/down-gemm-optimization.md`.**
+**Deploy: DONE 2026-06-25** (see the section above — `bb_pfd4` wired, +3.6% e2e @ q0 0). The earlier
+plan to defer the swap pending the up-kernel work was dropped: the down win stands alone, the up gemm
+stays `swz_m4n1` until its own kernel lands. **Consolidated arc: `docs/down-gemm-optimization.md`.**
 
 **2026-06-25 — two follow-on levers measured DEAD** (both gated on `bb_pfd`, `bb_pfd4` champion
 untouched): (1) **d_a-scale prefetch (DAP)** — chased the 57K-clk d_a stall; pfd4_dap +12.5% vs pfd4
