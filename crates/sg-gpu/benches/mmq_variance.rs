@@ -164,6 +164,11 @@ const VARIANTS_DOWN: &[(&str, &str, u32)] = &[
     ("bb pfd1", "gemm_q4_0_i8_bb_pfd1", 64),
     ("bb pfd2", "gemm_q4_0_i8_bb_pfd2", 64),
     ("bb pfd4", "gemm_q4_0_i8_bb_pfd4", 64),
+    // + d_a-scale prefetch (DAP) — take the rescale's b32 scale load off the hot path.
+    ("bb pfd2 dap", "gemm_q4_0_i8_bb_pfd2_dap", 64),
+    ("bb pfd4 dap", "gemm_q4_0_i8_bb_pfd4_dap", 64),
+    // Transposed [N,M] dispatch A/B (wg.x=N) — the weight-reuse-order test.
+    ("bb pfd4 tp", "gemm_q4_0_i8_bb_pfd4_tp", 64),
     // bb_m4 + super-block (BN_SB) swizzle — the L2-schedule sweep.
     ("bb m4 swz sb1", "gemm_q4_0_i8_bb_m4_swz_sb1", 64),
     ("bb m4 swz sb2", "gemm_q4_0_i8_bb_m4_swz_sb2", 64),
@@ -248,7 +253,9 @@ fn main() {
             if kern.contains("_l2") || kern.contains("bb_m4_swz") {
                 // 1D: one workgroup per output tile, decoded in-kernel (tile_index).
                 [(ndim as u32 / N_BLOCK) * (mdim as u32 / mb), 1, 1]
-            } else if kern.contains("basic") {
+            } else if kern.contains("basic") || kern.ends_with("_tp") {
+                // Transposed [N-blocks, M-blocks] (wg.x=N): basic baseline + the bb_pfd
+                // _tp dispatch-order A/B.
                 [ndim as u32 / N_BLOCK, mdim as u32 / mb, 1]
             } else {
                 [mdim as u32 / mb, ndim as u32 / N_BLOCK, 1]

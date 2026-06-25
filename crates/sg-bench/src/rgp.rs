@@ -90,6 +90,9 @@ fn shape(kernel: &str) -> Option<(usize, usize, u32, u32, bool, bool)> {
         "gemm_q4_0_i8_bb_pfd1_up" => (5376, 21504, 16, 64, true, true), // up shape (FFN gate/up)
         "gemm_q4_0_i8_bb_pfd2_up" => (5376, 21504, 16, 64, true, true),
         "gemm_q4_0_i8_bb_pfd4_up" => (5376, 21504, 16, 64, true, true),
+        "gemm_q4_0_i8_bb_pfd2_dap" => (21504, 5376, 16, 64, true, true), // + d_a-scale prefetch
+        "gemm_q4_0_i8_bb_pfd4_dap" => (21504, 5376, 16, 64, true, true),
+        "gemm_q4_0_i8_bb_pfd4_tp" => (21504, 5376, 16, 64, true, false), // transposed [N,M] dispatch (swz=false)
         "gemm_q4_0_i8_bb_m4_swz_sb1" => (21504, 5376, 16, 64, true, false), // bb_m4 + super-block (1D)
         "gemm_q4_0_i8_bb_m4_swz_sb2" => (21504, 5376, 16, 64, true, false),
         "gemm_q4_0_i8_bb_m4_swz_sb4" => (21504, 5376, 16, 64, true, false),

@@ -88,9 +88,31 @@ BCAST + deep prefetch). `bb_pfd4` is the challenger that beats it.
 | Full-occupancy `fo`/`bb` occupancy family | ceiling −15.5% | occupancy isn't the lever ([[fo-bb-occupancy-negative-sxp-hoist-pending]]) |
 | int8 V/PV flash (Piece B) | slower e2e, gap grows w/ ctx | shelved; QKᵀ int8 (Piece A) kept ([[int8-pv-needs-inkernel-i8-operand]]) |
 | PD / AXPF micro-variants | flat at pinned clock (−0..−1.2%) | the apparent "+4%" was an auto-clock DVFS artifact ([[pd-axpf-flat-at-pinned-clock]]) |
+| **d_a-scale prefetch (`bb_pfd` DAP)** | pfd4_dap +12.5% vs pfd4 +21.2%, **at byte-identical footprint** (144 VGPR / 6144 LDS) | the 57K-clk d_a stall ISN'T real headroom — the kernel is memory-pipe-bound (100% busy), so d_a is just part of the saturated load stream; prefetching it a slot early only adds another in-flight load. Tried LDS-staged (dead: dropped occupancy, see [[aco-vgpr-budget-tracks-binding-occupancy]]) AND register cross-iter carry (dead even at identical footprint). The SXP hoist gave identical ISA (ACO already schedules it as early as possible). |
+| **Transposed [N,M] dispatch (`bb_pfd` TPOSE, wg.x=N)** | pfd4_tp +10.1% vs pfd4 +21.2% | loses the weight reuse: weights (62 MiB) > MALL so reuse must come from co-residency; wg.x=M co-locates the 4 M-blocks sharing a weight column, wg.x=N re-fetches weights per M-block. Measured: VRAM/MALL **430 vs 341 MiB**, lower L2 hit rate. (Activations are 5.25 MiB → cached either way, so reusing *them* buys nothing.) See the dispatch-order analysis below. |
 
 **Still pending / not-yet-ported (live):** the `d_a`-scale hoist (SXP) was +4–9% VGPR-free
 on `fo` but never ported to the shipping kernels ([[fo-bb-occupancy-negative-sxp-hoist-pending]]).
+
+### Dispatch order: wg.x=M ([M-blocks, N-blocks]) is correct, quantified
+
+The dispatch must put **M in the fast-varying (x) dimension** so the 4 M-blocks that
+share each N-column's weights launch co-resident. Why, by the numbers (down M=256):
+
+| operand | per-tile | total unique | fits MALL (~32 MB)? |
+|---|---|---|---|
+| weights (16 cols × K, Q4_0) | 189 KiB | **62 MiB** | **no** |
+| activations (64 rows × K, int8) | 1.31 MiB | 5.25 MiB | yes |
+
+Per-tile the activation load is ~7× the weights, but that's the wrong level: activations
+(5.25 MiB) stay cached regardless of order, so the only reuse that matters is **weights**,
+and weights are too big to cache → reuse must come from co-residency. DRAM consequence:
+**wg.x=M ≈ 67 MiB DRAM** (weights fetched ~once, reused ×4) vs **wg.x=N ≈ 253 MiB**
+(weights re-fetched ×4). Measured VRAM/MALL 341 vs 430 MiB confirms the direction.
+Corollary: this is also why `bb_m4_swz` (reuse *both* operands) didn't beat plain — the
+activation half was already free. **RGP note:** the "write size" memory counter is a
+VRAM-level eviction count (96 B–3 KB), NOT the logical 2.6 MB output write — Y is
+cache-resident in all variants, so don't read the write column for signal.
 
 ## Methodology lessons (what made the measurements trustworthy)
 

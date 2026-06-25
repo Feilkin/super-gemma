@@ -429,11 +429,22 @@ fn gemm_q4_0_i8_l2_matches_basic_dir() {
         ("gemm_q4_0_i8_bb_pfd1", 64u32),     // depth-D coop-LDS weight prefetch
         ("gemm_q4_0_i8_bb_pfd2", 64u32),
         ("gemm_q4_0_i8_bb_pfd4", 64u32),
+        ("gemm_q4_0_i8_bb_pfd2_dap", 64u32), // + d_a-scale prefetch
+        ("gemm_q4_0_i8_bb_pfd4_dap", 64u32),
     ] {
         let got = run(variant, [m as u32 / m_rows, nb_n, 1]);
         let err = nrmse(&got, &want);
         eprintln!("{variant} vs basic_dir nrmse {err:.8}");
         assert_close(&got, &want, 1e-4, 1e-4, variant);
+    }
+
+    // bb_pfd4_tp: transposed [N-blocks, M-blocks] dispatch (wg.x=N) — must reproduce
+    // basic_dir despite the swapped grid (the dispatch-order A/B).
+    {
+        let got = run("gemm_q4_0_i8_bb_pfd4_tp", [nb_n, (m / 64) as u32, 1]);
+        let err = nrmse(&got, &want);
+        eprintln!("gemm_q4_0_i8_bb_pfd4_tp vs basic_dir nrmse {err:.8}");
+        assert_close(&got, &want, 1e-4, 1e-4, "gemm_q4_0_i8_bb_pfd4_tp");
     }
 
     // Deployed swz down (4×1, SWIZZLE=1 → 2D [M-blocks, N-blocks]) and its EPI=1

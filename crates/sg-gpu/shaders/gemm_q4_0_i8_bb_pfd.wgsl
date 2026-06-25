@@ -47,6 +47,21 @@ const PFD: u32 = #{PFD}u;
 const PAIRS: u32 = NB / 2u;            // 336 pairs per row
 const NUM_GROUPS: u32 = PAIRS / PFD;   // PFD evenly divides 336 (336/1/2/4 all exact)
 const WBUF: u32 = PFD * N_COLS * 9u;   // packed u32 per LDS buffer
+// d_a prefetch (DAP=1): keep the rescale's scale load off the critical path (the
+// binding stall AFTER weights are prefetched — the b32 that feeds v_fma_mix in the
+// rescale; RGP 2026-06-24). 0 = inline x_scales load. Unlike the weights (per-column →
+// cross-lane → must stage in LDS), d_a is PER-ROW — each lane owns its scale — so no
+// LDS staging is needed: a 1-deep REGISTER prefetch (carry pair p+1's d_a across one
+// iteration in `da_next`) takes it off the path for ~1 VGPR and ZERO extra LDS. The
+// existing da_l 0-stride broadcast is the only LDS d_a touches, same as DAP=0. (An
+// LDS-buffered version cost 1–2 KB LDS → dropped the occupancy tier → ACO then inflated
+// VGPR to fill the slack; the register carry sidesteps all of that.)
+const DAP: u32 = #{DAP}u;
+// Dispatch order (TPOSE): 0 = wg.x→M-block (x fastest-varying → the 4 M-blocks of each
+// N-column launch co-resident and reuse that column's weights; weights are 62 MiB >
+// MALL so this reuse is the lever). 1 = wg.x→N-block (transposed A/B — reuses the
+// already-cached activation strip instead; predicted ~4× more weight DRAM traffic).
+const TPOSE: u32 = #{TPOSE}u;
 
 // LDS: double-buffered PACKED weights (group g in buf g&1, group g+1 prefetched into
 // buf (g+1)&1), the unpacked weight block-pair (16 N-rows × 64 K), the pair's two d_w
@@ -76,8 +91,10 @@ fn main(
     @builtin(local_invocation_id) lid_v: vec3<u32>,
 ) {
     let lid = lid_v.x;
-    let m0 = wg.x * M_ROWS;  // [M-blocks, N-blocks] dispatch
-    let n0 = wg.y * N_COLS;
+    // TPOSE=0: grid [M-blocks, N-blocks], wg.x=M. TPOSE=1: grid [N-blocks, M-blocks],
+    // wg.x=N (the harness dispatches the matching shape).
+    let m0 = select(wg.x, wg.y, TPOSE == 1u) * M_ROWS;
+    let n0 = select(wg.y, wg.x, TPOSE == 1u) * N_COLS;
     let r0 = m0 * K;          // x base for tile rows  0..15
     let r1 = (m0 + 16u) * K;  // x base for tile rows 16..31
     let r2 = (m0 + 32u) * K;  // x base for tile rows 32..47
@@ -103,10 +120,17 @@ fn main(
         wpack[d + 3u] = weights[wp + 3u]; wpack[d + 4u] = weights[wp + 4u]; wpack[d + 5u] = weights[wp + 5u];
         wpack[d + 6u] = weights[wp + 6u]; wpack[d + 7u] = weights[wp + 7u]; wpack[d + 8u] = weights[wp + 8u];
     }
+    // d_a prologue: prime the 1-deep register prefetch with pair 0's scale (this lane's
+    // row). Carried across iterations in da_next; the prime load is the unavoidable
+    // pipeline fill.
+    var da_next = 0u;
+    if (DAP == 1u) {
+        da_next = x_scales[(m0 + lid) * PAIRS];
+    }
 
     for (var g = 0u; g < NUM_GROUPS; g = g + 1u) {
-        let cur = (g & 1u) * WBUF;          // current group's buffer offset
-        let nxt = ((g + 1u) & 1u) * WBUF;   // next group's buffer offset
+        let cur = (g & 1u) * WBUF;            // current group's weight buffer offset
+        let nxt = ((g + 1u) & 1u) * WBUF;     // next group's weight buffer offset
         let do_pf = (g + 1u) < NUM_GROUPS;
 
         // ── Issue the cooperative prefetch of group g+1 into registers (NOT yet
@@ -122,6 +146,13 @@ fn main(
             t3 = weights[wp + 3u]; t4 = weights[wp + 4u]; t5 = weights[wp + 5u];
             t6 = weights[wp + 6u]; t7 = weights[wp + 7u]; t8 = weights[wp + 8u];
         }
+
+        // The lever this file adds over bb_pfd: take the rescale's b32 scale load off
+        // the hot path by prefetching the group's d_a into LDS. INTERLEAVED per-slot
+        // (not batched at the group head) so only ONE d_a reg is live at a time, not
+        // PFD across the whole unrolled body — the batched array<u32,PFD> tipped ACO
+        // +36 VGPR at PFD=4 (dropped occupancy 400→320 waves); the per-slot scalar
+        // keeps it cheap. See the load/store inside the consume loop.
 
         // ── Consume this group's PFD pairs from cur buffer (PFD const → ACO unrolls;
         // static slot index, no dynamic addressing).
@@ -157,8 +188,21 @@ fn main(
             let a1_30 = coopLoadT<coop_mat16x16<i8, A>>(&x[r3 + k0 + 32u], K);
             let a1_31 = coopLoadT<coop_mat16x16<i8, A>>(&x[r3 + k0 + 48u], K);
             // d_a pair: two consecutive f16 (beta, beta+1) in ONE u32. All 64 lanes
-            // load their own row's scale (M_ROWS == WG).
-            let dpair = unpack2x16float(x_scales[(m0 + lid) * PAIRS + p]);
+            // load their own row's scale (M_ROWS == WG). DAP=1 takes it from the
+            // register prefetched LAST iteration (already resolved → no rescale stall)
+            // and issues THIS slot's prefetch of pair p+1 (hidden behind the WMMAs).
+            // DAP=0 is the inline VMEM load that stalls the rescale.
+            var dword = 0u;
+            if (DAP == 1u) {
+                dword = da_next;
+                let pn = p + 1u;
+                if (pn < PAIRS) {
+                    da_next = x_scales[(m0 + lid) * PAIRS + pn];
+                }
+            } else {
+                dword = x_scales[(m0 + lid) * PAIRS + p];
+            }
+            let dpair = unpack2x16float(dword);
             let da0 = dpair.x;
             let da1 = dpair.y;
 
@@ -211,10 +255,11 @@ fn main(
             yacc1 = yacc1 + (coopLoad<coop_mat16x16<f32, C>>(&da_l[16u], 0u) * dw_1) * f32(acc1_1);
             yacc2 = yacc2 + (coopLoad<coop_mat16x16<f32, C>>(&da_l[32u], 0u) * dw_1) * f32(acc1_2);
             yacc3 = yacc3 + (coopLoad<coop_mat16x16<f32, C>>(&da_l[48u], 0u) * dw_1) * f32(acc1_3);
+
         }
 
-        // ── Store the prefetched group g+1 into nxt buffer (its vmcnt is now resolved
-        // behind the MMAs above). Next outer iter reads it from cur=(g+1)&1.
+        // ── Store the prefetched group g+1 weights into nxt buffer (its vmcnt is now
+        // resolved behind the MMAs above). Next outer iter reads it from cur=(g+1)&1.
         if (do_pf && lid < PFD * N_COLS) {
             let d = nxt + 9u * lid;
             wpack[d] = t0; wpack[d + 1u] = t1; wpack[d + 2u] = t2;

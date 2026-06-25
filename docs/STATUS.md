@@ -84,8 +84,17 @@ prologue fill amortizes over far fewer iters and the down-shape weight-stall reg
 
 **Deploy NOT swapped yet** (deliberate — `graph.rs` still loads `swz_m4n1`). The down win `bb_pfd4`
 is real (+21.5%) but the deploy swap is deferred pending the up-kernel work, so both FFN gemms move
-together. Next down perf lever: the 57K pre-last-4-WMMA stall. **Consolidated arc:
-`docs/down-gemm-optimization.md`.**
+together. **Consolidated arc: `docs/down-gemm-optimization.md`.**
+
+**2026-06-25 — two follow-on levers measured DEAD** (both gated on `bb_pfd`, `bb_pfd4` champion
+untouched): (1) **d_a-scale prefetch (DAP)** — chased the 57K-clk d_a stall; pfd4_dap +12.5% vs pfd4
++21.2% *at byte-identical footprint* → the stall isn't real headroom, the kernel is memory-pipe-bound
+([[prefill-gemm-is-mlp-bound-not-byte-bound]]). The detour produced the reusable ACO fact
+[[aco-vgpr-budget-tracks-binding-occupancy]] (LDS sets the occupancy tier → ACO inflates VGPR to fill
+it; attack LDS not VGPR). (2) **Transposed [N,M] dispatch (TPOSE)** — pfd4_tp +10.1%, worse L2 (VRAM/MALL
+430 vs 341 MiB): wg.x=M is correct because weights (62 MiB > MALL) need co-residency reuse, activations
+(5.25 MiB) are cached regardless. Both in the doc's DIED ledger. Open down lever remains the 57K stall —
+but it's now known NOT to be d_a; re-profile what it actually is.
 
 ## 2026-06-23b — bb_m4 tall-tile, super-block swizzle, split-M, and a measurement correction
 
