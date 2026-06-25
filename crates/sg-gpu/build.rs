@@ -1445,41 +1445,6 @@ const VARIANTS: &[Variant] = &[
         subgroup_size: 0,
         raw: true,
     },
-    // bb_pfd + d_a-scale prefetch (DAP=1), down shape. Takes the rescale's b32 scale
-    // load off the critical path — bb_pfd4's #1 remaining stall (57K clk/wave before the
-    // last 4 WMMAs, RGP 2026-06-24). A/B vs bb_pfd2/4 (DAP=0).
-    Variant {
-        name: "gemm_q4_0_i8_bb_pfd2_dap",
-        src: "gemm_q4_0_i8_bb_pfd",
-        defs: &[("PFD", 2), ("DAP", 1), ("K_DIM", 21504), ("N_DIM", 5376)],
-        workgroup: [64, 1, 1],
-        bindings: 4,
-        push_bytes: 0,
-        subgroup_size: 0,
-        raw: true,
-    },
-    Variant {
-        name: "gemm_q4_0_i8_bb_pfd4_dap",
-        src: "gemm_q4_0_i8_bb_pfd",
-        defs: &[("PFD", 4), ("DAP", 1), ("K_DIM", 21504), ("N_DIM", 5376)],
-        workgroup: [64, 1, 1],
-        bindings: 4,
-        push_bytes: 0,
-        subgroup_size: 0,
-        raw: true,
-    },
-    // Transposed [N,M] dispatch A/B (wg.x=N): reuses the cached activation strip instead
-    // of the 62 MiB weights → predicted ~4× more weight DRAM traffic. Plain pfd4 base.
-    Variant {
-        name: "gemm_q4_0_i8_bb_pfd4_tp",
-        src: "gemm_q4_0_i8_bb_pfd",
-        defs: &[("PFD", 4), ("TPOSE", 1), ("K_DIM", 21504), ("N_DIM", 5376)],
-        workgroup: [64, 1, 1],
-        bindings: 4,
-        push_bytes: 0,
-        subgroup_size: 0,
-        raw: true,
-    },
     // bb_m4 + the l2 super-block (BN_SB) swizzle (1D dispatch, tile_index decode):
     // co-schedule BN_SB n-strips × all M-blocks so one X-block stays L2-hot while
     // the BN_SB weight strips reuse down M. BN_SB=1 is the plain transpose; sweep
@@ -2856,12 +2821,6 @@ fn compile(path: &std::path::Path, variant: &Variant) -> Vec<u32> {
         // gemm_q4_0_i8_bb_pfd reads `#{PFD}` (cooperative-LDS weight-prefetch depth in
         // pairs); default 1 (1-deep). Variants sweep 2/4.
         substituted = substituted.replace("#{PFD}", "1");
-        // gemm_q4_0_i8_bb_pfd reads `#{DAP}` (also prefetch the d_a scales into LDS);
-        // default 0 (inline x_scales load). 1 = the `_dap` variants.
-        substituted = substituted.replace("#{DAP}", "0");
-        // gemm_q4_0_i8_bb_pfd reads `#{TPOSE}` (transposed [N,M] dispatch); default 0
-        // (the weight-reuse-optimal [M,N], wg.x=M). 1 = the `_tp` A/B.
-        substituted = substituted.replace("#{TPOSE}", "0");
         // gemm_q4_0_i8_l2 reads `#{PFW}` (words prefetched/pair when PF=1); default 9
         // (full pair). 5 = minimal-fetch (block β only, β+1 inline). Only 5..9 valid.
         substituted = substituted.replace("#{PFW}", "9");
