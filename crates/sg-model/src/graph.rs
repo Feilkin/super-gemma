@@ -412,7 +412,12 @@ impl<'a> GpuModel<'a> {
             // per weight load; O global single-buffers (s1) as its largest-K
             // stage otherwise caps occupancy. See mmq_tflops + STATUS.
             gemm_up_i8: load("gemm_q4_0_i8_swz_m4n1_k5376_n21504")?,
-            gemm_down_i8: load("gemm_q4_0_i8_swz_m4n1_k21504_n5376")?,
+            // FFN down: bb_pfd4 — depth-4 cooperative-LDS weight prefetch
+            // (+21.5% over swz_m4n1, STATUS 2026-06-24). Same 4×1 swizzled grid
+            // and bindings; direct coopStoreT to y, ordered by the recorder
+            // barrier. The up shape stays swz_m4n1 (pfd is down-specific — short
+            // K doesn't amortize the prologue).
+            gemm_down_i8: load("gemm_q4_0_i8_bb_pfd4")?,
             gemm_q_i8_sl: load("gemm_q4_0_i8_swz_m4n1_k5376_n8192")?,
             gemm_q_i8_gl: load("gemm_q4_0_i8_swz_m4n1_k5376_n16384")?,
             gemm_kv_i8_sl: load("gemm_q4_0_i8_swz_m4n1_k5376_n4096")?,
