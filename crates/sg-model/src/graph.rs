@@ -876,6 +876,30 @@ impl<'a> GpuModel<'a> {
         Ok(out)
     }
 
+    /// Full-sequence prefill of `tokens` from the current `pos`, the 60-layer
+    /// forward only — no final norm / LM head. Grows the KV chunk-by-chunk
+    /// exactly as a real prompt does (the same per-chunk graphs as
+    /// [`Self::prefill_all_logits`], minus the logits work). The caller
+    /// wall-times this to get prefill throughput `tok/s = tokens.len() / time`,
+    /// comparable to `llama-bench -p L` (see `tools/llama_bench_sweep.sh`).
+    pub fn prefill_plain(&mut self, tokens: &[u32]) -> Result<(), GpuError> {
+        for chunk in tokens.chunks(self.max_chunk).collect::<Vec<_>>() {
+            let n_real = chunk.len();
+            let m_pad = n_real.next_multiple_of(64);
+            let key = (m_pad, n_real, LogitsMode::None);
+            if !self.prefill_graphs.contains_key(&key) {
+                let g = self.record_prefill(m_pad, n_real, LogitsMode::None)?;
+                self.prefill_graphs.insert(key, g);
+            }
+            self.stage_prefill_chunk(chunk)?;
+            for segment in &self.prefill_graphs[&key] {
+                self.ctx.submit_blocking(segment)?;
+            }
+            self.pos += n_real as u32;
+        }
+        Ok(())
+    }
+
     /// One full-size interior prefill chunk (no logits) as segment graphs,
     /// uninstrumented — the profiler wall-times the segment sequence.
     pub fn record_prefill_chunk_plain(&self) -> Result<Vec<CommandGraph>, GpuError> {

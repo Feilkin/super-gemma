@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod prefill;
 mod profile;
 mod rgp;
 mod splitbench;
@@ -31,7 +32,9 @@ enum Cmd {
     Decode,
     /// TTFT cold / warm / partial-hit (M6+).
     Ttft,
-    /// Prefill throughput (M4+).
+    /// Full-sequence prefill throughput vs context length (tok/s = L / time,
+    /// from an empty KV) — apples-to-apples with `llama-bench -p L`. Run at
+    /// perf=auto; override ctxs with `SG_PREFILL_CTXS` (and `SG_GLOBAL_CAP`).
     Prefill,
     /// Per-kernel e2e profile of decode steps and prefill chunks.
     Profile,
@@ -56,6 +59,7 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.cmd {
+        Cmd::Prefill => prefill::run(&args.model),
         Cmd::Profile => profile::run(&args.model),
         Cmd::Rgp { kernel } => rgp::run(&kernel),
         Cmd::RgpPrefill { q0 } => rgp::run_prefill(&args.model, q0),
