@@ -14,16 +14,38 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use sg_model::GpuModel;
 
-// Reps run back-to-back with no cooldown, so a long-ctx run is a sustained peg
-// (a 32K prefill is ~minutes each). Prefill timing is very stable (cv ~0%), so
-// keep reps low to bound continuous load; run at perf=auto so the clock
-// throttles to a plateau, and watch Tctl (see tools/llama_bench_sweep.sh).
-const REPS: usize = 2;
-const WARMUP: usize = 1;
+/// Timed reps (`SG_PREFILL_REPS`) and warmups (`SG_PREFILL_WARMUP`). Each rep is
+/// a fresh full-sequence prefill — a sustained peg of minutes at long ctx — so
+/// we cool to a floor (`SG_PREFILL_COOL`, °C; 0 disables) BEFORE each one. That
+/// caps the soak at a single rep's safe plateau instead of letting back-to-back
+/// reps accumulate heat (32K hit 88 °C un-cooled vs llama's 84). Timing is very
+/// stable (cv ~0.3%), so 2 reps is plenty; drop to 1 for 128K. Run at perf=auto.
+fn reps() -> usize {
+    env_usize("SG_PREFILL_REPS", 2)
+}
+fn warmup() -> usize {
+    env_usize("SG_PREFILL_WARMUP", 1)
+}
+/// Cool to this Tctl (°C) before each rep. 0 disables cooling. Default 50 —
+/// near idle on this box, a cool start that matches llama's gated runs.
+fn cool_floor() -> i64 {
+    std::env::var("SG_PREFILL_COOL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+}
+
+fn env_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
 
 fn env_u32s(var: &str, default: &[u32]) -> Vec<u32> {
     std::env::var(var)
@@ -67,7 +89,71 @@ fn perf_level() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-#[derive(serde::Serialize)]
+/// Tctl (°C) from the k10temp hwmon — the die sensor that tracks the thermal
+/// limit on this APU (the amdgpu `edge` sensor under-reports). `None` if no
+/// k10temp node is found. Reads the `_input` directly; `sensors -u` ordering
+/// is what silently broke an earlier scraping guard (see thermal memory).
+fn read_tctl() -> Option<i64> {
+    for e in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
+        let p = e.path();
+        if std::fs::read_to_string(p.join("name"))
+            .unwrap_or_default()
+            .trim()
+            != "k10temp"
+        {
+            continue;
+        }
+        for n in 1..=8 {
+            if std::fs::read_to_string(p.join(format!("temp{n}_label")))
+                .unwrap_or_default()
+                .trim()
+                == "Tctl"
+            {
+                if let Ok(milli) = std::fs::read_to_string(p.join(format!("temp{n}_input")))
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<i64>()
+                {
+                    return Some(milli / 1000);
+                }
+            }
+        }
+        // k10temp without labels: temp1 is Tctl.
+        if let Ok(milli) = std::fs::read_to_string(p.join("temp1_input"))
+            .unwrap_or_default()
+            .trim()
+            .parse::<i64>()
+        {
+            return Some(milli / 1000);
+        }
+    }
+    None
+}
+
+/// Block until Tctl <= `floor` °C (poll every 5 s). `floor <= 0` disables
+/// cooling. With cooling on, ABORT if Tctl can't be read — never peg the GPU
+/// blind, which is what burned us at 113 °C.
+fn cool_to(floor: i64) -> anyhow::Result<()> {
+    if floor <= 0 {
+        return Ok(());
+    }
+    loop {
+        let t = read_tctl().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cooling on (SG_PREFILL_COOL={floor}) but Tctl unreadable — \
+                 set SG_PREFILL_COOL=0 to disable or fix the sensor"
+            )
+        })?;
+        if t <= floor {
+            eprintln!("  Tctl {t}°C (<= {floor}°C)");
+            return Ok(());
+        }
+        eprintln!("  Tctl {t}°C > {floor}°C — cooling …");
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
 struct Point {
     tok_s: f64,
     total_ms: f64,
@@ -115,19 +201,57 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
     let mut model =
         GpuModel::new(&ctx, &gguf, cap, chunk).map_err(|e| anyhow::anyhow!("upload: {e}"))?;
 
+    let (n_reps, n_warm, floor) = (reps(), warmup(), cool_floor());
+    eprintln!(
+        "reps = {n_reps} (+{n_warm} warmup), cool = {}",
+        if floor > 0 {
+            format!("to {floor}°C before each rep")
+        } else {
+            "disabled".into()
+        }
+    );
+
+    // Write the JSON after every ctx (incremental): a long-ctx run can take many
+    // minutes per point and a thermal abort must not lose completed points.
+    let sha = git_sha();
+    let when = format!(
+        "unix:{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    let dir = std::path::Path::new("bench/results");
+    std::fs::create_dir_all(dir)?;
+    let out: PathBuf = dir.join(format!("{}-prefill.json", &sha[..12.min(sha.len())]));
+    let write_report = |prefill: &BTreeMap<u32, Point>| -> anyhow::Result<()> {
+        let report = Report {
+            git_sha: sha.clone(),
+            when: when.clone(),
+            perf_level: perf.clone(),
+            chunk,
+            global_cap: cap,
+            prefill: prefill.clone(),
+        };
+        let mut f = std::fs::File::create(&out)?;
+        f.write_all(serde_json::to_string_pretty(&report)?.as_bytes())?;
+        Ok(())
+    };
+
     let mut prefill = BTreeMap::new();
     for &l in &ctxs {
         eprintln!("prefill {l} tokens (full sequence) …");
         let tokens: Vec<u32> = (0..l).map(|i| (1000 + i * 7) % 100_000).collect();
         let mut totals = Vec::new();
-        for rep in 0..REPS + WARMUP {
+        for rep in 0..n_reps + n_warm {
+            cool_to(floor)?; // start each rep cool — caps the soak at one rep's plateau
             model.reset(); // pos = 0: prefill the whole sequence from empty
             let t0 = Instant::now();
             model
                 .prefill_plain(&tokens)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let ms = t0.elapsed().as_secs_f64() * 1e3;
-            let warm = rep < WARMUP;
+            let warm = rep < n_warm;
             eprintln!("  rep {rep}: {ms:.1} ms{}", if warm { " (warmup)" } else { "" });
             if !warm {
                 totals.push(ms);
@@ -136,39 +260,21 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
         let total_ms = median(totals.clone());
         let mean = totals.iter().sum::<f64>() / totals.len() as f64;
         let var = totals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / totals.len() as f64;
-        prefill.insert(
-            l,
-            Point {
-                tok_s: l as f64 / (total_ms / 1e3),
-                total_ms,
-                cv: if mean > 0.0 { var.sqrt() / mean } else { 0.0 },
-                reps: totals.len(),
-            },
-        );
+        let point = Point {
+            tok_s: l as f64 / (total_ms / 1e3),
+            total_ms,
+            cv: if mean > 0.0 { var.sqrt() / mean } else { 0.0 },
+            reps: totals.len(),
+        };
+        eprintln!("  => {:.1} tok/s (cv {:.1}%)", point.tok_s, point.cv * 100.0);
+        prefill.insert(l, point);
+        write_report(&prefill)?;
     }
 
-    let report = Report {
-        git_sha: git_sha(),
-        when: format!(
-            "unix:{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        ),
-        perf_level: perf,
-        chunk,
-        global_cap: cap,
-        prefill,
-    };
-
-    println!(
-        "\nfull-sequence prefill (perf={}, chunk={}, cap={})",
-        report.perf_level, report.chunk, report.global_cap
-    );
+    println!("\nfull-sequence prefill (perf={perf}, chunk={chunk}, cap={cap})");
     println!("| ctx | tok/s | total ms | cv |");
     println!("|----:|------:|---------:|---:|");
-    for (l, p) in &report.prefill {
+    for (l, p) in &prefill {
         println!(
             "| {l} | {:.1} | {:.1} | {:.1}% |",
             p.tok_s,
@@ -176,15 +282,6 @@ pub fn run(model_path: &std::path::Path) -> anyhow::Result<()> {
             p.cv * 100.0
         );
     }
-
-    let dir = std::path::Path::new("bench/results");
-    std::fs::create_dir_all(dir)?;
-    let out = dir.join(format!(
-        "{}-prefill.json",
-        &report.git_sha[..12.min(report.git_sha.len())]
-    ));
-    let mut f = std::fs::File::create(&out)?;
-    f.write_all(serde_json::to_string_pretty(&report)?.as_bytes())?;
     eprintln!("wrote {}", out.display());
     Ok(())
 }
