@@ -1,0 +1,15 @@
+{
+  "git_sha": "b75d5cf44a70956ac2607bee33224cccb46a26b8",
+  "when": "unix:1782644410",
+  "perf_level": "auto",
+  "chunk": 256,
+  "global_cap": 8192,
+  "prefill": {
+    "8192": {
+      "tok_s": 214.62716351693888,
+      "total_ms": 38168.514487,
+      "cv": 0.0017783546144932354,
+      "reps": 2
+    }
+  }
+}
