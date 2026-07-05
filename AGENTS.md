@@ -1,13 +1,19 @@
 # AGENTS.md — working on super-gemma
 
-**The goal: the FASTEST Gemma 4 31B QAT Q4_0 (GGUF) inference server for the Framework Desktop
-mainboard.** Not just *a* server — the fastest one. The strict one-model/one-machine focus
-(Framework Desktop, AMD Ryzen AI Max+ 395, 128 GB unified RAM, Radeon 8060S iGPU, NVMe, **Linux**)
-is the whole point: it *licenses and demands* hardware-specific optimization. Speed is a primary
-goal, not a finishing polish — kernel optimization, cache2, and tokio_uring all carry equal weight.
-Exposes an LLM-API-style `/v1/messages` API for AI coding agents. Not a general framework: no
-training, no batching, no portability work. The only second model in scope is the official 0.5B MTP
-drafter (`gemma-4-31B-it-assistant`) for speculative decoding — see
+**super-gemma is an open-source research project.** It exists to answer one question: *how much
+can hyper-optimizing an inference stack for a single model on a single machine beat existing
+general-purpose open-source servers?* The yardstick is llama-server (llama.cpp) and other portable
+engines running the same model on the same box. This is **not** commercial or production software and
+is not designed for commercial use — the strict one-model/one-machine focus is the experimental
+method, not a product constraint.
+
+**The single target:** Gemma 4 31B QAT Q4_0 (GGUF) on the Framework Desktop mainboard (AMD Ryzen AI
+Max+ 395, 128 GB unified RAM, Radeon 8060S iGPU, NVMe, **Linux**). Fixing the model and the hardware
+is the whole point: it *licenses and demands* hardware-specific optimization that a portable engine
+can't do. Speed is the primary variable — kernel optimization, cache2, and tokio_uring all carry
+equal weight. The server exposes an LLM-API-style `/v1/messages` API for AI coding agents. Not a
+general framework: no training, no batching, no portability work. The only second model in scope is
+the official 0.5B MTP drafter (`gemma-4-31B-it-assistant`) for speculative decoding — see
 `docs/plans/07-mtp-speculative-decoding.md`.
 
 **What "bespoke" means (operating principle):** hand-tailored for *this* model on *this* hardware.
@@ -70,7 +76,7 @@ cargo clippy --workspace --all-targets -- -D warnings    # lint (CI enforces)
 |---|---|---|
 | `sg-gguf` | GGUF parser, ModelDesc validation, Q4_0 types (scalar dequant = kernel ground truth) | 01 |
 | `sg-tokenizer` | SentencePiece from GGUF vocab, chat/tool template, streaming detok | 01 |
-| `sg-gpu` | vulkano runtime, WGSL→SPIR-V kernel library (`shaders/`, `build.rs`), command graphs | 02 |
+| `sg-gpu` | raw-ash Vulkan runtime, WGSL→SPIR-V kernel library (`shaders/`, `build.rs`), barrier-owning command recorder | 02 |
 | `sg-model` | Gemma 4 graph, sampling, CPU reference model (M3 parity oracle) | 03 |
 | `sg-cache` | cache2 radix trie + NVMe pager + eviction; tail snapshots; sliding-ring bookkeeping | 04 |
 | `sg-engine` | request orchestration across the GPU / uring / HTTP threads | 03 |
