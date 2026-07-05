@@ -2,7 +2,7 @@
 
 Bespoke inference server for **Gemma 4 31B QAT Q4_0** on a Framework Desktop
 (AMD Ryzen AI Max+ 395, 128 GB unified RAM, Linux). Rust: axum + tokio-uring + naga-oil + vulkano.
-Single-conversation text generation for AI coding agents behind an Anthropic-style `/v1/messages`
+Single-conversation text generation for AI coding agents behind an LLM-API-style `/v1/messages`
 API. NVMe-backed paged radix-trie KV cache (**cache2**) for global-attention layers; in-memory
 ring buffers for sliding-attention layers.
 

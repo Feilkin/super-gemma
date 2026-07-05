@@ -8,7 +8,7 @@
 //! Budget < 2 ms on the 262k vocab: the quickselect is O(n); only the
 //! ≤ 1024 surviving candidates are sorted.
 
-/// Sampling parameters (the Anthropic API surface; repetition penalties
+/// Sampling parameters (the LLM-API API surface; repetition penalties
 /// are deliberately absent — not in the API, plan 03).
 #[derive(Debug, Clone, Copy)]
 pub struct SamplerParams {

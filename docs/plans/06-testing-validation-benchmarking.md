@@ -12,7 +12,7 @@ strategy: the correctness ladder, reference baselines, CI topology, and the benc
 | 3 | Per-layer activations, full graph, 1 token | CPU reference model (f32, real GGUF weights) | rel-err thresholds per layer (M3) |
 | 4 | End-to-end logits & perplexity | llama.cpp on the **same GGUF file** | top-20 rank overlap ≥ threshold, KL ≤ threshold, ppl Δ ≤ 0.5 % (M4) |
 | 5 | Cache-path equivalence | ourselves (cold path) | bit-identical logits f16 / bounded KL Q8_0 (M5/M6) |
-| 6 | API conformance | Anthropic SDKs + captured fixtures | suites green (M7) |
+| 6 | API conformance | LLM-API SDKs + captured fixtures | suites green (M7) |
 | 7 | Behavioral quality | needle tests, small eval set (HumanEval-subset via the API), real agent session | no regression vs llama.cpp baseline (M8) |
 
 Why llama.cpp as the rung-4 oracle even though we're not recreating it: it's the only independent

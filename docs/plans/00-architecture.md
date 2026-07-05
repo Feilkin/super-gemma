@@ -119,7 +119,7 @@ hot loop free of runtime scheduling jitter.
 | `sg-model` | Gemma 4 graph: layer definitions, prefill/decode passes, sampling | 03 |
 | `sg-cache` | cache2 radix trie + NVMe pager + eviction; sliding ring; tail snapshots | 04 |
 | `sg-engine` | scheduler, conversation pipeline, cache↔gpu glue | 03 |
-| `sg-server` | axum app, Anthropic-style API, auth, SSE, queue | 05 |
+| `sg-server` | axum app, LLM-API-style API, auth, SSE, queue | 05 |
 | `sg-validate` (bin) | parity harness vs reference (activation dumps, logit KL) | 06 |
 | `sg-bench` (bin) | end-to-end + micro benchmarks, JSON output | 06 |
 
@@ -155,7 +155,7 @@ don't touch uring/Vulkan remain platform-neutral so most of the suite runs anywh
 | M4 | Full prefill + decode, CLI text generation | coherent output; perplexity within noise of llama.cpp Q4_0 on same GGUF |
 | M5 | In-memory caching (sliding ring + resident global KV), incremental decode | cache-on vs cache-off logits bit-identical |
 | M6 | cache2 NVMe trie + snapshots + eviction | warm-resume TTFT meets target; crash-consistency tests pass |
-| M7 | `sg-server` API complete | Anthropic-SDK-driven integration suite green; agent (e.g. coding agent) runs against it |
+| M7 | `sg-server` API complete | LLM-API-SDK-driven integration suite green; agent (e.g. coding agent) runs against it |
 | M7.5 | MTP speculative decoding (plan 07) | greedy MTP ≡ greedy non-MTP bit-exact; ≥2× effective tok/s on agent-loop bench |
 | M8 | Performance tuning | hits calibrated targets (see 06) or documented why not |
 | M9 | Hardening | fuzzing, fault injection, soak test (24 h agent loop) clean |

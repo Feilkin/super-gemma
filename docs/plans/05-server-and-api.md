@@ -1,10 +1,10 @@
-# 05 — Server & Anthropic-Style API (`sg-server`)
+# 05 — Server & LLM-API-Style API (`sg-server`)
 
 ## Scope
 
-axum HTTP server exposing an Anthropic-compatible surface: `POST /v1/messages` (blocking + SSE
+axum HTTP server exposing an LLM-API-compatible surface: `POST /v1/messages` (blocking + SSE
 streaming), `POST /v1/messages/count_tokens`, API-key auth, FIFO request queue with timeout,
-config, and observability. Compatible enough that standard Anthropic SDKs and coding agents work
+config, and observability. Compatible enough that standard LLM-API SDKs and coding agents work
 by switching base URL + key.
 
 ## Endpoints
@@ -16,11 +16,11 @@ by switching base URL + key.
   `tools`, `tool_choice` (`auto`/`any`/`tool`/`none`), `max_tokens` (required), `stop_sequences`,
   `temperature`, `top_p`, `top_k`, `stream`, `metadata`. **Image blocks → 400** with a clear error
   (text-only server).
-- Response (non-stream): Anthropic message shape — `id`, `type:"message"`, `role:"assistant"`,
+- Response (non-stream): LLM-API message shape — `id`, `type:"message"`, `role:"assistant"`,
   `content` (text and/or tool_use blocks), `stop_reason` (`end_turn`|`max_tokens`|`stop_sequence`|
   `tool_use`), `stop_sequence`, `usage` {input_tokens, output_tokens, plus extension fields:
   `cache_read_input_tokens` style reporting for cache2 hits — agents and we both want to see this}.
-- Streaming: exact Anthropic SSE event sequence — `message_start`, `content_block_start`,
+- Streaming: exact LLM-API SSE event sequence — `message_start`, `content_block_start`,
   `content_block_delta` (`text_delta` / `input_json_delta` for tool args), `content_block_stop`,
   `message_delta` (stop_reason + usage), `message_stop`; `ping` keepalives; `error` events.
   Client disconnect → abort signal into the engine (plan 03), cache writes still flushed.
@@ -45,7 +45,7 @@ unlimited concurrency.
 
 - Global FIFO: `tokio::sync::mpsc` of accepted requests; one engine consumer. Config:
   `max_queue_depth` (default 8), `queue_timeout_ms` (default 30 000). Overflow / timeout → 429
-  with `retry-after` and Anthropic-style error body (`overloaded_error`).
+  with `retry-after` and LLM-API-style error body (`overloaded_error`).
 - Per-request timeout (`max_request_ms`, generous default) → abort + `error` SSE event.
 - Graceful shutdown: stop accepting, drain or abort in-flight with cache flush, persist cache2
   index, exit.
@@ -53,7 +53,7 @@ unlimited concurrency.
 ## Auth & hardening
 
 - `x-api-key` header (also accept `Authorization: Bearer` for SDK friendliness). Keys in config as
-  argon2 hashes; constant-time verify; per-key name for logs. 401/403 Anthropic-style error bodies.
+  argon2 hashes; constant-time verify; per-key name for logs. 401/403 LLM-API-style error bodies.
 - `anthropic-version` header accepted and echoed, not enforced (log unknown values).
 - Request body limit (configurable, default 32 MB — coding-agent prompts are big), JSON depth
   limits, strict-but-tolerant deserialization (unknown fields ignored + logged once).
@@ -83,8 +83,8 @@ example in `deploy/`.
    a `MockEngine` trait implementation (scripted token streams) — the entire API layer is testable
    without a GPU.
 2. /v1/messages non-streaming against MockEngine; serde types golden-tested against captured
-   real Anthropic API fixtures (request and response shapes).
-3. SSE streaming: event encoder unit-tested against Anthropic SDK *as client* (the official Rust /
+   real LLM-API API fixtures (request and response shapes).
+3. SSE streaming: event encoder unit-tested against LLM-API SDK *as client* (the official Rust /
    TS SDK pointed at the test server must parse every stream we emit).
 4. Queue + timeouts + abort propagation; count_tokens.
 5. Tool-use round-trip against MockEngine (declaration render is plan 01; here: block assembly,
@@ -95,7 +95,7 @@ example in `deploy/`.
 
 ## Testing & validation
 
-- **API conformance:** fixture suite of real Anthropic request/response/SSE captures; byte-level
+- **API conformance:** fixture suite of real LLM-API request/response/SSE captures; byte-level
   SSE framing tests (event order, data: JSON shapes, ping cadence); official SDKs as test clients
   in CI (TS + Python: send/stream/tool-loop/count_tokens against MockEngine server).
 - **Queue:** concurrency tests (N parallel clients → strict FIFO order observed via MockEngine

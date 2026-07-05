@@ -80,7 +80,7 @@ Steady-state per token:
    is already met; the timeline-semaphore submission is an optimization to adopt only if the
    engine's pipelining wants it.)
 3. Sampler (CPU): temperature → top-k → top-p → categorical draw with per-request RNG seed
-   (Anthropic API params; greedy if temperature 0).
+   (LLM-API API params; greedy if temperature 0).
 4. Stop check: EOS ids {1, 106}, `stop_sequences` (decoded-text matcher with overlap buffer),
    `max_tokens`.
 5. Streaming detok (UTF-8-safe) → SSE delta out; incremental tool-call parser fed in parallel.
@@ -121,7 +121,7 @@ validate → PromptBuilder (messages+tools → token ids)
 
 ## Sampling details
 
-- Logit pipeline: f32 logits → repetition handling **none** (not in Anthropic API; keep out),
+- Logit pipeline: f32 logits → repetition handling **none** (not in LLM-API API; keep out),
   temperature scale → top_k partial-select (k ≤ 1024 via quickselect) → top_p prefix → sample.
   < 2 ms budget on 262k vocab; if profiling disagrees, enable the GPU prereduction kernel (plan 02).
 - **CPU vs GPU sampling:** start CPU. On unified memory the logits copy is free, and at ~75 ms/token

@@ -1,4 +1,4 @@
-//! super-gemma inference server: Anthropic-style `/v1/messages` API over the
+//! super-gemma inference server: LLM-API-style `/v1/messages` API over the
 //! single-conversation Gemma 4 engine.
 //!
 //! Scope and design: `docs/plans/05-server-and-api.md`. Lands in M7.

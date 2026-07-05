@@ -5,7 +5,7 @@ mainboard.** Not just *a* server — the fastest one. The strict one-model/one-m
 (Framework Desktop, AMD Ryzen AI Max+ 395, 128 GB unified RAM, Radeon 8060S iGPU, NVMe, **Linux**)
 is the whole point: it *licenses and demands* hardware-specific optimization. Speed is a primary
 goal, not a finishing polish — kernel optimization, cache2, and tokio_uring all carry equal weight.
-Exposes an Anthropic-style `/v1/messages` API for AI coding agents. Not a general framework: no
+Exposes an LLM-API-style `/v1/messages` API for AI coding agents. Not a general framework: no
 training, no batching, no portability work. The only second model in scope is the official 0.5B MTP
 drafter (`gemma-4-31B-it-assistant`) for speculative decoding — see
 `docs/plans/07-mtp-speculative-decoding.md`.
